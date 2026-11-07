@@ -637,16 +637,21 @@ Id EmitRenderArea(EmitContext& ctx) {
     }
 }
 
+// A dynamic index past the array is undefined in SPIR-V: drivers that put the array in scratch
+// memory (RADV) read or write wherever the offset points and fault the GPU (Kirby Air Riders).
+// Out-of-range words go to the spare word past the end; the frontend already turns such loads
+// into zero.
+static Id LocalPointer(EmitContext& ctx, Id word_offset) {
+    const Id index{ctx.OpUMin(ctx.U32[1], word_offset, ctx.Const(ctx.local_memory_words))};
+    return ctx.OpAccessChain(ctx.private_u32, ctx.local_memory, index, ctx.Const(0U));
+}
+
 Id EmitLoadLocal(EmitContext& ctx, Id word_offset) {
-    const Id pointer{
-        ctx.OpAccessChain(ctx.private_u32, ctx.local_memory, word_offset, ctx.Const(0U))};
-    return ctx.OpLoad(ctx.U32[1], pointer);
+    return ctx.OpLoad(ctx.U32[1], LocalPointer(ctx, word_offset));
 }
 
 void EmitWriteLocal(EmitContext& ctx, Id word_offset, Id value) {
-    const Id pointer{
-        ctx.OpAccessChain(ctx.private_u32, ctx.local_memory, word_offset, ctx.Const(0U))};
-    ctx.OpStore(pointer, value);
+    ctx.OpStore(LocalPointer(ctx, word_offset), value);
 }
 
 } // namespace Shader::Backend::SPIRV

@@ -645,9 +645,10 @@ void EmitContext::DefineLocalMemory(const IR::Program& program) {
     if (program.local_memory_size == 0) {
         return;
     }
-    const u32 num_elements{Common::DivCeil(program.local_memory_size, 4U)};
+    // One spare word past the end: EmitLoadLocal/EmitWriteLocal clamp their index to it.
+    local_memory_words = Common::DivCeil(program.local_memory_size, 4U);
     const Id element_type{TypeStruct(U32[1])};
-    const Id type{TypeArray(element_type, Const(num_elements))};
+    const Id type{TypeArray(element_type, Const(local_memory_words + 1))};
     const Id pointer{TypePointer(spv::StorageClass::Private, type)};
     local_memory = AddGlobalVariable(pointer, spv::StorageClass::Private);
     if (profile.supported_spirv >= 0x00010400) {

@@ -342,6 +342,7 @@ public:
     u32 render_are_member_index{};
 
     Id local_memory{};
+    u32 local_memory_words{};
 
     bool uses_explicit_workgroup_layout{};
     Id shared_memory_u8{};
