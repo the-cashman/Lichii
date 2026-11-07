@@ -25,6 +25,12 @@ namespace Core {
 using namespace Common::Literals;
 
 namespace {
+
+bool Nx2EnvOn(const char* name) {
+    const char* value = std::getenv(name);
+    return value == nullptr || value[0] != '0';
+}
+
 // EDEN_NX2_GUEST_THREAD_STATS: the JIT's dispatcher counters of each core's JITs (one per process).
 std::array<Dynarmic::A64::UserConfig::Counters, Hardware::NUM_CPU_CORES> g_jit_counters{};
 } // Anonymous namespace
@@ -206,11 +212,31 @@ void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception excep
         }
     }
     switch (exception) {
-    case Dynarmic::A64::Exception::WaitForInterrupt:
     case Dynarmic::A64::Exception::WaitForEvent:
+    case Dynarmic::A64::Exception::Yield: {
+        if (Kernel::Nx2ThreadStats::g_enabled) {
+            Kernel::Nx2ThreadStats::CountHint(
+                Kernel::Nx2ThreadStats::t_run,
+                static_cast<size_t>(exception) -
+                    static_cast<size_t>(Dynarmic::A64::Exception::WaitForInterrupt),
+                m_parent.m_system.CoreTiming().GetClockTicks(), m_spin_ticks);
+        }
+        // A guest spin-wait hint: give the SMT sibling the core for a moment, as GetCNTPCT does.
+        // EDEN_NX2_HINT_PAUSE=0 turns it off.
+        [[maybe_unused]] static const bool hint_pause = Nx2EnvOn("EDEN_NX2_HINT_PAUSE");
+        if (hint_pause) {
+#if defined(_M_X64) || defined(__x86_64__)
+            _mm_pause();
+            _mm_pause();
+#elif defined(__aarch64__)
+            asm volatile("yield");
+#endif
+        }
+        return;
+    }
+    case Dynarmic::A64::Exception::WaitForInterrupt:
     case Dynarmic::A64::Exception::SendEvent:
     case Dynarmic::A64::Exception::SendEventLocal:
-    case Dynarmic::A64::Exception::Yield:
         if (Kernel::Nx2ThreadStats::g_enabled) {
             Kernel::Nx2ThreadStats::CountHint(
                 Kernel::Nx2ThreadStats::t_run,
@@ -473,6 +499,27 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         config.fastmem_pointer = std::nullopt;
         config.fastmem_exclusive_access = false;
     }
+#if defined(ARCHITECTURE_x86_64)
+    // x86-64 is TSO: LDAPR/LDAR/LDAXR need no locked RMW (STLR keeps XCHG), and DMB xxLD/xxST
+    // order nothing TSO does not already order. Ocarina of Time has ~68k LDAPRB sites (static
+    // init guards), each a LOCK XADD that bounced the guard's cache line between the cores.
+    // EDEN_NX2_TSO_LOADS=0 turns both off.
+    static const bool tso_loads = Nx2EnvOn("EDEN_NX2_TSO_LOADS");
+    if (tso_loads && Settings::values.cpu_accuracy.GetValue() != Settings::CpuAccuracy::Paranoid) {
+        config.tso_ordered_loads = true;
+        config.elide_ld_st_barriers = true;
+    }
+    // The other #717 JIT options (spill to GPR, scratch copies, address folding, zero-extend
+    // elision, no block frame, compact exits, far code, back-edge halts, RSB 32, set-associative
+    // dispatch, host flags) are upstream's now (#1531, always on below); ours keeps only these.
+    if (Settings::values.cpu_accuracy.GetValue() != Settings::CpuAccuracy::Paranoid) {
+        // LSE atomics as host atomics (fastmem exclusives with the global monitor ignored only).
+        // EDEN_NX2_JIT_ATOMICS=0 keeps the exclusive load/store emulation.
+        static const bool native_atomics = Nx2EnvOn("EDEN_NX2_JIT_ATOMICS");
+        config.native_lse_atomics = native_atomics && config.fastmem_exclusive_access &&
+            config.HasOptimization(Dynarmic::OptimizationFlag::Unsafe_IgnoreGlobalMonitor);
+    }
+#endif
     if (Kernel::Nx2ThreadStats::g_enabled && m_core_index < g_jit_counters.size()) {
         config.counters = &g_jit_counters[m_core_index];
     }

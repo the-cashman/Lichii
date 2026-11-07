@@ -98,6 +98,103 @@ inline void Nx2MarkCommandListPage(u64 device_address) {
     return (g_nx2_command_list_pages[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1;
 }
 
+// Query results written when their host work completes (counter reports): per 16-byte slot
+// hash, how many were issued and how many completed. Equal counts mean the words in memory
+// are final.
+inline constexpr u64 Nx2AsyncReportSlots = u64{1} << 16;
+inline std::array<std::atomic<u32>, Nx2AsyncReportSlots> g_nx2_async_reports_issued{};
+inline std::array<std::atomic<u32>, Nx2AsyncReportSlots> g_nx2_async_reports_completed{};
+
+[[nodiscard]] inline u64 Nx2AsyncReportSlot(u64 device_address) {
+    return (device_address >> 4) % Nx2AsyncReportSlots;
+}
+
+[[nodiscard]] inline bool Nx2AsyncReportsSettled(u64 device_address, u64 size) {
+    if (size == 0) {
+        return true;
+    }
+    for (u64 slot = device_address >> 4; slot <= (device_address + size - 1) >> 4; ++slot) {
+        const u64 index = slot % Nx2AsyncReportSlots;
+        if (g_nx2_async_reports_completed[index].load(std::memory_order_acquire) !=
+            g_nx2_async_reports_issued[index].load(std::memory_order_acquire)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Bumped after every completed report; threads in Nx2WaitAsyncReportsSettled wait on it.
+inline std::atomic<u32> g_nx2_async_reports_generation{};
+inline std::atomic<u32> g_nx2_async_reports_waiters{};
+
+/// A report was issued to device_address (the thread that owns the query cache).
+inline void Nx2IssueAsyncReport(u64 device_address) {
+    g_nx2_async_reports_issued[Nx2AsyncReportSlot(device_address)].fetch_add(
+        1, std::memory_order_release);
+}
+
+/// A report's host work completed and its words are in memory (the fencing thread).
+inline void Nx2CompleteAsyncReport(u64 device_address) {
+    g_nx2_async_reports_completed[Nx2AsyncReportSlot(device_address)].fetch_add(
+        1, std::memory_order_release);
+    g_nx2_async_reports_generation.fetch_add(1, std::memory_order_seq_cst);
+    if (g_nx2_async_reports_waiters.load(std::memory_order_seq_cst) != 0) {
+        g_nx2_async_reports_generation.notify_all();
+    }
+}
+
+/// One asynchronous report's issued/completed pair. Complete counts it once, and destruction
+/// does if nothing did: an operation dropped without running (fences discarded when emulation
+/// stops) would otherwise leave its slot unequal for good, and a later wait on that slot would
+/// never end. Owned by the report's operation (shared by its copies); not thread-safe, as the
+/// operation runs or is dropped on one thread at a time.
+class Nx2AsyncReport {
+public:
+    explicit Nx2AsyncReport(u64 device_address_) : device_address{device_address_} {}
+    ~Nx2AsyncReport() {
+        Complete();
+    }
+    Nx2AsyncReport(const Nx2AsyncReport&) = delete;
+    Nx2AsyncReport& operator=(const Nx2AsyncReport&) = delete;
+
+    void Issue() {
+        if (!issued) {
+            issued = true;
+            Nx2IssueAsyncReport(device_address);
+        }
+    }
+    void Complete() {
+        if (issued && !completed) {
+            completed = true;
+            Nx2CompleteAsyncReport(device_address);
+        }
+    }
+
+private:
+    u64 device_address;
+    bool issued{};
+    bool completed{};
+};
+
+/// Blocks until every report issued so far to [device_address, device_address + size) is in
+/// memory. Only for the thread that issues reports, so none can be issued while it waits; the
+/// fences carrying them must already be submitted. A slot shared with another address only
+/// waits for that report too.
+inline void Nx2WaitAsyncReportsSettled(u64 device_address, u64 size) {
+    if (Nx2AsyncReportsSettled(device_address, size)) {
+        return;
+    }
+    g_nx2_async_reports_waiters.fetch_add(1, std::memory_order_seq_cst);
+    for (;;) {
+        const u32 generation = g_nx2_async_reports_generation.load(std::memory_order_seq_cst);
+        if (Nx2AsyncReportsSettled(device_address, size)) {
+            break;
+        }
+        g_nx2_async_reports_generation.wait(generation, std::memory_order_seq_cst);
+    }
+    g_nx2_async_reports_waiters.fetch_sub(1, std::memory_order_relaxed);
+}
+
 /// A new emulation session starts: no page has been written by its GPU yet.
 inline void Nx2ClearGpuWrittenPages() {
     for (auto& word : g_nx2_gpu_written_pages) {
@@ -161,6 +258,16 @@ inline void Nx2RemoveSemaphoreRegion(u64 start) {
     return g_nx2_semaphore_regions.contains(start);
 }
 
+/// EDEN_NX2_SEM_MIRROR (on unless 0; a local switch for A/B): the puller mirrors second-page
+/// releases into the first page (#979). Off: no mirrored release, so no shadow either.
+inline bool Nx2SemaphoreMirrorEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_SEM_MIRROR");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
 inline bool Nx2InSemaphoreFirstPage(u64 address) {
     return Nx2IsSemaphoreRegion(address & ~u64{0xfff});
 }
@@ -178,9 +285,14 @@ public:
         return instance;
     }
 
+    /// Whether any mirrored release went to the table (readers skip the lock until then).
+    [[nodiscard]] bool HasWords() const {
+        return has_words.load(std::memory_order_acquire);
+    }
+
     /// A release that is not the mirror's landed at gpu_address (device_address).
     void NoteDirectRelease(u64 device_address, u64 gpu_address) {
-        if (!Nx2InSemaphoreFirstPage(gpu_address)) {
+        if (!Nx2SemaphoreMirrorEnabled() || !Nx2InSemaphoreFirstPage(gpu_address)) {
             return;
         }
         const u64 word = device_address & ~u64{3};
@@ -477,8 +589,22 @@ inline bool Nx2SparseUnwritten(u64 gpu_address, u64 size) {
     return true;
 }
 
+// GPU semaphore writes that landed in guest memory, counted per word by a hash (collisions only
+// add): the split's front tells a release still held back by a fence from one already written
+// (GpuSplit::PredictedSemaphore, EDEN_NX2_SEM_PREDICT_LANDED).
+inline constexpr size_t Nx2LandedSlots = 4096;
+inline std::array<std::atomic<u32>, Nx2LandedSlots> g_nx2_semaphore_landed{};
+
+[[nodiscard]] inline size_t Nx2LandedSlot(u64 device_address) {
+    return static_cast<size_t>(((device_address >> 2) * 0x9E3779B97F4A7C15ULL) >> 52) &
+           (Nx2LandedSlots - 1);
+}
+
 /// GPU VA in the first page that mirrors a release at `address`, or 0.
 inline u64 Nx2SemaphoreMirror(u64 address) {
+    if (!Nx2SemaphoreMirrorEnabled()) {
+        return 0;
+    }
     return Nx2IsSemaphoreRegion((address & ~u64{0xfff}) - 0x1000) ? address - 0x1000 : 0;
 }
 
@@ -652,6 +778,7 @@ public:
 
     /// A GPU write of value to the u32 at device_address.
     void OnWrite(u64 device_address, u32 value) {
+        g_nx2_semaphore_landed[Nx2LandedSlot(device_address)].fetch_add(1, std::memory_order_release);
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }

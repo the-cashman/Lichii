@@ -6,6 +6,7 @@
 #pragma once
 
 #include <memory>
+#include <span>
 
 #include "video_core/query_cache/query_cache_base.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -40,6 +41,10 @@ public:
     void SyncValues(std::span<SyncValuesType> values, VkBuffer base_src_buffer = VkBuffer{});
 
     void Barriers(bool is_prebarrier);
+
+    /// EDEN_NX2_QUERY_LAZY_SYNC: each range to mark is marked CPU-written in the buffer cache, as
+    /// a guest CPU write is, unless its pages hold GPU-written data (needs_copy).
+    void NoteGuestWrittenRanges(std::span<VideoCommon::GuestWrittenRange> ranges);
 
     void EndHostConditionalRendering();
 

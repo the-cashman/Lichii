@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "core/arm/arm_interface.h"
+#include "core/hle/kernel/k_spin_lock.h"
 
 namespace Kernel {
 class KernelCore;
@@ -70,10 +71,13 @@ public:
 private:
     const std::size_t m_core_index;
     std::mutex m_guard;
+    // EDEN_NX2_CORE_LOCK: m_fast_guard replaces m_guard, and Idle sleeps on m_is_interrupted
+    // with an address wait instead of m_on_interrupt.
+    KSpinLock m_fast_guard;
     std::condition_variable m_on_interrupt;
     Core::ArmInterface* m_arm_interface{};
     KThread* m_current_thread{};
-    std::atomic<bool> m_is_interrupted{};
+    std::atomic<u32> m_is_interrupted{};
     bool m_is_single_core{};
 
     std::chrono::nanoseconds m_idle_poll{};

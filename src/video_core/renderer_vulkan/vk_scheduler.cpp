@@ -45,7 +45,23 @@ std::atomic<u64> g_profile_skipped_flushes{};
 std::atomic<u64> g_profile_finish_ns{};
 std::atomic<u64> g_profile_window_start{};
 std::mutex g_profile_end_mutex;
+/// Finish() per call site: calls and nanoseconds waited.
+std::map<std::string, std::pair<u64, u64>> g_profile_finish_sites;
 std::map<std::string, u64> g_profile_ends;
+/// Flush() per call site (deferred submissions by the site that submitted them).
+std::map<std::string, u64> g_profile_submit_sites;
+
+void CountSubmit(const char* file, u32 line) {
+    if (!VideoCommon::Nx2Profile::Enabled()) {
+        return;
+    }
+    std::string_view name{file};
+    if (const auto slash = name.find_last_of("/\\"); slash != std::string_view::npos) {
+        name.remove_prefix(slash + 1);
+    }
+    std::scoped_lock lock{g_profile_end_mutex};
+    ++g_profile_submit_sites[fmt::format("{}:{}", name, line)];
+}
 
 void CountRenderPassEnd(const char* file, u32 line) {
     if (!VideoCommon::Nx2Profile::Enabled()) {
@@ -91,6 +107,34 @@ void ReportSubmitCounts() {
     for (size_t i = 0; i < ends.size() && i < 16; ++i) {
         LOG_INFO(Render_Vulkan, "Render pass ends {:.0f}/s at {}",
                  static_cast<double>(ends[i].first) / seconds, ends[i].second);
+    }
+    std::vector<std::pair<u64, std::string>> finishes;
+    {
+        std::scoped_lock lock{g_profile_end_mutex};
+        for (const auto& [site, entry] : g_profile_finish_sites) {
+            const double calls = static_cast<double>(entry.first) / seconds;
+            const double ms = static_cast<double>(entry.second) / 1e6 / seconds;
+            finishes.emplace_back(entry.second,
+                                  fmt::format("{:.0f}/s waiting {:.1f} ms at {}", calls, ms, site));
+        }
+        g_profile_finish_sites.clear();
+    }
+    std::sort(finishes.rbegin(), finishes.rend());
+    for (size_t i = 0; i < finishes.size() && i < 8; ++i) {
+        LOG_INFO(Render_Vulkan, "Finishes {}", finishes[i].second);
+    }
+    std::vector<std::pair<u64, std::string>> submits;
+    {
+        std::scoped_lock lock{g_profile_end_mutex};
+        for (const auto& [site, count] : g_profile_submit_sites) {
+            submits.emplace_back(count, site);
+        }
+        g_profile_submit_sites.clear();
+    }
+    std::sort(submits.rbegin(), submits.rend());
+    for (size_t i = 0; i < submits.size() && i < 12; ++i) {
+        LOG_INFO(Render_Vulkan, "Submits {:.0f}/s at {}",
+                 static_cast<double>(submits[i].first) / seconds, submits[i].second);
     }
 }
 }
@@ -176,6 +220,7 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Flush");
     }
+    CountSubmit(location.file_name(), location.line());
     // When flushing, we only send data to the worker thread; no waiting is necessary.
     const u64 signal_value = SubmitExecution(signal_semaphore, wait_semaphore);
     AllocateNewContext();
@@ -196,7 +241,8 @@ bool Scheduler::DeferFlush() {
     // Imprisonment fights, each a queue submission (~22,000 a second with the others), which
     // kept the Vulkan worker busy submitting. Batched within 500 us: ~10-15% more fps there.
     // Command list copies after dispatches were ~9,000 more a second, of which the front waited
-    // for about 5%.
+    // for about 5%. A guest read waiting for downloads (Nx2Reactive::WaitLanding) has the
+    // fence manager submit at once instead (FenceManager::SignalFence).
     static const s64 interval_us = [] {
         const char* value = std::getenv("EDEN_NX2_FENCE_FLUSH_US");
         if (value != nullptr) {
@@ -212,10 +258,18 @@ bool Scheduler::DeferFlush() {
     return true;
 }
 
-void Scheduler::FlushDeferred() {
+void Scheduler::FlushDeferred(std::source_location location) {
     if (flush_pending) {
-        Flush();
+        Flush({}, {}, location);
     }
+}
+
+bool Scheduler::DeferFlushUntilWanted() {
+    if (!VideoCommon::GpuSplit::OnBackThread()) {
+        return false;
+    }
+    flush_pending = true;
+    return true;
 }
 
 bool Scheduler::WaitSubmitted(u64 tick) {
@@ -269,8 +323,17 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     flush_pending = false;
     if (profile) {
         g_profile_finishes.fetch_add(1, std::memory_order_relaxed);
-        g_profile_finish_ns.fetch_add(VideoCommon::Nx2Profile::Now() - start,
-                                      std::memory_order_relaxed);
+        const u64 waited = VideoCommon::Nx2Profile::Now() - start;
+        g_profile_finish_ns.fetch_add(waited, std::memory_order_relaxed);
+        std::string_view name{location.file_name()};
+        if (const auto slash = name.find_last_of("/\\"); slash != std::string_view::npos) {
+            name.remove_prefix(slash + 1);
+        }
+        std::scoped_lock lock{g_profile_end_mutex};
+        auto& site = g_profile_finish_sites[fmt::format("{}:{} {}", name, location.line(),
+                                                        location.function_name())];
+        ++site.first;
+        site.second += waited;
     }
 }
 
@@ -314,28 +377,54 @@ std::optional<double> Scheduler::GpuBusyMs() const {
     return gpu_busy->ms;
 }
 
-void Scheduler::DispatchWork() {
+void Scheduler::DispatchWork(bool lazy) {
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::DispatchWork");
     }
     if (uploads_pending) {
-        // The worker must receive everything recorded so far.
+        // The worker must receive everything recorded so far (#1245's batch, before the chunk is
+        // checked for work).
         FlushUploads();
     }
-    if (chunk && !chunk->Empty()) {
-        // Waking the worker is a system call (~2% of the GPU thread at one dispatch per 8
-        // draws): skip it while the worker is still busy, it pops the queue before waiting.
-        bool wake;
-        {
-            std::scoped_lock ql{queue_mutex};
+    // EDEN_NX2_LAZY_WAKE=0: every chunk handed over wakes a sleeping worker. Otherwise the chunks
+    // handed over between submissions (every 32 draws, or full) wake it only in pairs: each wake
+    // is a system call on this thread (~1% of it in Ocarina), and nothing waits for those chunks
+    // before the next submission, which always wakes it.
+    static const bool lazy_wake = [] {
+        const char* value = std::getenv("EDEN_NX2_LAZY_WAKE");
+        return value == nullptr || value[0] != '0';
+    }();
+    const bool has_work = chunk && !chunk->Empty();
+    if (!has_work && !(lazy_queued && !lazy)) {
+        return;
+    }
+    lazy = lazy && lazy_wake;
+    // Waking the worker is a system call (~2% of the GPU thread at one dispatch per 8
+    // draws): skip it while the worker is still busy, it pops the queue before waiting.
+    bool wake;
+    {
+        std::scoped_lock ql{queue_mutex};
+        if (has_work) {
             work_queue.push(std::move(chunk));
-            wake = worker_waiting;
         }
-        if (wake) {
-            event_cv.notify_all();
-        }
+        wake = worker_waiting && !work_queue.empty() && (!lazy || work_queue.size() >= 2);
+        lazy_queued = worker_waiting && !wake && !work_queue.empty();
+    }
+    if (wake) {
+        event_cv.notify_all();
+    }
+    if (has_work) {
         AcquireNewChunk();
     }
+}
+
+bool Scheduler::RenderPassMatches(const Framebuffer* framebuffer, bool dynamic) const {
+    // RequestRenderpass's test for continuing the active pass (any clear variant of it).
+    dynamic = dynamic && !framebuffer->HasResolveAttachments();
+    const VkExtent2D render_area = framebuffer->RenderArea();
+    return state.renderpass != VK_NULL_HANDLE && framebuffer->Handle() == state.framebuffer &&
+           render_area.width == state.render_area.width &&
+           render_area.height == state.render_area.height && dynamic == state.dynamic_rendering;
 }
 
 void Scheduler::RecordUpload(VkBuffer src, VkBuffer dst, std::span<const VkBufferCopy> copies) {
@@ -590,6 +679,9 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
         VideoCommon::StutterTrace::Thread::Worker};
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
     Common::SetCurrentThreadToPerformanceCores();
+    if (!Settings::values.pin_gpu_threads.GetValue()) {
+        Common::PinHostThread(Common::HostThreadRole::VulkanWorker);
+    }
 
     const auto TryPopQueue{[this](auto& work) -> bool {
         if (work_queue.empty()) {

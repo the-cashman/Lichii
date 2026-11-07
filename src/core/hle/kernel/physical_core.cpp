@@ -22,6 +22,46 @@
 namespace Kernel {
 
 namespace {
+
+/// EDEN_NX2_CORE_LOCK: the core context lock is a KSpinLock and Idle sleeps on an address wait.
+/// The std::mutex and condition variable went through winpthreads: every contended lock, every
+/// Interrupt of an idle core and every RunThread entry and exit paid semaphore round trips.
+bool CoreLockEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_CORE_LOCK");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+class ScopedCoreGuard {
+public:
+    explicit ScopedCoreGuard(KSpinLock& fast_guard, std::mutex& guard)
+        : m_fast_guard{fast_guard}, m_guard{guard}, m_fast{CoreLockEnabled()} {
+        if (m_fast) {
+            m_fast_guard.Lock();
+        } else {
+            m_guard.lock();
+        }
+    }
+
+    ~ScopedCoreGuard() {
+        if (m_fast) {
+            m_fast_guard.Unlock();
+        } else {
+            m_guard.unlock();
+        }
+    }
+
+    LICHII_NON_COPYABLE(ScopedCoreGuard);
+    LICHII_NON_MOVEABLE(ScopedCoreGuard);
+
+private:
+    KSpinLock& m_fast_guard;
+    std::mutex& m_guard;
+    const bool m_fast;
+};
+
 // EDEN_NX2_IDLE_STATS=1: every 10 s, each core logs how often it went idle, how many of those
 // periods its poll caught, and how long blocked periods took to wake after the interrupt.
 const bool g_idle_stats = std::getenv("EDEN_NX2_IDLE_STATS") != nullptr;
@@ -43,7 +83,7 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
 
     const auto EnterContext = [&]() {
         // Lock the core context.
-        std::scoped_lock lk{m_guard};
+        ScopedCoreGuard lk{m_fast_guard, m_guard};
 
         // Check if we are already interrupted. If we are, we can just stop immediately.
         if (m_is_interrupted) {
@@ -74,7 +114,7 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
         interface->UnlockThread(thread);
 
         // Lock the core context.
-        std::scoped_lock lk{m_guard};
+        ScopedCoreGuard lk{m_fast_guard, m_guard};
 
         // On exit, we no longer are running.
         m_arm_interface = nullptr;
@@ -264,10 +304,21 @@ void PhysicalCore::Idle(KernelCore& kernel) {
         polled = Common::WaitForFlag(m_is_interrupted, start + m_idle_poll);
     }
     if (!polled) {
-        std::unique_lock lk{m_guard};
-        m_on_interrupt.wait(lk, [this] { return m_is_interrupted.load(); });
-        // Under m_guard, as Interrupt writes it: no later interrupt can replace it yet.
-        interrupt_time = m_interrupt_time.load(std::memory_order_relaxed);
+        if (CoreLockEnabled()) {
+            while (m_is_interrupted.load(std::memory_order_acquire) == 0) {
+                Nx2Wait::Wait(m_is_interrupted, 0);
+            }
+            if (g_idle_stats) {
+                // Under the guard, as Interrupt writes it: no later interrupt can replace it yet.
+                ScopedCoreGuard lk{m_fast_guard, m_guard};
+                interrupt_time = m_interrupt_time.load(std::memory_order_relaxed);
+            }
+        } else {
+            std::unique_lock lk{m_guard};
+            m_on_interrupt.wait(lk, [this] { return m_is_interrupted.load() != 0; });
+            // Under m_guard, as Interrupt writes it: no later interrupt can replace it yet.
+            interrupt_time = m_interrupt_time.load(std::memory_order_relaxed);
+        }
     }
     const auto end = std::chrono::steady_clock::now();
     const auto poll = m_idle_poll;
@@ -322,10 +373,31 @@ void PhysicalCore::Idle(KernelCore& kernel) {
 }
 
 bool PhysicalCore::IsInterrupted() const {
-    return m_is_interrupted;
+    return m_is_interrupted.load() != 0;
 }
 
 void PhysicalCore::Interrupt() {
+    if (CoreLockEnabled()) {
+        Core::ArmInterface* arm_interface{};
+        KThread* thread{};
+        {
+            ScopedCoreGuard lk{m_fast_guard, m_guard};
+            arm_interface = m_arm_interface;
+            thread = m_current_thread;
+            if (g_idle_stats) {
+                m_interrupt_time.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                                       std::memory_order_relaxed);
+            }
+            m_is_interrupted.store(1, std::memory_order_seq_cst);
+            if (arm_interface != nullptr) {
+                arm_interface->SignalInterrupt(thread);
+            }
+        }
+        // Wakes Idle if it sleeps; costs no syscall otherwise.
+        Nx2Wait::WakeAll(m_is_interrupted);
+        return;
+    }
+
     // Lock core context.
     std::scoped_lock lk{m_guard};
 
@@ -339,7 +411,7 @@ void PhysicalCore::Interrupt() {
     }
 
     // Add interrupt flag.
-    m_is_interrupted = true;
+    m_is_interrupted = 1;
 
     // Interrupt ourselves.
     m_on_interrupt.notify_one();
@@ -354,8 +426,8 @@ void PhysicalCore::Interrupt() {
 }
 
 void PhysicalCore::ClearInterrupt() {
-    std::scoped_lock lk{m_guard};
-    m_is_interrupted = false;
+    ScopedCoreGuard lk{m_fast_guard, m_guard};
+    m_is_interrupted = 0;
 }
 
 } // namespace Kernel

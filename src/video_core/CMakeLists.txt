@@ -98,6 +98,8 @@ add_library(video_core STATIC
     host1x/vic.h
     macro.cpp
     macro.h
+    macro_hle_oot.cpp
+    macro_hle_oot.h
     macro_memo.h
     macro_turing.h
     fence_manager.h
@@ -130,6 +132,8 @@ add_library(video_core STATIC
     native_qmd.h
     native_query_trace.h
     nx2.h
+    nx2_bindcache.h
+    nx2_bindmemo_stats.h
     nx2_back_idle_trace.cpp
     nx2_back_idle_trace.h
     nx2_list_macro_trace.cpp
@@ -146,6 +150,8 @@ add_library(video_core STATIC
     nx2_async_readback.h
     nx2_backx.h
     nx2_download_trace.h
+    nx2_query_fast.h
+    nx2_reactive.h
     pending_maps.h
     present.h
     pte_kind.h
@@ -689,7 +695,7 @@ endif()
 # setting is on. Only Streamline's MIT-licensed headers are compiled in and nothing of NVIDIA's is
 # linked or copied: sl.interposer.dll and the DLSS plugins are loaded at run time from the user's PC.
 cmake_dependent_option(ENABLE_NVIDIA_DLSS "Enable NVIDIA DLSS through NVIDIA Streamline" ON
-                       "MSVC AND ARCHITECTURE_x86_64" OFF)
+                       "WIN32 AND ARCHITECTURE_x86_64" OFF)
 set(EGLANTINE_STREAMLINE_SDK "" CACHE PATH
     "NVIDIA Streamline SDK directory for its headers (empty: download them)")
 if (ENABLE_NVIDIA_DLSS)

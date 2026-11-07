@@ -6,10 +6,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -928,6 +930,146 @@ void PinCurrentThread(PinnedRole role) {
 #endif
 }
 
+namespace {
+
+#ifdef _WIN32
+// A list of physical core indices ("1+2" or "4"), as a mask of their logical processors.
+KAFFINITY ParseCoreSet(std::string_view text, const std::vector<KAFFINITY>& cores) {
+    KAFFINITY mask{};
+    while (!text.empty()) {
+        size_t value = 0;
+        size_t digits = 0;
+        while (digits < text.size() && text[digits] >= '0' && text[digits] <= '9') {
+            value = value * 10 + static_cast<size_t>(text[digits] - '0');
+            ++digits;
+        }
+        if (digits == 0 || value >= cores.size()) {
+            return 0;
+        }
+        mask |= cores[value];
+        text.remove_prefix(digits);
+        if (!text.empty() && text[0] == '+') {
+            text.remove_prefix(1);
+        }
+    }
+    return mask;
+}
+#endif
+
+} // Anonymous namespace
+
+void PinHostThread(HostThreadRole role, size_t index) {
+#ifdef _WIN32
+    struct Layout {
+        KAFFINITY front{};
+        KAFFINITY back{};
+        KAFFINITY worker{};
+        std::array<KAFFINITY, 8> guest{};
+    };
+    static const Layout layout = [] {
+        Layout result{};
+        const char* const setting = std::getenv("EDEN_NX2_PIN_THREADS");
+        if (setting != nullptr && setting[0] == '0') {
+            return result;
+        }
+        // Physical cores of processor group 0, as masks of their logical processors, in order
+        // (Ryzen 7 3700X: cores 0-3 are the first core complex, logical processors 0-7).
+        std::vector<KAFFINITY> cores;
+        DWORD length = 0;
+        GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &length);
+        std::vector<u8> buffer(length);
+        if (length == 0 ||
+            !GetLogicalProcessorInformationEx(
+                RelationProcessorCore,
+                reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data()), &length)) {
+            return result;
+        }
+        for (DWORD offset = 0; offset < length;) {
+            const auto* const entry =
+                reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() +
+                                                                                 offset);
+            if (entry->Processor.GroupCount > 0 && entry->Processor.GroupMask[0].Group == 0) {
+                cores.push_back(entry->Processor.GroupMask[0].Mask);
+            }
+            offset += entry->Size;
+        }
+        if (cores.size() < 6) {
+            return result;
+        }
+        KAFFINITY all{};
+        for (const KAFFINITY core : cores) {
+            all |= core;
+        }
+        // The default: the GPU threads on cores 1-3 of the first core complex (core 0 takes most
+        // interrupts and DPCs); with 8 or more cores all six guest cores float over cores 0 and
+        // 4-7 (both SMT siblings each), so only one guest core at a time runs paired, whichever
+        // has slack. Fewer cores: front and back only.
+        // EDEN_NX2_PIN_CORES=front,back,worker and EDEN_NX2_PIN_GUEST=g0,g1,...,g5 (each a core
+        // or cores joined by '+', '-' for any core the GPU threads don't use) change it.
+        const bool wide = cores.size() >= 8;
+        std::string gpu_list = wide ? "1,2,3" : "1,2,-";
+        std::string guest_list = wide ? "0+4+5+6+7,0+4+5+6+7,0+4+5+6+7,0+4+5+6+7,0+4+5+6+7,0+4+5+6+7"
+                                      : "-,-,-,-,-,-";
+        if (const char* value = std::getenv("EDEN_NX2_PIN_CORES")) {
+            gpu_list = value;
+        }
+        if (const char* value = std::getenv("EDEN_NX2_PIN_GUEST")) {
+            guest_list = value;
+        }
+        const auto split_list = [](std::string_view text) {
+            std::vector<std::string_view> items;
+            while (true) {
+                const size_t comma = text.find(',');
+                items.push_back(text.substr(0, comma));
+                if (comma == std::string_view::npos) {
+                    return items;
+                }
+                text.remove_prefix(comma + 1);
+            }
+        };
+        const auto gpu = split_list(gpu_list);
+        KAFFINITY gpu_mask{};
+        for (size_t i = 0; i < gpu.size() && i < 3; ++i) {
+            const KAFFINITY mask = gpu[i] == "-" ? 0 : ParseCoreSet(gpu[i], cores);
+            (i == 0 ? result.front : i == 1 ? result.back : result.worker) = mask;
+            gpu_mask |= mask;
+        }
+        const auto guest = split_list(guest_list);
+        for (size_t i = 0; i < result.guest.size(); ++i) {
+            KAFFINITY mask{};
+            if (i < guest.size() && guest[i] != "-") {
+                mask = ParseCoreSet(guest[i], cores);
+            }
+            result.guest[i] = mask != 0 ? mask : all & ~gpu_mask;
+        }
+        LOG_INFO(Common, "Host thread pinning: front {:#x} back {:#x} worker {:#x} guest {:#x}",
+                 result.front, result.back, result.worker, fmt::join(result.guest, " "));
+        return result;
+    }();
+    KAFFINITY mask{};
+    switch (role) {
+    case HostThreadRole::GpuFront:
+        mask = layout.front;
+        break;
+    case HostThreadRole::GpuBack:
+        mask = layout.back;
+        break;
+    case HostThreadRole::VulkanWorker:
+        mask = layout.worker;
+        break;
+    case HostThreadRole::GuestCore:
+        mask = index < layout.guest.size() ? layout.guest[index] : 0;
+        break;
+    }
+    if (mask != 0) {
+        SetThreadAffinityMask(GetCurrentThread(), mask);
+    }
+#else
+    (void)role;
+    (void)index;
+#endif
+}
+
 void SetCurrentThreadToEfficiencyCores() {
 #if defined(__ANDROID__)
     if (ADPF::AddCurrentThread(ADPF::Session::Background)) {
@@ -1125,13 +1267,17 @@ bool Event::WaitFor(const std::chrono::nanoseconds time) {
 }
 #endif
 
+// Any non-zero value of the flag ends the wait (our PhysicalCore keeps its interrupt flag as an
+// atomic<u32>, waited on with Nx2Wait as well).
+template <typename T>
 #if defined(ARCHITECTURE_x86_64) && defined(__clang__)
 __attribute__((target("waitpkg,mwaitx")))
 #endif
-bool WaitForFlag(const std::atomic<bool>& flag, std::chrono::steady_clock::time_point deadline) {
+static bool WaitForFlagImpl(const std::atomic<T>& flag,
+                            std::chrono::steady_clock::time_point deadline) {
 #ifdef ARCHITECTURE_x86_64
     if (const auto& caps = Common::g_cpu_caps; caps.monitorx || caps.waitpkg) {
-        auto* const line = const_cast<std::atomic<bool>*>(std::addressof(flag));
+        auto* const line = const_cast<std::atomic<T>*>(std::addressof(flag));
         const u64 ticks_per_second = Common::g_wall_clock.NsToTicks(std::chrono::seconds{1});
         while (true) {
             if (caps.monitorx) {
@@ -1139,7 +1285,7 @@ bool WaitForFlag(const std::atomic<bool>& flag, std::chrono::steady_clock::time_
             } else {
                 _umonitor(line);
             }
-            if (flag.load(std::memory_order_acquire)) {
+            if (flag.load(std::memory_order_acquire) != T{}) {
                 return true;
             }
             // Armed before the load, so a store after it ends the wait. Interrupts and stores to
@@ -1159,10 +1305,18 @@ bool WaitForFlag(const std::atomic<bool>& flag, std::chrono::steady_clock::time_
         }
     }
 #endif
-    while (!flag.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
+    while (flag.load(std::memory_order_acquire) == T{} && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::yield();
     }
-    return flag.load(std::memory_order_acquire);
+    return flag.load(std::memory_order_acquire) != T{};
+}
+
+bool WaitForFlag(const std::atomic<bool>& flag, std::chrono::steady_clock::time_point deadline) {
+    return WaitForFlagImpl(flag, deadline);
+}
+
+bool WaitForFlag(const std::atomic<u32>& flag, std::chrono::steady_clock::time_point deadline) {
+    return WaitForFlagImpl(flag, deadline);
 }
 
 #ifdef _WIN32

@@ -294,6 +294,13 @@ struct UserConfig {
     /// callbacks.
     bool recompile_on_exclusive_fastmem_failure = true;
 
+    /// x64 only. The host is TSO, so ordered (acquire) loads are emitted as plain loads instead
+    /// of LOCK XADD. Ordered stores keep XCHG, which keeps STLR followed by LDAR ordered.
+    bool tso_ordered_loads = false;
+
+    /// x64 only. DMB that only orders loads (xxLD) or only stores (xxST) is a no-op on TSO.
+    bool elide_ld_st_barriers = false;
+
     /// x64 only. The register allocator moves a value it must evict into a free callee-saved
     /// GPR when there is one, instead of spilling it to the stack.
     bool spill_to_free_gpr = false;
@@ -346,6 +353,12 @@ struct UserConfig {
     /// returns. Spills and the check bit move into the JIT state; the host stack holds one frame
     /// per guest call.
     bool host_call_return = false;
+
+    /// x64 only, with fastmem exclusives and Unsafe_IgnoreGlobalMonitor. LSE atomics (LDADD
+    /// and friends, SWP, CAS) become one host atomic instruction (or a host CAS loop) instead
+    /// of an exclusive load/store pair that ends the block.
+    bool native_lse_atomics = false;
+
 
     /// This option relates to translation. Generally when we run into an unpredictable
     /// instruction the ExceptionRaised callback is called. If this is true, we define

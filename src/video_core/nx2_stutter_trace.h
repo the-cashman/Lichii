@@ -79,7 +79,7 @@ enum class DriverBuild : u8 {
 inline constexpr size_t DriverBuildCount = static_cast<size_t>(DriverBuild::Count);
 
 /// Room for every Nx2Profile::Zone (nx2_profile.h checks it).
-inline constexpr size_t ZoneSlots = 64;
+inline constexpr size_t ZoneSlots = 128; // #717's split GPU thread zones need more than 64
 
 /// Rare operations that can make one frame long on their own, timed apart from the zones they run
 /// in and on every thread, guest threads included.

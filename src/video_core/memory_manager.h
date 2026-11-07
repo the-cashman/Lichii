@@ -178,16 +178,18 @@ public:
     bool IsMemoryDirty(GPUVAddr gpu_addr, size_t size,
                        VideoCommon::CacheType which = VideoCommon::CacheType::All) const;
 
+    /// Switch 2, the split GPU thread's front (GpuSplit::NarrowDrains): whether a read of
+    /// [gpu_addr, gpu_addr + size) still needs the full drain: a page of it is unmapped, or GPU
+    /// work wrote it through the buffer cache (Nx2IsGpuWritten: newer words may be in the cache,
+    /// which only the back may ask or flush), or it reads the syncpoint shim (the back increments
+    /// syncpoints). Without any of these IsMemoryDirty(BufferCache) is false: the buffer cache
+    /// holds GPU-written data only on pages it marked.
+    [[nodiscard]] bool Nx2ReadNeedsDrain(GPUVAddr gpu_addr, std::size_t size) const;
+
     size_t MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const;
 
     [[nodiscard]] u64 MapSerial() const {
         return map_serial.load(std::memory_order_acquire);
-    }
-
-    /// Changes whenever this address space or the device memory behind it is mapped or unmapped:
-    /// a host pointer GetPointer returned is only good while it stays the same.
-    [[nodiscard]] u64 HostPointerSerial() const {
-        return MapSerial() + memory.TranslationGeneration();
     }
 
     /// MaxContinuousRange by walking the page tables (the answer with Nx2Perf off).

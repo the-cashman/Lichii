@@ -9,6 +9,7 @@
 #pragma once
 
 #include <array>
+#include <initializer_list>
 #include <map>
 #include <optional>
 #include <tuple>
@@ -117,6 +118,12 @@ public:
     void EmitExclusiveReadMemoryInline(A64EmitContext& ctx, IR::Inst* inst);
     template<std::size_t bitsize, auto callback>
     void EmitExclusiveWriteMemoryInline(A64EmitContext& ctx, IR::Inst* inst);
+    template<std::size_t bitsize>
+    void EmitAtomicRmwMemory(A64EmitContext& ctx, IR::Inst* inst);
+    template<std::size_t bitsize>
+    void EmitAtomicCasMemory(A64EmitContext& ctx, IR::Inst* inst);
+    using AtomicFallbackFn = u64 (*)(const A64::UserConfig& conf, u64 vaddr, u64 a, u64 b);
+    void EmitAtomicFallbackStub(Xbyak::Reg64 result, std::initializer_list<Xbyak::Reg64> sources, std::optional<u32> param4, AtomicFallbackFn fallback);
 
     // Terminal instruction emitters
     bool EmitLeafTerminal(IR::Term::LeafTerminal const& terminal, IR::LocationDescriptor initial_location, bool is_single_step) noexcept override;

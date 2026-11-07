@@ -5,13 +5,17 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <span>
 #include "common/container/unordered_map.h"
 #include <utility>
+#include <vector>
 
 #include "common/assert.h"
 #include "common/common_types.h"
@@ -34,6 +38,20 @@ namespace VideoCommon {
 
 using Maxwell = Tegra::Engines::Maxwell3D;
 
+/// EDEN_NX2_QUERY_LAZY_SYNC (on unless 0): payload releases (QMD releases, semaphores) whose value
+/// is written to guest memory during the report reach the host's buffers as a guest CPU write
+/// does (the buffer cache uploads the page before GPU work next uses it) instead of a copy at the
+/// next wait for idle, which ended the render pass ~1,200 times a second in Ocarina. Pages holding
+/// GPU-written data, and releases written later (high GPU accuracy, delayed fences), are still
+/// copied.
+inline bool LazyPayloadSync() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_QUERY_LAZY_SYNC");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
 struct SyncValuesStruct {
     VAddr address;
     u64 value;
@@ -55,7 +73,10 @@ public:
     size_t WriteCounter(VAddr address, bool has_timestamp, u32 value,
                         std::optional<u32> subreport = std::nullopt) override {
         auto new_id = BuildQuery(has_timestamp, address, static_cast<u64>(value));
-        pending_sync.push_back(new_id);
+        // The value is kept here too: fence releases free their slot at once, and the slot can
+        // hold another release before the sync (EDEN_NX2_FENCE_TRIM batches them).
+        pending_sync.push_back(PendingSync{new_id, address, static_cast<u64>(value),
+                                           has_timestamp});
         return new_id;
     }
 
@@ -63,33 +84,199 @@ public:
         return !pending_sync.empty();
     }
 
+    void MarkInFlight(size_t query_id) override {
+        if (pending_sync.empty() || pending_sync.back().id != query_id) {
+            return;
+        }
+        pending_sync.back().lazy = true;
+        inflight = true;
+        inflight_skipped = false;
+    }
+
+    bool FinishInFlight(size_t query_id, bool written) override {
+        if (!inflight) {
+            // A wait for idle copied it meanwhile (its pages hold GPU-written data).
+            return false;
+        }
+        inflight = false;
+        if (pending_sync.empty()) {
+            return false;
+        }
+        PendingSync& entry = pending_sync.back();
+        if (entry.id != query_id) {
+            entry.lazy = false;
+            return inflight_skipped;
+        }
+        if (!written) {
+            entry.lazy = false;
+            return inflight_skipped;
+        }
+        if (!inflight_skipped) {
+            // Applied with the next wait for idle, as its copy would have been.
+            return false;
+        }
+        // A wait for idle came between the report and its guest write: apply it now, before
+        // any later GPU work, as the copy at that wait would have been.
+        GuestWrittenRange range{
+            .address = entry.address, .size = SyncSize(entry), .mark = true, .needs_copy = false};
+        NoteGuestWritten(std::span<GuestWrittenRange>(&range, 1));
+        if (range.needs_copy) {
+            entry.lazy = false;
+            return true;
+        }
+        pending_sync.pop_back();
+        return false;
+    }
+
+    void ResolveLazy() override {
+        lazy_ranges.clear();
+        const size_t count = pending_sync.size();
+        for (size_t i = 0; i < count; ++i) {
+            const PendingSync& entry = pending_sync[i];
+            if (!entry.lazy) {
+                continue;
+            }
+            const bool in_flight = inflight && i + 1 == count;
+            lazy_ranges.push_back(GuestWrittenRange{.address = entry.address,
+                                                    .size = SyncSize(entry),
+                                                    .mark = !in_flight,
+                                                    .needs_copy = false});
+        }
+        if (lazy_ranges.empty()) {
+            return;
+        }
+        NoteGuestWritten(lazy_ranges);
+        // Addresses whose newest pending value is now marked CPU-written: an older entry for the
+        // same address must not be copied after the page upload that carries the newer value.
+        superseded.clear();
+        for (size_t i = 0, r = 0; i < count; ++i) {
+            if (!pending_sync[i].lazy) {
+                continue;
+            }
+            const GuestWrittenRange& range = lazy_ranges[r++];
+            const bool in_flight = inflight && i + 1 == count;
+            if (!range.needs_copy && !in_flight) {
+                superseded.emplace_back(i, pending_sync[i].address);
+            }
+        }
+        const auto is_superseded = [&](size_t i, VAddr address) {
+            return std::ranges::any_of(superseded, [&](const auto& s) {
+                return s.first > i && s.second == address;
+            });
+        };
+        size_t range_index = 0;
+        size_t kept = 0;
+        for (size_t i = 0; i < count; ++i) {
+            PendingSync entry = pending_sync[i];
+            if (entry.lazy) {
+                const GuestWrittenRange& range = lazy_ranges[range_index++];
+                const bool in_flight = inflight && i + 1 == count;
+                if (range.needs_copy) {
+                    // Pages with GPU-written data: copied by this wait as before.
+                    entry.lazy = false;
+                    if (in_flight) {
+                        inflight = false;
+                    }
+                } else if (in_flight) {
+                    // Its guest write is still to come: FinishInFlight applies it.
+                    inflight_skipped = true;
+                } else {
+                    continue;
+                }
+            } else if (is_superseded(i, entry.address)) {
+                continue; // a newer release of this address is applied as a CPU write
+            }
+            pending_sync[kept++] = entry;
+        }
+        pending_sync.resize(kept);
+    }
+
+    bool HasCopyPending() const override {
+        const size_t count = pending_sync.size();
+        for (size_t i = 0; i < count; ++i) {
+            if (!pending_sync[i].lazy || !(inflight && inflight_skipped && i + 1 == count)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     void SyncWrites() override {
         if (pending_sync.empty()) {
             return;
         }
+        // The in-flight release a wait for idle left to its report stays pending (ResolveLazy).
+        std::optional<PendingSync> kept;
+        if (inflight && inflight_skipped && pending_sync.back().lazy) {
+            kept = pending_sync.back();
+            pending_sync.pop_back();
+        } else {
+            inflight = false;
+        }
         std::vector<SyncValuesStruct> sync_values;
         sync_values.reserve(pending_sync.size());
-        for (size_t pending_id : pending_sync) {
-            auto& query = slot_queries[pending_id];
-            if (True(query.flags & QueryFlagBits::IsRewritten) ||
-                True(query.flags & QueryFlagBits::IsInvalidated)) {
+        std::vector<VAddr> seen;
+        seen.reserve(pending_sync.size());
+        // Newest first: only the last write of an address counts (one copy command must not
+        // write a range twice).
+        for (auto it = pending_sync.rbegin(); it != pending_sync.rend(); ++it) {
+            if (std::find(seen.begin(), seen.end(), it->address) != seen.end()) {
                 continue;
             }
-            query.flags |= QueryFlagBits::IsHostSynced;
+            seen.push_back(it->address);
+            auto& query = slot_queries[it->id];
+            const bool same = query.guest_address == it->address && query.value == it->value;
+            if (same && (True(query.flags & QueryFlagBits::IsRewritten) ||
+                         True(query.flags & QueryFlagBits::IsInvalidated))) {
+                continue;
+            }
+            if (same) {
+                query.flags |= QueryFlagBits::IsHostSynced;
+            }
             sync_values.emplace_back(SyncValuesStruct{
-                .address = query.guest_address,
-                .value = query.value,
-                .size = static_cast<u64>(True(query.flags & QueryFlagBits::HasTimestamp) ? 8 : 4)});
+                .address = it->address,
+                .value = it->value,
+                .size = static_cast<u64>(it->has_timestamp ? 8 : 4)});
         }
         pending_sync.clear();
+        if (kept) {
+            pending_sync.push_back(*kept);
+        }
         if (sync_values.size() > 0) {
             runtime.template SyncValues<SyncValuesStruct>(sync_values);
         }
     }
 
 private:
+    struct PendingSync {
+        size_t id;
+        VAddr address;
+        u64 value;
+        bool has_timestamp;
+        bool lazy{}; ///< EDEN_NX2_QUERY_LAZY_SYNC: the value is (or is about to be) in guest memory
+    };
+
+    /// The guest bytes a release wrote: the value and, for long reports, the timestamp.
+    static u64 SyncSize(const PendingSync& entry) {
+        return entry.has_timestamp ? 16 : 4;
+    }
+
+    void NoteGuestWritten(std::span<GuestWrittenRange> ranges) {
+        if constexpr (requires { runtime.NoteGuestWrittenRanges(ranges); }) {
+            runtime.NoteGuestWrittenRanges(ranges);
+        } else {
+            for (GuestWrittenRange& range : ranges) {
+                range.needs_copy = true;
+            }
+        }
+    }
+
     RuntimeType& runtime;
-    std::deque<size_t> pending_sync;
+    std::deque<PendingSync> pending_sync;
+    std::vector<GuestWrittenRange> lazy_ranges;
+    std::vector<std::pair<size_t, VAddr>> superseded;
+    bool inflight{};         ///< pending_sync.back() is a lazy release still in its report
+    bool inflight_skipped{}; ///< A wait for idle left it to FinishInFlight
 };
 
 template <typename Traits>
@@ -288,46 +475,29 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     const u64 report_size = has_timestamp ? 16 : 4;
     const bool immediate =
         !is_fence && !Settings::IsGPULevelHigh() && counter_type == QueryType::Payload;
-    // Written later: the buffer cache keeps GPU writes over it until then (NoteReportPending).
-    const bool report_noted =
-        !immediate && impl->rasterizer.NoteReportPending(cpu_addr, report_size);
-    // What the operation needs, small enough for MSVC's std::function to hold without allocating:
-    // a report per draw (Ocarina of Time's occlusion counts) allocated one each. Host pointers are
-    // looked up when it runs.
-    struct ReportOp {
-        QueryBase* query;
-        DAddr cpu_addr;
-        GPUVAddr addr;
-        QueryLocation location;
-        u32 asid;
-        u8 counter_type;
-        bool mirrored;
-        bool wide;
-        bool noted;
-    };
-    const ReportOp report_op{
-        .query = query,
-        .cpu_addr = cpu_addr,
-        .addr = addr,
-        .location = query_location,
-        .asid = static_cast<u32>(gpu_memory->GetID()),
-        .counter_type = static_cast<u8>(counter_type),
-        .mirrored = mirrored,
-        .wide = has_timestamp,
-        .noted = report_noted,
-    };
-    const auto operation_body = [this, op = report_op] {
-        const DAddr cpu_addr = op.cpu_addr;
-        const GPUVAddr addr = op.addr;
-        const size_t asid = op.asid;
-        const QueryType counter_type = static_cast<QueryType>(op.counter_type);
-        const bool mirrored = op.mirrored;
-        const u64 report_size = op.wide ? 16 : 4;
-        const QueryLocation query_location = op.location;
-        QueryBase* const query_base = op.query;
-        auto* const streamer = impl->streamers[query_location.stream_id.Value()];
+    // #1028, written later: the buffer cache keeps GPU writes over it until then
+    // (NoteReportPending). Only its early downloads need that (EDEN_NX2_ASYNC_READBACK).
+    const bool report_noted = !immediate && VideoCore::AsyncReadback::Enabled() &&
+                              impl->rasterizer.NoteReportPending(cpu_addr, report_size);
+    // #717's lazy fence path (EDEN_NX2_QUERY_LAZY_SYNC): with the fence skipped as empty, its
+    // operation wrote the value during SignalFence. Since #337 a fence-flagged report's fence is
+    // never skipped, so this only applies where the fence still runs at once.
+    const bool is_synced = (Settings::IsGPUFenceBehaviorDefault() ? !Settings::IsGPULevelHigh() : !Settings::IsGPUFenceBehaviorBalanced() && !Settings::IsGPUFenceBehaviorAccurate()) && is_fence;
+    // FlushQueryResults waits for these: completed on every way out of the operation, written or
+    // discarded, and when the operation is dropped without running.
+    auto report = std::make_shared<Tegra::Nx2AsyncReport>(cpu_addr);
+    std::function<void()> operation([this, streamer, query_base = query, query_location,
+                                     pointer, pointer_timestamp, cpu_addr, addr,
+                                     asid = gpu_memory->GetID(), counter_type, report, mirrored,
+                                     report_size, report_noted] {
+        struct Complete {
+            Tegra::Nx2AsyncReport& report;
+            ~Complete() {
+                report.Complete();
+            }
+        } const complete{*report};
         SCOPE_EXIT {
-            if (op.noted) {
+            if (report_noted) {
                 impl->rasterizer.FinishReport(cpu_addr, report_size);
             }
         };
@@ -358,20 +528,14 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         query_base->value += streamer->GetAmendValue();
         streamer->SetAccumulationValue(query_base->value);
         FinishReads(cpu_addr, True(query_base->flags & QueryFlagBits::HasTimestamp) ? 16 : 4);
-        u8* const pointer = impl->device_memory.template GetPointer<u8>(cpu_addr);
-        u8* const pointer_timestamp = impl->device_memory.template GetPointer<u8>(cpu_addr + 8);
         auto& shadow = Tegra::Nx2MirrorShadow::Get();
-        if (pointer == nullptr) {
-            // Unmapped since the report: nothing to write.
-        } else if (mirrored && shadow.Diverts(cpu_addr)) {
+        if (mirrored && shadow.Diverts(cpu_addr)) {
             u32 guest;
             std::memcpy(&guest, pointer, sizeof(guest));
             shadow.Set(cpu_addr, static_cast<u32>(query_base->value), guest);
         } else if (True(query_base->flags & QueryFlagBits::HasTimestamp)) {
             u64 timestamp = impl->gpu.GetTicks();
-            if (pointer_timestamp != nullptr) {
-                std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
-            }
+            std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
             std::memcpy(pointer, &query_base->value, sizeof(query_base->value));
         } else {
             u32 value = static_cast<u32>(query_base->value);
@@ -391,14 +555,35 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                      static_cast<u32>(query_base->flags));
         }
         impl->pending_unregister.push_back(query_location);
+    });
+    // EDEN_NX2_QUERY_LAZY_SYNC: whether guest memory holds the release's value (the fence ran
+    // its operation at once, or the write below).
+    const bool lazy_payload = counter_type == QueryType::Payload && LazyPayloadSync();
+    const auto guest_holds_value = [pointer, has_timestamp, payload] {
+        if (pointer == nullptr) {
+            return false;
+        }
+        if (has_timestamp) {
+            u64 value{};
+            std::memcpy(&value, pointer, sizeof(value));
+            return value == static_cast<u64>(payload);
+        }
+        u32 value{};
+        std::memcpy(&value, pointer, sizeof(value));
+        return value == payload;
     };
-    static_assert(sizeof(operation_body) <= 48,
-                  "the report operation must fit MSVC's std::function storage");
-    std::function<void()> operation(operation_body);
     if (is_fence) {
+        report->Issue();
+        const bool lazy_fence = lazy_payload && is_synced;
+        if (lazy_fence) {
+            streamer->MarkInFlight(new_query_id);
+        }
         VideoCore::g_signaling_query_report_fence = true;
         impl->rasterizer.SignalFence(std::move(operation));
         VideoCore::g_signaling_query_report_fence = false;
+        if (lazy_fence && streamer->FinishInFlight(new_query_id, guest_holds_value())) {
+            NotifyWFI();
+        }
     } else {
         if (immediate) {
             FinishReads(cpu_addr, has_timestamp ? 16 : 4);
@@ -427,9 +612,15 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                          static_cast<u32>(counter_type), has_timestamp ? 8 : 4, payload,
                          static_cast<u32>(query->flags));
             }
+            if (lazy_payload) {
+                // Written: applied with the next wait for idle, as its copy would have been.
+                streamer->MarkInFlight(new_query_id);
+                streamer->FinishInFlight(new_query_id, guest_holds_value());
+            }
             streamer->Free(new_query_id);
             return;
         }
+        report->Issue();
         impl->rasterizer.SyncOperation(std::move(operation));
     }
     auto [cont_addr, base] = gen_caching_indexing(cpu_addr);
@@ -499,6 +690,22 @@ void QueryCacheBase<Traits>::NotifyWFI() {
         [&should_sync](StreamerInterface* streamer) { should_sync |= streamer->HasPendingSync(); });
     if (!should_sync) {
         return;
+    }
+    if (LazyPayloadSync()) {
+        // Payload releases already in guest memory go to the buffer cache as guest CPU writes:
+        // without anything to copy, the render pass stays open (EDEN_NX2_QUERY_LAZY_SYNC).
+        StreamerInterface* const payload = impl->streamers[static_cast<size_t>(QueryType::Payload)];
+        if (payload != nullptr) {
+            payload->ResolveLazy();
+        }
+        should_sync = false;
+        impl->ForEachStreamer([&should_sync, payload](StreamerInterface* streamer) {
+            should_sync |=
+                streamer == payload ? streamer->HasCopyPending() : streamer->HasPendingSync();
+        });
+        if (!should_sync) {
+            return;
+        }
     }
 
     impl->ForEachStreamer([](StreamerInterface* streamer) { streamer->PresyncWrites(); });
@@ -641,10 +848,12 @@ bool QueryCacheBase<Traits>::HasUncommittedFlushes() const {
 }
 
 template <typename Traits>
-bool QueryCacheBase<Traits>::HasPendingFenceWork() const {
+bool QueryCacheBase<Traits>::HasPendingFenceWork(bool ignore_payload_sync) const {
     bool result = false;
-    impl->ForEachStreamer([&result](StreamerInterface* streamer) {
-        result |= streamer->HasUnsyncedQueries() || streamer->HasPendingSync();
+    StreamerInterface* const payload = impl->streamers[static_cast<size_t>(QueryType::Payload)];
+    impl->ForEachStreamer([&](StreamerInterface* streamer) {
+        result |= streamer->HasUnsyncedQueries() ||
+                  ((!ignore_payload_sync || streamer != payload) && streamer->HasPendingSync());
         return result;
     });
     return result;

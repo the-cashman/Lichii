@@ -69,6 +69,8 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
         Common::SetCurrentThreadToPerformanceCores();
         if (Settings::values.pin_gpu_threads.GetValue()) {
             Common::PinCurrentThread(Common::PinnedRole::GpuFront);
+        } else {
+            Common::PinHostThread(Common::HostThreadRole::GpuFront);
         }
         system.RegisterHostThread();
 
@@ -122,6 +124,11 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     last_progress = std::chrono::steady_clock::now();
                 }
                 if (!popped) {
+                    // EDEN_NX2_PUBLISH_WAITS: what the resumed channels sent goes to the back
+                    // before this thread yields or sleeps (Commit publishes every 256 words).
+                    if (split.Active()) {
+                        split.PublishBeforeWait();
+                    }
                     if (!scheduler.HasPendingChannels()) {
                         continue;
                     }
@@ -225,6 +232,11 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     });
                 } else {
                     ASSERT(false);
+                }
+                if (!std::holds_alternative<SubmitListCommand>(next.data)) {
+                    // Syncs, maps, flushes and composites write guest memory anywhere.
+                    split.NoteUnboundedWrite(false,
+                                             VideoCommon::UnboundedCause::GpuThreadCommand);
                 }
                 split.Defer([state_ptr = &state, fence = next.fence, block = next.block] {
                     SignalCommand(*state_ptr, fence, block);

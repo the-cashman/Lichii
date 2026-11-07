@@ -18,6 +18,9 @@ struct RasterizerDownloadArea {
     VAddr start_address;
     VAddr end_address;
     bool preemtive;
+    /// Not preemtive, but every GPU write there has a download on its way: wait for it to land
+    /// instead of flushing (Nx2Reactive::WaitLanding).
+    bool wait_landing{};
     /// What guest memory lacks there is on its way for an earlier read: nothing to flush, only to
     /// wait for (RasterizerInterface::FinishRead).
     bool in_flight{};

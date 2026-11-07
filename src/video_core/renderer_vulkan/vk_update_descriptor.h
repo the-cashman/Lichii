@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstring>
 #include <memory>
 #include <span>
@@ -106,10 +107,19 @@ public:
         *(payload_cursor++) = texel_buffer;
     }
 
-    /// Entries an earlier draw added (delta draws).
-    void AddEntries(std::span<const DescriptorUpdateEntry> entries) {
-        std::memcpy(payload_cursor, entries.data(), entries.size_bytes());
-        payload_cursor += entries.size();
+    /// Adds entries recorded from an earlier payload (a pipeline's cached image bindings).
+    void AddEntries(const DescriptorUpdateEntry* entries, size_t count) {
+        payload_cursor = std::copy_n(entries, count, payload_cursor);
+    }
+
+    /// Adds an entry kept as raw bytes (TextureCache::BindingMemo::payload).
+    void AddPayload(const void* entry) {
+        std::memcpy(static_cast<void*>(payload_cursor++), entry, sizeof(DescriptorUpdateEntry));
+    }
+
+    /// The entry added last.
+    [[nodiscard]] const DescriptorUpdateEntry& Last() const noexcept {
+        return payload_cursor[-1];
     }
 
     void AddTexelBuffer(VkBufferView texel_buffer, VkDeviceAddress base_address,

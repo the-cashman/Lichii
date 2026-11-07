@@ -397,6 +397,10 @@ void RasterizerOpenGL::DrawTexture() {
 }
 
 void RasterizerOpenGL::DispatchCompute() {
+    // As after a draw, serve sync requests once dispatch resources and cache locks are released.
+    SCOPE_EXIT {
+        gpu.TickWork();
+    };
     gpu_memory->FlushCaching();
     ComputePipeline* const pipeline{shader_cache.CurrentComputePipeline()};
     if (!pipeline) {

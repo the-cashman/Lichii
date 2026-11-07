@@ -28,6 +28,13 @@
 //   too and is compared (CheckDmaRead).
 namespace VideoCore::AsyncReadback {
 
+/// #1028's read-back is always on here. #717's reactive read-back (nx2_reactive.h) only runs
+/// without it, so it stays off, as in builds where EDEN_NX2_ASYNC_READBACK was a switch (on by
+/// default).
+[[nodiscard]] constexpr bool Enabled() {
+    return true;
+}
+
 /// EDEN_NX2_READ_CHECK's value: unset, 0 or not a number checks none.
 [[nodiscard]] inline u64 ParseReadCheck(const char* value) {
     return value == nullptr ? 0 : static_cast<u64>(std::strtoull(value, nullptr, 10));

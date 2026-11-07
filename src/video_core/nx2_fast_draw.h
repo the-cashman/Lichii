@@ -27,7 +27,8 @@ class MemoryManager;
 /// when they reach the pipeline's texture handles at their GPU addresses or through another
 /// mapping of their device memory). Anything else that could change what a resolve produces bumps
 /// a serial: a 3D register that changes, any 3D method with side effects (uploads, reports,
-/// clears, barriers, ...), constant buffer data reaching the texture or sampler headers (the same
+/// clears, barriers, ...; counter resets and render enable writes change query state only and
+/// don't), constant buffer data reaching the texture or sampler headers (the same
 /// way), any other engine, deferred calls on the split's back (except the ones marked
 /// GpuSplit::FastDrawNeutral), GPU::TickWork requests, texture cache writes, unmaps and
 /// deletions, shader removals, fence releases, HLE macros and frames. The rasterizer takes the
@@ -67,6 +68,9 @@ inline std::atomic<bool> g_enabled{true};
 /// then the vertex attribute formats are draw parameters, as only each attribute's type class is
 /// in the pipeline key. Set by the pipeline cache before the GPU threads run, read on the back.
 inline std::atomic<bool> g_dynamic_vertex_input{};
+/// Whether the host binds vertex stream strides as dynamic state (set by the renderer): a
+/// stride change then leaves the pipeline as it is.
+inline std::atomic<bool> g_dynamic_strides{false};
 
 /// Any thread: whether fast draws run (always, unless a test turned them off). The rasterizer
 /// latches it per draw (on the thread that draws) and starts with a full resolve when it turns on.
