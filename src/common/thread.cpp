@@ -49,6 +49,11 @@
 #ifdef __linux__
 #include <sys/resource.h>
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
 
 namespace {
 constexpr int NICE_AUDIO = -16;
@@ -84,6 +89,129 @@ int NiceValueForPriority(Common::ThreadPriority priority) {
     }();
     return (std::max)(wanted, (std::min)(NICE_DEFAULT, LowestAllowedNice()));
 }
+// EDEN_NX2_ISOLATE=<thread name>[,<thread name>...] (Linux): give each named thread a physical
+// core of its own, the highest-numbered ones, and keep every other thread of the process off them
+// (both SMT siblings). The GPU split's back thread is the limit in Ocarina of Time's heavy views
+// and shared its core with another busy emulator thread a quarter of the time it ran.
+// Off by default.
+#ifndef __ANDROID__
+struct IsolationPlan {
+    std::vector<std::string> names;
+    std::vector<cpu_set_t> reserved; // per name: the CPUs of its physical core
+    cpu_set_t rest;                  // everything else the process may use
+    bool active = false;
+};
+
+int SiblingsOf(int cpu, cpu_set_t* out) {
+    CPU_ZERO(out);
+    char path[96];
+    std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list",
+                  cpu);
+    std::FILE* file = std::fopen(path, "r");
+    if (file == nullptr) {
+        CPU_SET(cpu, out);
+        return 1;
+    }
+    char text[64] = {};
+    const size_t got = std::fread(text, 1, sizeof(text) - 1, file);
+    std::fclose(file);
+    text[got] = '\0';
+    int count = 0;
+    for (char* part = std::strtok(text, ",\n"); part != nullptr; part = std::strtok(nullptr, ",\n")) {
+        int lo = 0;
+        int hi = 0;
+        const int n = std::sscanf(part, "%d-%d", &lo, &hi);
+        if (n < 1) {
+            continue;
+        }
+        if (n == 1) {
+            hi = lo;
+        }
+        for (int c = lo; c <= hi && c < CPU_SETSIZE; ++c) {
+            CPU_SET(c, out);
+            ++count;
+        }
+    }
+    if (count == 0) {
+        CPU_SET(cpu, out);
+        count = 1;
+    }
+    return count;
+}
+
+const IsolationPlan& Isolation() {
+    static const IsolationPlan plan = [] {
+        IsolationPlan p;
+        const char* text = std::getenv("EDEN_NX2_ISOLATE");
+        if (text == nullptr || text[0] == '\0') {
+            return p;
+        }
+        std::string list{text};
+        for (size_t start = 0; start <= list.size();) {
+            const size_t end = std::min(list.find(',', start), list.size());
+            if (end > start) {
+                p.names.emplace_back(list.substr(start, end - start));
+            }
+            start = end + 1;
+        }
+        cpu_set_t allowed;
+        CPU_ZERO(&allowed);
+        if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+            return p;
+        }
+        p.rest = allowed;
+        int cpu = CPU_SETSIZE - 1;
+        for (size_t i = 0; i < p.names.size(); ++i) {
+            while (cpu >= 0 && !CPU_ISSET(cpu, &p.rest)) {
+                --cpu;
+            }
+            if (cpu < 0) {
+                break;
+            }
+            cpu_set_t core;
+            SiblingsOf(cpu, &core);
+            CPU_AND(&core, &core, &allowed);
+            for (int c = 0; c < CPU_SETSIZE; ++c) {
+                if (CPU_ISSET(c, &core)) {
+                    CPU_CLR(c, &p.rest);
+                }
+            }
+            p.reserved.push_back(core);
+        }
+        // Leave at least four CPUs to everything else, or don't isolate at all.
+        if (p.reserved.size() != p.names.size() || CPU_COUNT(&p.rest) < 4) {
+            p.names.clear();
+            p.reserved.clear();
+            return p;
+        }
+        p.active = true;
+        return p;
+    }();
+    return plan;
+}
+
+// Before main: the main thread, and with it every thread created later, starts on the rest.
+[[maybe_unused]] const bool g_isolation_applied = [] {
+    const IsolationPlan& plan = Isolation();
+    if (plan.active) {
+        sched_setaffinity(0, sizeof(plan.rest), &plan.rest);
+    }
+    return plan.active;
+}();
+
+void ApplyIsolationForName(const char* name) {
+    const IsolationPlan& plan = Isolation();
+    if (!plan.active) {
+        return;
+    }
+    for (size_t i = 0; i < plan.names.size(); ++i) {
+        if (plan.names[i] == name) {
+            sched_setaffinity(0, sizeof(plan.reserved[i]), &plan.reserved[i]);
+            return;
+        }
+    }
+}
+#endif // __ANDROID__
 } // Anonymous namespace
 #endif
 
@@ -699,6 +827,9 @@ void SetCurrentThreadName(const char* name) {
 #elif defined(__NetBSD__)
     pthread_setname_np(pthread_self(), "%s", (void*)name);
 #elif defined(__linux__) || defined(__CYGWIN__) || defined(__sun__) || defined(__glibc__) || defined(__managarm__)
+#if defined(__linux__) && !defined(__ANDROID__)
+    ApplyIsolationForName(name);
+#endif
     int ret = pthread_setname_np(pthread_self(), name);
     if (ret == ERANGE) {
         // Linux limits thread names to 15 characters and will outright reject any
