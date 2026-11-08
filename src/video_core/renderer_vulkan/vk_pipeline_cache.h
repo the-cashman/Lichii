@@ -128,6 +128,9 @@ struct ComputePipelineCacheEntry {
                                        const ComputePipelineCacheKey& key) const;
 };
 
+/// EDEN_NX2_NAN_GUARD: whether the fragment shader with this hash writes 0 instead of NaN.
+bool NanGuardShader(u64 hash);
+
 class PipelineCache : public VideoCommon::ShaderCache {
 public:
     explicit PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_, const Device& device,

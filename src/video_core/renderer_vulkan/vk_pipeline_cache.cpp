@@ -2520,6 +2520,44 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::RebuildGraphicsPipeline(KeptGra
     return pipeline;
 }
 
+/// EDEN_NX2_NAN_GUARD=<hash>[,<hash>...] or =all: the listed fragment shaders (or all of them)
+/// write 0 instead of NaN to their float color outputs. A workaround for shaders that read bad
+/// data and would spread NaN through later passes (white areas after bloom); it hides the
+/// symptom, not the cause.
+bool NanGuardShader(u64 hash) {
+    static bool all = false;
+    static const std::vector<u64> hashes = [] {
+        std::vector<u64> result;
+        const char* const value = std::getenv("EDEN_NX2_NAN_GUARD");
+        if (value == nullptr) {
+            return result;
+        }
+        const std::string_view list{value};
+        if (list == "all") {
+            all = true;
+            LOG_INFO(Render_Vulkan, "Nx2Perf: NaN guard on every fragment shader");
+            return result;
+        }
+        size_t start = 0;
+        while (start < list.size()) {
+            size_t end = list.find(',', start);
+            if (end == std::string_view::npos) {
+                end = list.size();
+            }
+            const std::string item{list.substr(start, end - start)};
+            char* parsed_end = nullptr;
+            const u64 parsed = std::strtoull(item.c_str(), &parsed_end, 16);
+            if (!item.empty() && parsed_end != item.c_str() && *parsed_end == '\0') {
+                result.push_back(parsed);
+            }
+            start = end + 1;
+        }
+        LOG_INFO(Render_Vulkan, "Nx2Perf: NaN guard on {} fragment shader(s)", result.size());
+        return result;
+    }();
+    return all || std::ranges::find(hashes, hash) != hashes.end();
+}
+
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     ShaderPools& pools, const GraphicsPipelineCacheKey& key,
     std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
@@ -2966,6 +3004,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             PruneUnreadGeometryOutputs(
                 program, programs[static_cast<size_t>(Maxwell::ShaderType::Pixel)], key,
                 device.IsNvGeometryShaderPassthroughSupported());
+        }
+        if (program.stage == Shader::Stage::Fragment &&
+            NanGuardShader(key.unique_hashes[index])) {
+            runtime_info.nan_guard_frag_colors = true;
         }
         // EDEN_NX2_MESH_EMULATION_DUMP=<dir>: write the emulation's vertex shader for spirv-val.
         // (Emitting the mesh program a second time here to dump its compute shader crashed the

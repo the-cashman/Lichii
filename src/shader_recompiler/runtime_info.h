@@ -97,6 +97,8 @@ struct RuntimeInfo {
 
     bool convert_depth_mode{};
     bool force_early_z{};
+    /// Fragment stage: float color outputs replace NaN with 0 (EDEN_NX2_NAN_GUARD).
+    bool nan_guard_frag_colors{};
 
     /// Descriptor set of every resource the stage declares (0 normally; per-stage sets for
     /// graphics pipeline libraries: vertex 0, fragment 1).
