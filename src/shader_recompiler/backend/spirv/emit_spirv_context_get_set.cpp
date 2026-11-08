@@ -638,7 +638,7 @@ Id EmitRenderArea(EmitContext& ctx) {
 }
 
 // A dynamic index past the array is undefined in SPIR-V: drivers that put the array in scratch
-// memory (RADV) read or write wherever the offset points and fault the GPU (Kirby Air Riders).
+// memory (RADV) read or write wherever the offset points and fault the GPU.
 // Out-of-range words go to the spare word past the end; the frontend already turns such loads
 // into zero.
 static Id LocalPointer(EmitContext& ctx, Id word_offset) {
