@@ -889,6 +889,16 @@ void PinCurrentThread(PinnedRole role) {
         SelectCurrentThreadCpuSets(ids);
     }
 #elif defined(__linux__) && !defined(__ANDROID__)
+    // EDEN_NX2_ISOLATE already placed the threads it names (SetCurrentThreadName) and keeps every
+    // other thread off their cores: pinning on top would move them to other cores and put guest
+    // cores onto the isolated ones. It wins; the setting applies without it.
+    if (Isolation().active) {
+        [[maybe_unused]] static const bool logged = [] {
+            LOG_INFO(Common, "GPU thread pinning skipped: EDEN_NX2_ISOLATE places the threads");
+            return true;
+        }();
+        return;
+    }
     static const GpuThreadPinning plan = [] {
         GpuThreadPinning result = PlanGpuThreadPinning(LinuxProcessors());
         if (result.front.empty()) {
