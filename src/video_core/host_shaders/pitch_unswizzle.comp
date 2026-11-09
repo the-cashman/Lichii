@@ -80,5 +80,10 @@ void main() {
 
     const uvec4 texel = ReadTexel(offset);
     const ivec2 coord = ivec2(gl_GlobalInvocationID.xy) + destination;
+    // Workgroups round the dispatch up past the image; on AMD a store outside it lands in other
+    // memory (see astc_decoder.comp).
+    if (any(greaterThanEqual(coord, imageSize(output_image)))) {
+        return;
+    }
     imageStore(output_image, coord, texel);
 }
