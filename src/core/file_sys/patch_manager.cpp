@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <optional>
 #include <span>
@@ -61,6 +62,8 @@ struct BuiltinPatch {
     std::span<const BuiltinPatchRecord> records;
     size_t state_offset = 0;
     size_t state_size = 0;
+    /// Applied only while this returns true (an env switch); null means always.
+    bool (*env_enabled)() = nullptr;
     // Another built-in this one contains; it is skipped once this one is applied.
     std::string_view replaces{};
     // Applies only with NVIDIA DLSS on at this quality in docked mode, and is not listed in
@@ -329,6 +332,57 @@ constexpr std::array FPS_UNLOCK_RECORDS{
     BuiltinPatchRecord{0x3C46A40, TURN_SPEED_ROUTINE, {}, true},
 };
 
+// EDEN_NX2_OOT_SHADOW_RES (off when unset; the launcher sets x2 for the test tiles): the sun's shadow cascades (a D16
+// array, 3 layers of 1600x1600 in Kokiri Forest) larger. Each frame the game sizes them itself and
+// rounds the size up to 8; the instruction that starts the rounding is replaced. "x1.5", "x2",
+// "x3" or "x4" multiply the game's own size (it then rounds down to 8), a number 256..4096 (a
+// multiple of 8) fixes it. Width and height follow. Bigger maps need room in the game's dynamic
+// texture pool: the built-in Texture Pool x2 (#1313) above doubles it.
+std::array<u8, 4> OOT_SHADOW_RES_WORD{};
+constexpr std::array<u8, 4> OOT_SHADOW_RES_ORIGINAL{0x28, 0x1D, 0x00, 0x11}; // add w8, w9, #7
+constexpr std::array OOT_SHADOW_RES_RECORDS{
+    BuiltinPatchRecord{0x4729EC, OOT_SHADOW_RES_WORD, OOT_SHADOW_RES_ORIGINAL},
+};
+
+u32 OotShadowResWord() {
+    static const u32 word = [] {
+        const char* value = std::getenv("EDEN_NX2_OOT_SHADOW_RES");
+        if (value == nullptr || value[0] == 0) {
+            return 0U;
+        }
+        const std::string_view text{value};
+        if (text == "x1.5") {
+            return 0x0B490528U; // add w8, w9, w9, lsr #1
+        }
+        if (text == "x2") {
+            return 0x531F7928U; // lsl w8, w9, #1
+        }
+        if (text == "x3") {
+            return 0x0B090528U; // add w8, w9, w9, lsl #1
+        }
+        if (text == "x4") {
+            return 0x531E7528U; // lsl w8, w9, #2
+        }
+        const unsigned long n = std::strtoul(value, nullptr, 10);
+        if (n < 256 || n > 4096 || (n & 7) != 0) {
+            LOG_WARNING(Loader, "EDEN_NX2_OOT_SHADOW_RES={}: not x1.5/x2/x3/x4 or 256..4096 in steps of 8",
+                        value);
+            return 0U;
+        }
+        return 0x52800008U | (static_cast<u32>(n) << 5); // movz w8, #n
+    }();
+    return word;
+}
+
+bool OotShadowResEnabled() {
+    const u32 word = OotShadowResWord();
+    if (word == 0) {
+        return false;
+    }
+    std::memcpy(OOT_SHADOW_RES_WORD.data(), &word, sizeof(word));
+    return true;
+}
+
 constexpr std::array BUILTIN_PATCHES{
     // Ocarina of Time takes its "dynamic resolution disabled" path, so the 3D renders at full scale
     // instead of following the GPU-time controller down to its 480p floor.
@@ -396,6 +450,14 @@ constexpr std::array BUILTIN_PATCHES{
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = RENDER_ULTRA_RECORDS,
         .dlss_quality = Settings::NvidiaDlssQuality::UltraPerformance,
+    },
+    BuiltinPatch{
+        .name = "Sun shadow map size (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = OOT_SHADOW_RES_RECORDS,
+        .env_enabled = OotShadowResEnabled,
     },
 };
 
@@ -838,6 +900,10 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         }
         if (std::find(disabled.cbegin(), disabled.cend(), patch.name) != disabled.cend()) {
             LOG_INFO(Loader, "    - Skipping \"{}\": disabled in Add-Ons", patch.name);
+            continue;
+        }
+        if (patch.env_enabled != nullptr && !patch.env_enabled()) {
+            LOG_INFO(Loader, "    - Skipping \"{}\": off by its EDEN_NX2_ switch", patch.name);
             continue;
         }
         if (std::find(replaced.cbegin(), replaced.cend(), patch.name) != replaced.cend()) {
