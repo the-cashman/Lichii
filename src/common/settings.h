@@ -411,6 +411,9 @@ struct Values {
                                                   false};
     // NVIDIA DLSS (through NVIDIA Streamline) in place of a game's DLSS.
     SwitchableSetting<bool> nvidia_dlss{linkage, false, "nvidia_dlss", Category::Renderer};
+    SwitchableSetting<bool> ocarina_fsr{linkage, false, "ocarina_fsr", Category::Renderer};
+    // AMD FSR 4 in place of FSR 3.1 where FSR replaces a game's upscaler (Windows, AMD's driver).
+    SwitchableSetting<bool> amd_fsr4{linkage, false, "amd_fsr4", Category::Renderer};
     SwitchableSetting<AspectRatio, true> aspect_ratio{linkage,
                                                       AspectRatio::R16_9,
                                                       "aspect_ratio",
@@ -1023,6 +1026,12 @@ struct Values {
     Setting<bool> log_flush_line{linkage, false, "flush_line", Category::Miscellaneous, Specialization::Default, true, true};
     Setting<bool> censor_username{linkage, true, "censor_username", Category::Miscellaneous};
     Setting<bool> first_launch{linkage, true, "first_launch", Category::Miscellaneous};
+    // The recommended settings offer (common/recommended_settings.h): whether the user has
+    // answered it, and the values its settings held before they were applied.
+    Setting<bool> recommended_settings_prompt_shown{
+        linkage, false, "recommended_settings_prompt_shown", Category::Miscellaneous};
+    Setting<std::string> recommended_settings_backup{
+        linkage, {}, "recommended_settings_backup", Category::Miscellaneous};
 
     // Network
     Setting<std::string> network_interface{linkage, std::string(), "network_interface",

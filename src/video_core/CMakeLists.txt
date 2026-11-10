@@ -65,6 +65,7 @@ add_library(video_core STATIC
     render_trace.h
     fsr.cpp
     fsr.h
+    fsr4_support.h
     game_dlss_status.cpp
     game_dlss_status.h
     host1x/codecs/decoder.cpp
@@ -178,6 +179,8 @@ add_library(video_core STATIC
     renderer_vulkan/maxwell_to_vk.cpp
     renderer_vulkan/maxwell_to_vk.h
     renderer_vulkan/pipeline_build.h
+    renderer_vulkan/pipeline_build_failure.cpp
+    renderer_vulkan/pipeline_build_failure.h
     renderer_vulkan/pipeline_build_trace.h
     renderer_vulkan/pipeline_helper.h
     renderer_vulkan/pipeline_optimization.h
@@ -197,6 +200,11 @@ add_library(video_core STATIC
     renderer_vulkan/vk_compute_pass.h
     renderer_vulkan/vk_fsr3_upscaler.cpp
     renderer_vulkan/vk_fsr3_upscaler.h
+    renderer_vulkan/vk_fsr4_upscaler.cpp
+    renderer_vulkan/vk_fsr4_upscaler.h
+    vulkan_common/ffx_files.h
+    vulkan_common/ffx_runtime.cpp
+    vulkan_common/ffx_runtime.h
     renderer_vulkan/vk_dlss_network_probe.cpp
     renderer_vulkan/vk_dlss_network_probe.h
     renderer_vulkan/vk_ocarina_camera_motion.cpp
@@ -306,6 +314,7 @@ add_library(video_core STATIC
     nx2_precompile_env.cpp
     nx2_precompile_env.h
     shader_environment.h
+    evicted_pointer_slots.h
     shader_handle_program.h
     shader_jobs.cpp
     shader_jobs.h
@@ -334,6 +343,7 @@ add_library(video_core STATIC
     texture_cache/format_lookup_table.h
     texture_cache/image_base.cpp
     texture_cache/image_base.h
+    texture_cache/host_memory_limit.h
     texture_cache/host_mip_limits.h
     texture_cache/image_info.cpp
     texture_cache/image_info.h
@@ -550,6 +560,12 @@ target_link_options(video_core PRIVATE ${FFmpeg_LDFLAGS})
 
 add_dependencies(video_core host_shaders)
 target_include_directories(video_core PRIVATE ${HOST_SHADERS_INCLUDE})
+# AMD's FFX API headers (MIT), for calling AMD's FSR 4 runtime (vk_fsr4_upscaler.cpp).
+target_include_directories(video_core PRIVATE ${CMAKE_SOURCE_DIR}/externals/ffx-api)
+if (WIN32)
+    # Checks AMD's downloaded FSR 4 runtime (vulkan_common/ffx_runtime.cpp).
+    target_link_libraries(video_core PRIVATE bcrypt wintrust crypt32)
+endif()
 
 target_link_libraries(video_core PRIVATE sirit::sirit)
 

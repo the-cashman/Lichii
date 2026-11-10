@@ -1996,7 +1996,8 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
                                           : StutterTrace::Lookup::GraphicsNew);
         }
         if (!pipeline) {
-            pipeline = CreateGraphicsPipeline();
+            const auto keep = evicted_pointer_slots.Take(graphics_key.Hash());
+            pipeline = CreateGraphicsPipeline(keep ? &*keep : nullptr);
         }
     } else if (StutterTrace::Enabled() && pipeline && !pipeline->WasUsed()) {
         StutterTrace::CountLookup(StutterTrace::Lookup::GraphicsPrebuilt);
@@ -2082,6 +2083,7 @@ void PipelineCache::EvictUnusedPipelines() {
         if (used_this_session.erase(pipeline) != 0) {
             used_and_evicted.insert(it->first.Hash());
         }
+        evicted_pointer_slots.Remember(it->first.Hash(), pipeline->MappedPointers());
         evicted_pipelines.emplace_back(tick, std::move(it->second));
         it = graphics_cache.erase(it);
         ++evicted;
@@ -2662,12 +2664,20 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         .vertex_spirv = gpl_code[0],
         .fragment_spirv = gpl_code[1],
     };
+    static_assert(VideoCommon::EvictedPointerSlots::NumPrograms == Maxwell::MaxShaderProgram);
+    VideoCommon::EvictedPointerSlots::Slots mapped_pointers;
+    for (size_t index = 0, mapped_env = 0; index < Maxwell::MaxShaderProgram; ++index) {
+        if (key.unique_hashes[index] != 0) {
+            mapped_pointers[index] = envs[mapped_env++]->MappedStoragePointerKeys();
+        }
+    }
     auto built = std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, pipeline_binaries.get(),
         &shader_notify, device, descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring,
         BuildQueue(build_in_parallel, defer_emission ? deferred_ir_bytes : 0), statistics,
         render_pass_cache, key, std::move(modules), infos, std::move(emit_stages),
         use_gpl ? &gpl_params : nullptr, std::move(mesh_emulation));
+    built->SetMappedPointers(std::move(mapped_pointers));
     times.layout = Nx2Stats::Clock::now() - phase_begin;
     return built;
 
@@ -2749,7 +2759,45 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
 }
 } // Anonymous namespace
 
-std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
+void PipelineCache::WarnKeptPointer(size_t program, u64 slot) const {
+    if ((slot >> 63) != 0) {
+        return;
+    }
+    const u32 index = static_cast<u32>(slot >> 32);
+    const u32 offset = static_cast<u32>(slot);
+    const size_t stage = program == 0 ? 0 : program - 1;
+    const auto& cbufs = maxwell3d->state.shader_stages[stage].const_buffers;
+    GPUVAddr value = 0;
+    const char* reason = nullptr;
+    if (index >= cbufs.size() || !cbufs[index].enabled ||
+        offset + sizeof(u64) > cbufs[index].size ||
+        !gpu_memory->IsFullyMappedRange(cbufs[index].address + offset, sizeof(u64))) {
+        reason = "constant buffer not bound";
+    } else {
+        value = gpu_memory->Read<u64>(cbufs[index].address + offset);
+        if (value == 0) {
+            reason = "null";
+        } else if (!gpu_memory->IsWithinGPUAddressRange(value)) {
+            reason = "outside the GPU address range";
+        } else if (!gpu_memory->IsFullyMappedRange(value, 1)) {
+            reason = "unmapped";
+        }
+    }
+    if (!reason) {
+        return;
+    }
+    static std::atomic<u64> kept{};
+    const u64 count = kept.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (count <= 32 || count % 1000 == 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "Graphics pipeline {:016x} translated again after eviction: s{}:c{}[{:#x}] "
+                    "holds {:#x} ({}), kept as the storage buffer pointer it was ({} so far)",
+                    graphics_key.Hash(), program, index, offset, value, reason, count);
+    }
+}
+
+std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+    const VideoCommon::EvictedPointerSlots::Slots* keep_pointers) {
     // EDEN_NX2_PRECOMPILE_ONLY=1 (sandbox): build no pipeline while playing (draws are skipped),
     // so a precompile host leaves only the precompile's libraries in the driver's cache.
     static const bool precompile_only = [] {
@@ -2782,6 +2830,17 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     GraphicsEnvironments environments;
     GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
     const auto env_time = std::chrono::steady_clock::now() - begin;
+    if (keep_pointers) {
+        for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
+            if (graphics_key.unique_hashes[index] == 0) {
+                continue;
+            }
+            environments.envs[index].KeepStoragePointers((*keep_pointers)[index]);
+            for (const u64 slot : (*keep_pointers)[index]) {
+                WarnKeptPointer(index, slot);
+            }
+        }
+    }
 
     // Shader cache v2: two or more stages translate at once on the shader jobs' CPU workers while
     // this thread waits. Only this thread may flush guest memory, as reading a texture descriptor
