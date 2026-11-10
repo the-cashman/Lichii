@@ -242,6 +242,32 @@ public:
         return Common::DisassembleX64(p, p + size);
     }
 
+    PrecompileResult Precompile(std::uint64_t location, std::size_t keep_free) {
+        ASSERT(!is_executing);
+        const IR::LocationDescriptor descriptor{location};
+        if (A64::LocationDescriptor{descriptor}.SingleStepping()) {
+            return PrecompileResult::Unreadable;
+        }
+        if (emitter.GetBasicBlock(descriptor)) {
+            return PrecompileResult::Present;
+        }
+        // Unlike GetBlock, never clears the cache to make room. GetBlock assumes a block fits in
+        // MINIMUM_REMAINING_CODESIZE, so keep_free is left after this one.
+        if (block_of_code.SpaceRemaining() < MINIMUM_REMAINING_CODESIZE + keep_free) {
+            return PrecompileResult::Full;
+        }
+        block_of_code.EnsureMemoryCommitted(MINIMUM_REMAINING_CODESIZE);
+        if (!CompileBlock(descriptor, true)) {
+            return PrecompileResult::Unreadable;
+        }
+        ASSERT(block_of_code.SpaceRemaining() >= keep_free);
+        return PrecompileResult::Compiled;
+    }
+
+    size_t CodeCacheUsed() const {
+        return size_t(reinterpret_cast<const char*>(block_of_code.getCurr()) - reinterpret_cast<const char*>(block_of_code.GetCodeBegin()));
+    }
+
 private:
     static CodePtr GetCurrentBlockThunk(void* thisptr) {
         Jit::Impl* this_ = static_cast<Jit::Impl*>(thisptr);
@@ -263,11 +289,12 @@ private:
         return GetBlock(A64::LocationDescriptor{GetCurrentLocation()}.SetSingleStepping(true));
     }
 
+    static constexpr size_t MINIMUM_REMAINING_CODESIZE = 1 * 1024 * 1024;
+
     CodePtr GetBlock(IR::LocationDescriptor descriptor) {
         if (auto block = emitter.GetBasicBlock(descriptor))
             return block->entrypoint;
 
-        constexpr size_t MINIMUM_REMAINING_CODESIZE = 1 * 1024 * 1024;
         if (block_of_code.SpaceRemaining() < MINIMUM_REMAINING_CODESIZE) {
             // Immediately evacuate cache
             invalidate_entire_cache = true;
@@ -276,11 +303,27 @@ private:
         block_of_code.EnsureMemoryCommitted(MINIMUM_REMAINING_CODESIZE);
 
         // JIT Compile
-        const auto get_code = [this](u64 vaddr) { return conf.callbacks->MemoryReadCode(vaddr); };
+        const CodePtr entrypoint = CompileBlock(descriptor, false);
+        conf.callbacks->BlockCompiled(descriptor.Value());
+        return entrypoint;
+    }
+
+    /// Translates, optimizes and emits the block. With skip_unreadable, returns nullptr and emits
+    /// nothing when an instruction of the block could not be read.
+    CodePtr CompileBlock(IR::LocationDescriptor descriptor, bool skip_unreadable) {
+        bool readable = true;
+        const auto get_code = [this, &readable](u64 vaddr) {
+            const std::optional<u32> instruction = conf.callbacks->MemoryReadCode(vaddr);
+            readable = readable && instruction.has_value();
+            return instruction;
+        };
         // LocationDescriptor ctor() does important ops (like tflags) do not skip
         auto const arch_descriptor = A64::LocationDescriptor{descriptor};
         ir_block.Reset(arch_descriptor);
         A64::Translate(ir_block, arch_descriptor, get_code, {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct, true, conf.elide_ld_st_barriers, conf.native_lse_atomics});
+        if (skip_unreadable && !readable) {
+            return nullptr;
+        }
         Optimization::Optimize(ir_block, conf, polyfill_options);
         if (conf.counters) {
             ++conf.counters->blocks_compiled;
@@ -344,6 +387,14 @@ void Jit::ClearCache() {
 
 void Jit::InvalidateCacheRange(u64 start_address, size_t length) {
     impl->InvalidateCacheRange(start_address, length);
+}
+
+PrecompileResult Jit::Precompile(std::uint64_t location, std::size_t keep_free) {
+    return impl->Precompile(location, keep_free);
+}
+
+std::size_t Jit::CodeCacheUsed() const {
+    return impl->CodeCacheUsed();
 }
 
 void Jit::Reset() {
