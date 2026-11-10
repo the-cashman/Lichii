@@ -764,11 +764,13 @@ bool StageCache::LoadProgram(Record& record) {
             return false;
         }
     }
-    record.program = Common::Compression::DecompressDataZSTD(compressed);
-    if (record.program.size() != record.raw_program_size) {
-        record.program.clear();
+    // The frame header's size is checked against the record before the output is allocated: a
+    // damaged record could declare any size.
+    auto program = Common::Compression::TryDecompressDataZSTD(compressed, record.raw_program_size);
+    if (!program || program->size() != record.raw_program_size) {
         return false;
     }
+    record.program = std::move(*program);
     std::scoped_lock lock{mutex};
     if (!program_lookup.contains(record.program_offset)) {
         program_lru.emplace_front(record.program_offset,
