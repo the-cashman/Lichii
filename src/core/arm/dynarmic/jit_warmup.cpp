@@ -285,7 +285,7 @@ void JitWarmup::OnCompiled(size_t core, u64 location) {
     }
 }
 
-bool JitWarmup::Run(size_t core, Dynarmic::A64::Jit& jit, const std::atomic<bool>& stop) {
+bool JitWarmup::Run(size_t core, Dynarmic::A64::Jit& jit, const std::atomic<u32>& stop) {
     CoreWork& work = cores[core];
     if (work.full || work.cursor >= list_size.load(std::memory_order_acquire)) {
         return false;
@@ -295,7 +295,7 @@ bool JitWarmup::Run(size_t core, Dynarmic::A64::Jit& jit, const std::atomic<bool
     bool more = true;
     // stop and the deadline are checked before every block: once stop is set, this returns
     // after at most the Precompile in progress.
-    while (more && !stop.load(std::memory_order_acquire) && NowNs() < end_ns) {
+    while (more && stop.load(std::memory_order_acquire) == 0 && NowNs() < end_ns) {
         size_t count;
         {
             // Never waits for the lock: OnCompiled may hold it while the set grows.
@@ -312,7 +312,7 @@ bool JitWarmup::Run(size_t core, Dynarmic::A64::Jit& jit, const std::atomic<bool
             break;
         }
         for (size_t i = 0; i < count; ++i) {
-            if (stop.load(std::memory_order_acquire) || NowNs() >= end_ns) {
+            if (stop.load(std::memory_order_acquire) != 0 || NowNs() >= end_ns) {
                 break;
             }
             const u64 compile_start = NowNs();

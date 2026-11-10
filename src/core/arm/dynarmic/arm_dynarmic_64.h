@@ -105,7 +105,7 @@ public:
 
     bool SupportsJitWarmup() const override;
     void SetJitWarmup(std::shared_ptr<JitWarmup> warmup) override;
-    bool WarmUp(const std::atomic<bool>& stop) override;
+    bool WarmUp(const std::atomic<u32>& stop) override;
 
 protected:
     const Kernel::DebugWatchpoint* HaltedWatchpoint() const override;

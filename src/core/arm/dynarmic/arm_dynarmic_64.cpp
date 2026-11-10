@@ -735,7 +735,7 @@ void ArmDynarmic64::SetJitWarmup(std::shared_ptr<JitWarmup> warmup) {
     m_warmup = std::move(warmup);
 }
 
-bool ArmDynarmic64::WarmUp(const std::atomic<bool>& stop) {
+bool ArmDynarmic64::WarmUp(const std::atomic<u32>& stop) {
     if (!m_warmup) {
         return false;
     }

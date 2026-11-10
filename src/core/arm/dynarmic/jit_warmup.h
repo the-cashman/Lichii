@@ -85,7 +85,7 @@ public:
     /// On core's host thread while it has nothing to run: compiles listed blocks into jit until
     /// stop is set, SliceNs has passed or nothing is left. Returns whether there may be more to
     /// compile.
-    bool Run(size_t core, Dynarmic::A64::Jit& jit, const std::atomic<bool>& stop);
+    bool Run(size_t core, Dynarmic::A64::Jit& jit, const std::atomic<u32>& stop);
 
 private:
     struct alignas(64) CoreWork {

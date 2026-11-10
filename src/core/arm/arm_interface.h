@@ -84,7 +84,7 @@ public:
     virtual void SetJitWarmup(std::shared_ptr<JitWarmup> /*warmup*/) {}
     // On this core's host thread while it has nothing to run: compiles code ahead until stop is
     // set or a time slice ends. Returns whether there may be more to compile.
-    virtual bool WarmUp(const std::atomic<bool>& /*stop*/) {
+    virtual bool WarmUp(const std::atomic<u32>& /*stop*/) {
         return false;
     }
 
