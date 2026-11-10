@@ -4,6 +4,8 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
@@ -26,6 +28,9 @@ class KProcess;
 } // namespace Kernel
 
 namespace Core {
+
+class JitWarmup;
+
 using WatchpointArray = std::array<Kernel::DebugWatchpoint, Core::Hardware::NUM_WATCHPOINTS>;
 
 // NOTE: these values match the HaltReason enum in Dynarmic
@@ -71,6 +76,17 @@ public:
 
     // Clear a range of the instruction cache for this CPU.
     virtual void InvalidateCacheRange(u64 addr, std::size_t size) = 0;
+
+    // JIT warm-up (core/arm/dynarmic/jit_warmup.h), only where SupportsJitWarmup.
+    virtual bool SupportsJitWarmup() const {
+        return false;
+    }
+    virtual void SetJitWarmup(std::shared_ptr<JitWarmup> /*warmup*/) {}
+    // On this core's host thread while it has nothing to run: compiles code ahead until stop is
+    // set or a time slice ends. Returns whether there may be more to compile.
+    virtual bool WarmUp(const std::atomic<bool>& /*stop*/) {
+        return false;
+    }
 
     // Get the current architecture.
     // This returns AArch64 when PSTATE.nRW == 0 and AArch32 when PSTATE.nRW == 1.

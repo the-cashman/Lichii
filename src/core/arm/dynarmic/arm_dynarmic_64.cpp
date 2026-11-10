@@ -13,6 +13,7 @@
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
+#include "core/arm/dynarmic/jit_warmup.h"
 #include "core/arm/dynarmic/window_trace.h"
 #include "core/core_timing.h"
 #include "core/hardware_properties.h"
@@ -333,6 +334,12 @@ u64 DynarmicCallbacks64::GetCNTPCT() {
         Kernel::Nx2ThreadStats::CountRead(Kernel::Nx2ThreadStats::t_run, ticks, m_spin_ticks);
     }
     return ticks;
+}
+
+void DynarmicCallbacks64::BlockCompiled(u64 location) {
+    if (m_parent.m_warmup) {
+        m_parent.m_warmup->OnCompiled(m_parent.m_core_index, location);
+    }
 }
 
 bool DynarmicCallbacks64::CheckMemoryAccess(u64 addr, u64 size, Kernel::DebugWatchpointType type) {
@@ -713,6 +720,30 @@ void ArmDynarmic64::SignalInterrupt(Kernel::KThread* thread) {
 void ArmDynarmic64::ClearInstructionCache() {
     m_cb->last_code_addr = u64(-1);
     m_jit->ClearCache();
+}
+
+bool ArmDynarmic64::SupportsJitWarmup() const {
+#ifdef ARCHITECTURE_x86_64
+    return true;
+#else
+    // Only dynarmic's x64 backend implements Jit::Precompile.
+    return false;
+#endif
+}
+
+void ArmDynarmic64::SetJitWarmup(std::shared_ptr<JitWarmup> warmup) {
+    m_warmup = std::move(warmup);
+}
+
+bool ArmDynarmic64::WarmUp(const std::atomic<bool>& stop) {
+    if (!m_warmup) {
+        return false;
+    }
+    const bool more = m_warmup->Run(m_core_index, *m_jit, stop);
+    // An InvalidateCacheRange from another thread during the slice may have been followed by a
+    // precompile that cached the old page again: the next compile reads guest memory afresh.
+    m_cb->last_code_addr = u64(-1);
+    return more;
 }
 
 void ArmDynarmic64::InvalidateCacheRange(u64 addr, std::size_t size) {
