@@ -253,14 +253,18 @@ public:
         }
         // Unlike GetBlock, never clears the cache to make room. GetBlock assumes a block fits in
         // MINIMUM_REMAINING_CODESIZE, so keep_free is left after this one.
-        if (block_of_code.SpaceRemaining() < MINIMUM_REMAINING_CODESIZE + keep_free) {
+        // With far code (cold paths in the last quarter of the cache), SpaceRemaining is the
+        // smaller of the near and far room, and the far part is a quarter of the cache: keep a
+        // quarter free there, or a 128 MiB far region stops the warm-up at its first block.
+        const size_t keep = block_of_code.HasFarCode() ? keep_free / 4 : keep_free;
+        if (block_of_code.SpaceRemaining() < MINIMUM_REMAINING_CODESIZE + keep) {
             return PrecompileResult::Full;
         }
         block_of_code.EnsureMemoryCommitted(MINIMUM_REMAINING_CODESIZE);
         if (!CompileBlock(descriptor, true)) {
             return PrecompileResult::Unreadable;
         }
-        ASSERT(block_of_code.SpaceRemaining() >= keep_free);
+        ASSERT(block_of_code.SpaceRemaining() >= keep);
         return PrecompileResult::Compiled;
     }
 
