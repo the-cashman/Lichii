@@ -10,6 +10,7 @@
 
 #include "common/fs/fs_paths.h"
 #include "common/fs/path_util.h"
+#include "common/nx2_huge_pages.h"
 #include "nx2_switches.h"
 #include "startup_checks.h"
 
@@ -121,6 +122,7 @@ int main(int argc, char* argv[]) {
     SetUpNvidiaShaderDiskCache();
 #endif
     LoadNx2Switches(argv[0]);
+    Common::Nx2HugePages::Apply();
 #if LICHII_ROOM
     bool launch_room = false;
     for (int i = 1; i < argc; i++) {

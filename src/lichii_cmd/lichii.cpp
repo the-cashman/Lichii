@@ -34,6 +34,7 @@
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
 #include "common/literals.h"
+#include "common/nx2_huge_pages.h"
 #include "common/logging.h"
 #include "common/memory_detect.h"
 #include "common/scm_rev.h"
@@ -531,6 +532,7 @@ static bool ReplayGpuTrace(Core::System& system, int argc, char** argv) {
 }
 
 extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
+    Common::Nx2HugePages::Apply();
     // SDL calls SDL_AppIterate back to back by default, which kept a host core at 100% polling
     // input; 240 Hz is plenty for input and the key script.
     SDL_SetHint(SDL_HINT_MAIN_CALLBACK_RATE, "240");

@@ -22,7 +22,9 @@
 #endif
 
 #include <array>
+#include <cstdlib>
 #include <cstring>
+#include <string_view>
 
 #include "common/assert.h"
 #include "dynarmic/mcl/bit.hpp"
@@ -168,6 +170,24 @@ bool IsUnderRosetta() {
 }
 #endif
 
+#if defined(__linux__)
+// EDEN_NX2_HUGE_PAGES=1/all or a comma list with "jit" (src/common/nx2_huge_pages.h): the code
+// cache on transparent huge pages, fewer iTLB misses for JIT code. No-op without THP.
+void AdviseHugeCodeCache(void* base, size_t size) {
+    const char* env = std::getenv("EDEN_NX2_HUGE_PAGES");
+    std::string_view v = env ? env : "";
+    bool want = v == "1" || v == "all";
+    for (size_t pos = 0; !want && !v.empty() && v != "0" && pos != std::string_view::npos;) {
+        const size_t comma = v.find(',', pos);
+        want = v.substr(pos, comma == std::string_view::npos ? comma : comma - pos) == "jit";
+        pos = comma == std::string_view::npos ? comma : comma + 1;
+    }
+    if (want) {
+        madvise(base, size, MADV_HUGEPAGE);
+    }
+}
+#endif
+
 }  // anonymous namespace
 
 BlockOfCode::BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_code_size, std::function<void(BlockOfCode&)> rcp)
@@ -182,6 +202,9 @@ BlockOfCode::BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_cod
     , jsi(jsi)
     , cb(std::move(cb))
 {
+#if defined(__linux__)
+    AdviseHugeCodeCache(const_cast<uint8_t*>(getCode()), maxSize_);
+#endif
     EnableWriting();
     EnsureMemoryCommitted(PRELUDE_COMMIT_SIZE);
     GenRunCode(rcp);
