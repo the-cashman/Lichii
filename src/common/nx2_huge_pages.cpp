@@ -172,8 +172,11 @@ void Apply() {
     if (g_applied.test_and_set()) {
         return;
     }
+    // Default on (text + jit); off with EDEN_NX2_HUGE_PAGES=0, and when unset while a profiler's
+    // perf map is requested (PERF_BUILDID_DIR): perf/samply can't name the moved text.
     const char* env = std::getenv("EDEN_NX2_HUGE_PAGES");
-    const std::string_view value = env ? env : "";
+    const std::string_view value =
+        env ? env : (std::getenv("PERF_BUILDID_DIR") != nullptr ? "0" : "1");
     const bool text = Wants(value, "text");
     const bool jit = Wants(value, "jit");
     if ((!text && !jit) || !ThpAvailable()) {

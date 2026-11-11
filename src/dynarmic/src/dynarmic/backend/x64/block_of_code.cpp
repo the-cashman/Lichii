@@ -171,11 +171,12 @@ bool IsUnderRosetta() {
 #endif
 
 #if defined(__linux__)
-// EDEN_NX2_HUGE_PAGES=1/all or a comma list with "jit" (src/common/nx2_huge_pages.h): the code
-// cache on transparent huge pages, fewer iTLB misses for JIT code. No-op without THP.
+// EDEN_NX2_HUGE_PAGES unset/1/all or a comma list with "jit" (src/common/nx2_huge_pages.h,
+// default on, off when unset with PERF_BUILDID_DIR): the code cache on transparent huge pages,
+// fewer iTLB misses for JIT code. No-op without THP.
 void AdviseHugeCodeCache(void* base, size_t size) {
     const char* env = std::getenv("EDEN_NX2_HUGE_PAGES");
-    std::string_view v = env ? env : "";
+    std::string_view v = env ? env : (std::getenv("PERF_BUILDID_DIR") ? "0" : "1");
     bool want = v == "1" || v == "all";
     for (size_t pos = 0; !want && !v.empty() && v != "0" && pos != std::string_view::npos;) {
         const size_t comma = v.find(',', pos);
