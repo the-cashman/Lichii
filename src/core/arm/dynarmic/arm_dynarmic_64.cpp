@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <cstdlib>
+#include <string_view>
 #if defined(_M_X64) || defined(__x86_64__)
 #include <immintrin.h>
 #endif
@@ -736,7 +737,12 @@ void ArmDynarmic64::SetJitWarmup(std::shared_ptr<JitWarmup> warmup) {
 }
 
 bool ArmDynarmic64::WarmUp(const std::atomic<u32>& stop) {
-    if (!m_warmup) {
+    // EDEN_NX2_JIT_WARMUP=record: record the block list, never precompile.
+    static const bool record_only = [] {
+        const char* const value = std::getenv("EDEN_NX2_JIT_WARMUP");
+        return value != nullptr && std::string_view{value} == "record";
+    }();
+    if (!m_warmup || record_only) {
         return false;
     }
     const bool more = m_warmup->Run(m_core_index, *m_jit, stop);
