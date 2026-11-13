@@ -11,6 +11,7 @@
 #include <iosfwd>
 #include <limits>
 #include <memory>
+#include <chrono>
 #include <optional>
 #include <span>
 #include <type_traits>
@@ -44,7 +45,7 @@ public:
 
     ~GenericEnvironment() override;
 
-    [[nodiscard]] u32 TextureBoundBuffer() const final;
+    [[nodiscard]] u32 TextureBoundBuffer() const override;
 
     [[nodiscard]] u32 LocalMemorySize() const final;
 
@@ -98,6 +99,10 @@ public:
     /// kind than a cache record holds
     [[nodiscard]] bool CanBeSerialized() const noexcept;
 
+    /// Diagnostics: bytes of the program in GPU memory (offset from its header); empty without
+    /// GPU memory (precompile and disk environments).
+    [[nodiscard]] std::vector<u8> ReadProgramBytes(u32 offset, u32 size) const;
+
     /// The texture descriptor pool was flushed on the GPU thread before this environment's
     /// translation moved to another thread, which may not flush: descriptors are read as they
     /// are in memory. Nothing can make the pool dirty again while the GPU thread waits for it.
@@ -117,7 +122,80 @@ public:
     }
     bool HasNativeInstructions() const override;
 
+    /// The translation's answers (texture types, pixel formats, cbuf values, storage pointer
+    /// classifications) as bytes, and taking such answers over (keeps answers already present).
+    /// The per-stage translation cache (nx2_ir_cache.h) stores and restores them, so a pipeline
+    /// built from a cached translation is serialized with the answers that translation used.
+    void SerializeAnswers(std::vector<u8>& out) const;
+    void AdoptAnswers(std::span<const u8> data) override;
+
+    [[nodiscard]] const ::Common::unordered_map<u64, u8>& StoragePointerAnswers() const noexcept {
+        return storage_pointer_types;
+    }
+
+    /// nx2 shaderwarm, learning (EDEN_NX2_IR_LEARN): while armed, the texture queries a live
+    /// translation makes are logged with the constant buffer words of their handle, so the
+    /// translation can be stored as a per-stage cache record that the runtime re-checks the same
+    /// way as a precompiled one (nx2_ir_cache.h TextureCheck: kind 0 type, 1 integer format,
+    /// 2 exact pixel format).
+    struct LoggedTextureQuery {
+        std::array<u32, 6> source;
+        u32 kind;
+        u32 answer;
+    };
+    void BeginQueryLog() {
+        query_log_active = true;
+        query_log_complete = true;
+        has_query_source = false;
+        viewport_read = false;
+        logged_queries.clear();
+    }
+    void EndQueryLog() {
+        query_log_active = false;
+    }
+    /// False when a texture query came without a known handle source (then don't store it).
+    [[nodiscard]] bool QueryLogComplete() const noexcept {
+        return query_log_complete;
+    }
+    [[nodiscard]] const std::vector<LoggedTextureQuery>& LoggedTextureQueries() const noexcept {
+        return logged_queries;
+    }
+    [[nodiscard]] bool ViewportTransformRead() const noexcept {
+        return viewport_read;
+    }
+    [[nodiscard]] u32 ViewportTransformAnswer() const noexcept {
+        return viewport_transform_state;
+    }
+    [[nodiscard]] bool HasConstantReplacements() const noexcept {
+        return !cbuf_replacements.empty();
+    }
+    void NoteTextureHandleSource(u32 index, u32 offset, u32 shift_left, u32 secondary_index,
+                                 u32 secondary_offset, u32 secondary_shift_left) override {
+        query_source = {index, offset, shift_left, secondary_index, secondary_offset,
+                        secondary_shift_left};
+        has_query_source = true;
+    }
+
 protected:
+    void LogTextureQuery(u32 kind, u32 answer) {
+        if (!query_log_active) {
+            return;
+        }
+        if (!has_query_source) {
+            query_log_complete = false;
+            return;
+        }
+        logged_queries.push_back({query_source, kind, answer});
+    }
+    bool query_log_active = false;
+    bool query_log_complete = true;
+    bool has_query_source = false;
+    bool viewport_read = false;
+    /// Set while IsTexturePixelFormatInteger reads the format (logged as kind 1, not 2).
+    bool integer_query = false;
+    std::array<u32, 6> query_source{};
+    std::vector<LoggedTextureQuery> logged_queries;
+
     std::optional<u64> TryFindSize();
     virtual std::optional<u32> ReadTrapGuardConstant(u32, u32) { return std::nullopt; }
 
@@ -129,6 +207,12 @@ protected:
     std::shared_ptr<const LoweredNativeCode> LowerNativeCode(u32 source_header_size,
                                                           bool geometry_stage,
                                                           ShaderCacheV2::Cache* cache_v2);
+    /// Lowers captured native instructions (`sph` and `stage` already set) and packs the result.
+    /// nx2 shaderwarm: the precompile lowers captured programs without GPU memory.
+    std::shared_ptr<const LoweredNativeCode> LowerCapturedNative(
+        std::vector<Shader::Ampere::Instruction>& native, u32 source_header_size,
+        bool geometry_stage, ShaderCacheV2::Cache* cache_v2 = nullptr,
+        std::chrono::steady_clock::time_point capture_begin = {});
     size_t native_source_size{};
     std::shared_ptr<const LoweredNativeCode> lowered_native;
     std::shared_ptr<const ShaderCacheV2::ProgramRecord> program_record;
@@ -167,6 +251,9 @@ protected:
 
 class GraphicsEnvironment final : public GenericEnvironment {
 public:
+    [[nodiscard]] bool IsLiveEnvironment() const override {
+        return true;
+    }
     explicit GraphicsEnvironment() = default;
     explicit GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
                                  Tegra::MemoryManager& gpu_memory_,
@@ -196,6 +283,9 @@ private:
 
 class ComputeEnvironment final : public GenericEnvironment {
 public:
+    [[nodiscard]] bool IsLiveEnvironment() const override {
+        return true;
+    }
     explicit ComputeEnvironment() = default;
     explicit ComputeEnvironment(Tegra::Engines::KeplerCompute& kepler_compute_,
                                 Tegra::MemoryManager& gpu_memory_, GPUVAddr program_base_,
@@ -335,6 +425,21 @@ private:
     std::optional<u32> recorded_read_properties;
     bool lacks_recorded_value{};
 };
+
+/// The mesh registers a task/mesh pipeline is translated and keyed with. EDEN_NX2_MESH_INIT=0:
+/// without a task program, SET_MESH_INIT_SHADER (task threads, task output lines) only sizes the
+/// mesh program's payload input, which nothing writes; games leave the last task draw's value in
+/// it (OoT: two values for the same mesh-only pipelines, a third of its mesh pipelines were such
+/// duplicates), so it is zeroed there.
+[[nodiscard]] std::array<u32, 3> EffectiveMeshRegisters(u32 shader_a, u32 shader_b, u32 init,
+                                                        bool has_task);
+
+/// The value a task/mesh stage's unique hash is XORed with in the pipeline key: the mesh registers
+/// (SET_MESH_SHADER_A/B, SET_MESH_INIT_SHADER) and the pass-through geometry header bound with them
+/// (zero when that slot is off). XORing a key's stage hash with it again gives the program's own
+/// hash.
+[[nodiscard]] u64 MeshStateHash(const std::array<u32, 3>& registers,
+                                const Shader::ProgramHeader& primitive_header);
 
 /// Where a pipeline is in a cache file, from its environment count to the end of its key, and a
 /// hash of those bytes: a rewrite removes it only while the file still holds them.

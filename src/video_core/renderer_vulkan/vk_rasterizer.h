@@ -260,7 +260,8 @@ private:
     /// Builds the state from the attribute formats, vertex streams and repacked bindings (the
     /// registers VideoCommon::VertexInputKey holds).
     void BuildVertexInput(const Tegra::Engines::Maxwell3D::Regs& regs, u32 max_attributes,
-                          u32 max_bindings, VertexInputState& state);
+                          u32 max_bindings, VertexInputState& state,
+                          std::optional<u32> null_binding);
     /// Dynamic vertex input states built before, by the registers they were built from.
     VideoCommon::VertexInputCache<VertexInputState> vertex_input_cache;
 

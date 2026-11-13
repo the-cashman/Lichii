@@ -19,6 +19,13 @@ namespace Shader::Maxwell {
                                            ObjectPool<IR::Block>& block_pool, Environment& env,
                                            Flow::CFG& cfg, const HostTranslateInfo& host_info);
 
+/// Task and mesh programs: put the environment's mesh registers and pass-through header into a
+/// program translated with other ones (the per-stage IR cache stores them translated with fixed
+/// values). Only the mesh sizes, workgroup size and the mesh program's line-to-attribute map
+/// (and the stores it implies) depend on them. A program translated with a pass-through header
+/// that has per-primitive outputs keeps those stores: use it only from translations with none.
+void ApplyMeshState(IR::Program& program, Environment& env);
+
 [[nodiscard]] IR::Program MergeDualVertexPrograms(IR::Program& vertex_a, IR::Program& vertex_b,
                                                   Environment& env_vertex_b,
                                                   const HostTranslateInfo& host_info);

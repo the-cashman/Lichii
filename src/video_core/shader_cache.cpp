@@ -37,6 +37,7 @@
 #include "video_core/shader_cache_v2/records.h"
 #include "video_core/shader_environment.h"
 #include "video_core/texture_cache/util.h"
+#include "video_core/renderer_vulkan/nx2_pipeline_stats.h"
 
 namespace VideoCommon {
 
@@ -171,15 +172,19 @@ ShaderCache::ShaderCache(Tegra::MaxwellDeviceMemoryManager& device_memory_)
 u64 ShaderCache::MeshStateHash() const {
     using Regs = Tegra::Engines::Maxwell3D::Regs;
     const auto& regs{maxwell3d->regs};
-    std::array<u32, 3 + 20> state{regs.reg_array[Regs::MeshShaderA], regs.reg_array[Regs::MeshShaderB],
-                                  regs.reg_array[Regs::MeshInitShader]};
+    const std::array<u32, 3> registers{VideoCommon::EffectiveMeshRegisters(
+        regs.reg_array[Regs::MeshShaderA], regs.reg_array[Regs::MeshShaderB],
+        regs.reg_array[Regs::MeshInitShader],
+        regs.IsShaderConfigEnabled(Regs::ShaderType::Tessellation))};
+    Shader::ProgramHeader primitive_header;
+    std::memset(&primitive_header, 0, sizeof(primitive_header));
     if (regs.IsShaderConfigEnabled(Regs::ShaderType::Geometry)) {
         const auto& geometry{regs.pipelines[static_cast<size_t>(Regs::ShaderType::Geometry)]};
         const GPUVAddr address{(static_cast<u64>(geometry.reserved[0] & 0xff) << 32) |
                                geometry.reserved[1]};
-        gpu_memory->ReadBlockUnsafe(address, state.data() + 3, 20 * sizeof(u32));
+        gpu_memory->ReadBlockUnsafe(address, &primitive_header, sizeof(primitive_header));
     }
-    return Common::CityHash64(reinterpret_cast<const char*>(state.data()), sizeof(state)) | 1;
+    return VideoCommon::MeshStateHash(registers, primitive_header);
 }
 
 bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
@@ -234,10 +239,16 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
                 // Native programs are lowered while the environment is built (once: the
                 // ShaderInfo keeps the result for the pipeline's environments).
                 RethrowIfRejected(*cpu_shader_addr);
+                const auto lower_begin = Vulkan::Nx2Stats::Clock::now();
                 const Nx2Profile::Scope profile_scope{Nx2Profile::Zone::ShaderCapture};
                 GraphicsEnvironment env{*maxwell3d, *gpu_memory, program, native ? shader_addr : base_addr, start_address,
                                         {}, shader_cache_v2};
                 shader_info = MakeShaderInfo(env, *cpu_shader_addr);
+                if (Vulkan::Nx2Stats::Enabled()) {
+                    const auto lower_time = Vulkan::Nx2Stats::Clock::now() - lower_begin;
+                    Vulkan::Nx2Stats::Add(Vulkan::Nx2Stats::Phase::Lower, lower_time);
+                    Vulkan::Nx2Stats::lowered_since_pipeline += lower_time;
+                }
             } catch (const Shader::Exception&) {
                 RememberRejection(*cpu_shader_addr);
                 // Once per program: which stage slot it is bound to, its header and the slot's

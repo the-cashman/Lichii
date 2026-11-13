@@ -373,6 +373,7 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     const VkExtent2D render_area = framebuffer->RenderArea();
     ++render_pass_serial;
     state.renderpass = renderpass;
+    state.dynamic_rendering = false;
     state.framebuffer = framebuffer_handle;
     state.render_area = render_area;
 
@@ -423,12 +424,18 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     framebuffer->MarkResolveShadowsUpToDate();
 }
 
-void Scheduler::RealizeDeferredClear() {
+void Scheduler::RealizeDeferredClear(bool dynamic) {
     if (deferred_clear.framebuffer == nullptr) {
         return;
     }
     const DeferredClear dc = deferred_clear;
     deferred_clear = {};
+    if (dynamic && !dc.framebuffer->HasResolveAttachments()) {
+        EndRenderPass();
+        BeginRenderingImpl(dc.framebuffer, dc.color_clear_mask, &dc.color_values,
+                           dc.depth_stencil, dc.depth_stencil_value);
+        return;
+    }
 
     std::array<VkClearValue, 9> clear_values{};
     u32 count = 0;
@@ -489,9 +496,11 @@ void Scheduler::FlushDeferredClear() {
     EndRenderPass();
 }
 
-void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_location location) {
+void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, bool dynamic,
+                                  std::source_location location) {
+    dynamic = dynamic && !framebuffer->HasResolveAttachments();
     if (deferred_clear.framebuffer == framebuffer) {
-        RealizeDeferredClear();
+        RealizeDeferredClear(dynamic);
         return;
     }
     const VkRenderPass renderpass = framebuffer->RenderPass();
@@ -506,7 +515,7 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
     // so it is the correct identity to compare.
     if (state.renderpass && framebuffer_handle == state.framebuffer &&
         render_area.width == state.render_area.width &&
-        render_area.height == state.render_area.height) {
+        render_area.height == state.render_area.height && dynamic == state.dynamic_rendering) {
         return;
     }
     if (state.renderpass) {
@@ -514,7 +523,11 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
     }
     // Ends any active pass and realizes a deferred clear
     EndRenderPass();
-    BeginRenderPassImpl(framebuffer, renderpass, nullptr, 0);
+    if (dynamic) {
+        BeginRenderingImpl(framebuffer, 0, nullptr, false, VkClearValue{});
+    } else {
+        BeginRenderPassImpl(framebuffer, renderpass, nullptr, 0);
+    }
 }
 
 void Scheduler::RequestOutsideRenderPassOperationContext(std::source_location location) {
@@ -1008,7 +1021,8 @@ void Scheduler::EndRenderPass()
         Record([num_images = num_renderpass_images,
                        images = renderpass_images,
                        ranges = renderpass_image_ranges,
-                       has_transform_feedback = device.IsExtTransformFeedbackSupported()](
+                       has_transform_feedback = device.IsExtTransformFeedbackSupported(),
+                       dynamic_rendering = state.dynamic_rendering](
                           vk::CommandBuffer cmdbuf) {
             std::array<VkImageMemoryBarrier, 9> barriers;
             for (size_t i = 0; i < num_images; ++i) {
@@ -1045,7 +1059,11 @@ void Scheduler::EndRenderPass()
                         .subresourceRange = range,
                 };
             }
-            cmdbuf.EndRenderPass();
+            if (dynamic_rendering) {
+                cmdbuf.EndRendering();
+            } else {
+                cmdbuf.EndRenderPass();
+            }
             cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
                                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
                                    0, nullptr, nullptr, vk::Span(barriers.data(), num_images));
@@ -1063,6 +1081,7 @@ void Scheduler::EndRenderPass()
         });
 
         state.renderpass = VkRenderPass{};
+        state.dynamic_rendering = false;
         num_renderpass_images = 0;
     }
 

@@ -50,6 +50,7 @@ VK_DEFINE_HANDLE(VmaPool)
     FEATURE(EXT, ShaderDemoteToHelperInvocation, SHADER_DEMOTE_TO_HELPER_INVOCATION,               \
             shader_demote_to_helper_invocation)                                                    \
     FEATURE(EXT, SubgroupSizeControl, SUBGROUP_SIZE_CONTROL, subgroup_size_control)                \
+    FEATURE(KHR, DynamicRendering, DYNAMIC_RENDERING, dynamic_rendering)                           \
     FEATURE(KHR, Maintenance4, MAINTENANCE_4, maintenance4)                                        \
     FEATURE(KHR, Synchronization2, SYNCHRONIZATION_2, synchronization2)
 
@@ -68,8 +69,10 @@ VK_DEFINE_HANDLE(VmaPool)
     FEATURE(EXT, ExtendedDynamicState2, EXTENDED_DYNAMIC_STATE_2, extended_dynamic_state2)         \
     FEATURE(EXT, ExtendedDynamicState3, EXTENDED_DYNAMIC_STATE_3, extended_dynamic_state3)         \
     FEATURE(EXT, ImageCompressionControl, IMAGE_COMPRESSION_CONTROL, image_compression_control)    \
+    FEATURE(EXT, GraphicsPipelineLibrary, GRAPHICS_PIPELINE_LIBRARY, graphics_pipeline_library)    \
     FEATURE(EXT, 4444Formats, 4444_FORMATS, format_a4b4g4r4)                                       \
     FEATURE(EXT, IndexTypeUint8, INDEX_TYPE_UINT8, index_type_uint8)                               \
+    FEATURE(EXT, LegacyVertexAttributes, LEGACY_VERTEX_ATTRIBUTES, legacy_vertex_attributes)       \
     FEATURE(EXT, LineRasterization, LINE_RASTERIZATION, line_rasterization)                        \
     FEATURE(EXT, MeshShader, MESH_SHADER, mesh_shader)                                             \
     FEATURE(EXT, PrimitiveTopologyListRestart, PRIMITIVE_TOPOLOGY_LIST_RESTART,                    \
@@ -124,6 +127,7 @@ VK_DEFINE_HANDLE(VmaPool)
     EXTENSION(KHR, MAINTENANCE_3, maintenance3)                                                    \
     EXTENSION(KHR, MAINTENANCE_7, maintenance7)                                                    \
     EXTENSION(KHR, MAINTENANCE_8, maintenance8)                                                    \
+    EXTENSION(KHR, PIPELINE_LIBRARY, pipeline_library)                                             \
     EXTENSION(NV, DEVICE_DIAGNOSTICS_CONFIG, device_diagnostics_config)                            \
     EXTENSION(NV, GEOMETRY_SHADER_PASSTHROUGH, geometry_shader_passthrough)                        \
     EXTENSION(NV, VIEWPORT_ARRAY2, viewport_array2)                                                \
@@ -602,6 +606,23 @@ FN_MAX_LIMIT_LIST
     /// Returns true if the device supports descriptor buffers.
     bool IsExtDescriptorBufferSupported() const {
         return extensions.descriptor_buffer;
+    }
+
+    /// Native VS+PS pipelines are built from per-stage VK_EXT_graphics_pipeline_library libraries
+    /// and drawn with dynamic rendering (EDEN_NX2_GPL=1 and the device supports both, with fast
+    /// linking).
+    bool IsGplEnabled() const {
+        return extensions.graphics_pipeline_library;
+    }
+
+    /// Library-pipeline vertex stages declare every vertex attribute as float, whatever the
+    /// format's class (int, uint, or a constant attribute): VK_EXT_legacy_vertex_attributes with
+    /// dynamic vertex input allows the mismatch. Only on RADV, where the attribute's 32-bit
+    /// values reach the shader unchanged (the VS prolog fetches per format), so the result is the
+    /// same as with typed inputs. EDEN_NX2_GPL_ATTRS=0 turns it off.
+    bool IsGplUntypedAttributes() const {
+        return extensions.legacy_vertex_attributes && extensions.graphics_pipeline_library &&
+               extensions.vertex_input_dynamic_state;
     }
 
     /// Returns the descriptor buffer properties of the device.
@@ -1400,6 +1421,7 @@ private:
         VkPhysicalDeviceCustomBorderColorPropertiesEXT custom_border_color{};
         VkPhysicalDeviceCooperativeMatrixPropertiesKHR cooperative_matrix{};
         VkPhysicalDeviceShaderIntegerDotProductProperties integer_dot_product{};
+        VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT graphics_pipeline_library{};
 
         VkPhysicalDeviceProperties properties{};
     };

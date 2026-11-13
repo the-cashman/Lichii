@@ -362,6 +362,46 @@ void TightenOutputVertices(IR::Program& program) {
         program.output_vertices = (std::min)(program.output_vertices, num_emits);
     }
 }
+// SET_MESH_SHADER_A: topology 3:0, max vertex 12:4, max primitive 22:13; SET_MESH_SHADER_B:
+// mesh threads 25:20; SET_MESH_INIT_SHADER: task threads 5:0, local buffer lines 20:12, lines
+// passed to the mesh stage 30:22 (lines are 128 bytes). The rest of the translation doesn't read
+// them: ApplyMeshState puts them into a translation made with other values (cached IR).
+void SetMeshState(IR::Program& program, Environment& env) {
+    const auto& registers{env.MeshRegisters()};
+    const u32 shader_a{registers[0]}, shader_b{registers[1]}, init{registers[2]};
+    const u32 lines{(std::max)((init >> 12) & 0x1ff, (init >> 22) & 0x1ff)};
+    program.mesh.payload_words = (std::max)(lines, 1U) * 32;
+    program.mesh.topology = shader_a & 0xf;
+    program.mesh.max_vertices = (shader_a >> 4) & 0x1ff;
+    program.mesh.max_primitives = (shader_a >> 13) & 0x3ff;
+    const u32 threads{program.stage == Stage::Task ? init & 0x3f : (shader_b >> 20) & 0x3f};
+    program.workgroup_size = {(std::max)(threads, 1U), 1, 1};
+    program.mesh.vertex_lines.clear();
+    program.mesh.primitive_lines.clear();
+    if (program.stage == Stage::Mesh) {
+        if (program.mesh.topology != 0 && program.mesh.topology != 1 &&
+            program.mesh.topology != 4) {
+            throw NotImplementedException("Mesh output topology {} (SET_MESH_SHADER_A {:#010x})",
+                                          program.mesh.topology, shader_a);
+        }
+        AddMeshLines(env.SPH(), program.mesh.vertex_lines);
+        AddMeshLines(env.MeshPrimitiveHeader(), program.mesh.primitive_lines);
+    }
+}
+
+// A mesh program's outputs come from the stage buffer lines, not attribute stores; the next
+// stage reads what they name.
+void AddMeshStores(IR::Program& program) {
+    if (program.stage != Stage::Mesh) {
+        return;
+    }
+    for (const u32 line : program.mesh.vertex_lines) {
+        program.info.stores.Set(static_cast<IR::Attribute>(line), true);
+    }
+    for (const u32 line : program.mesh.primitive_lines) {
+        program.info.stores.Set(static_cast<IR::Attribute>(line), true);
+    }
+}
 } // Anonymous namespace
 
 void TrimGeometryPassthrough(IR::Program& program, const VaryingState& previous_stores) {
@@ -399,6 +439,11 @@ void TrimGeometryPassthrough(IR::Program& program, const VaryingState& previous_
             program.info.stores.mask[base + component] = false;
         }
     }
+}
+
+void ApplyMeshState(IR::Program& program, Environment& env) {
+    SetMeshState(program, env);
+    AddMeshStores(program);
 }
 
 IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Block>& block_pool,
@@ -459,30 +504,9 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
         program.shared_memory_size = env.SharedMemorySize();
         break;
     case Stage::Task:
-    case Stage::Mesh: {
-        // SET_MESH_SHADER_A: topology 3:0, max vertex 12:4, max primitive 22:13;
-        // SET_MESH_SHADER_B: mesh threads 25:20; SET_MESH_INIT_SHADER: task threads 5:0, local
-        // buffer lines 20:12, lines passed to the mesh stage 30:22 (lines are 128 bytes).
-        const auto& registers{env.MeshRegisters()};
-        const u32 shader_a{registers[0]}, shader_b{registers[1]}, init{registers[2]};
-        const u32 lines{(std::max)((init >> 12) & 0x1ff, (init >> 22) & 0x1ff)};
-        program.mesh.payload_words = (std::max)(lines, 1U) * 32;
-        program.mesh.topology = shader_a & 0xf;
-        program.mesh.max_vertices = (shader_a >> 4) & 0x1ff;
-        program.mesh.max_primitives = (shader_a >> 13) & 0x3ff;
-        const u32 threads{program.stage == Stage::Task ? init & 0x3f : (shader_b >> 20) & 0x3f};
-        program.workgroup_size = {(std::max)(threads, 1U), 1, 1};
-        if (program.stage == Stage::Mesh) {
-            if (program.mesh.topology != 0 && program.mesh.topology != 1 &&
-                program.mesh.topology != 4) {
-                throw NotImplementedException("Mesh output topology {} (SET_MESH_SHADER_A {:#010x})",
-                                              program.mesh.topology, shader_a);
-            }
-            AddMeshLines(env.SPH(), program.mesh.vertex_lines);
-            AddMeshLines(env.MeshPrimitiveHeader(), program.mesh.primitive_lines);
-        }
+    case Stage::Mesh:
+        SetMeshState(program, env);
         break;
-    }
     default:
         break;
     }
@@ -534,16 +558,7 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
     }
     program.info.is_task = program.stage == Stage::Task;
     program.info.is_mesh = program.stage == Stage::Mesh;
-    if (program.stage == Stage::Mesh) {
-        // Its outputs come from the stage buffer lines, not attribute stores; the next stage
-        // reads what they name.
-        for (const u32 line : program.mesh.vertex_lines) {
-            program.info.stores.Set(static_cast<IR::Attribute>(line), true);
-        }
-        for (const u32 line : program.mesh.primitive_lines) {
-            program.info.stores.Set(static_cast<IR::Attribute>(line), true);
-        }
-    }
+    AddMeshStores(program);
     Optimization::LayerPass(program, normalized_host_info);
     Optimization::VendorWorkaroundPass(program);
 

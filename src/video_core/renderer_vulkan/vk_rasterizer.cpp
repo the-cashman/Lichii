@@ -10,6 +10,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <memory>
+#include <optional>
 #include <limits>
 #include <cstdio>
 #include <cstdlib>
@@ -63,6 +64,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/vk_gpl.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
@@ -1288,7 +1290,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             recorded |= FrameDumpBuffers(false, pipeline->ShaderHashes());
         }
         if (recorded) {
-            scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+            scheduler.RequestRenderpass(texture_cache.GetFramebuffer(), device.IsGplEnabled());
         }
     }
     if (VideoCommon::RenderTrace::SampleFrame(render_trace_frame) && render_trace_draws <= 2048) {
@@ -1966,7 +1968,7 @@ void RasterizerVulkan::CaptureIndirectTrace() {
     });
     slot->tick = scheduler.CurrentTick();
     slot->pending = true;
-    scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+    scheduler.RequestRenderpass(texture_cache.GetFramebuffer(), device.IsGplEnabled());
     scheduler.NoteRenderPassStores();
 }
 
@@ -2270,7 +2272,7 @@ void RasterizerVulkan::Clear(u32 layer_count) {
                                  !scheduler.IsRenderPassActive() &&
                                  (!use_color || color_full_channels) && ds_deferrable;
     if (!can_defer_clear) {
-        scheduler.RequestRenderpass(framebuffer);
+        scheduler.RequestRenderpass(framebuffer, device.IsGplEnabled());
     }
 
     query_cache.NotifySegment(true);
@@ -3636,7 +3638,7 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
         }
     }
     if (frame_dump.BeginPass(framebuffer, colors)) {
-        scheduler.RequestRenderpass(framebuffer);
+        scheduler.RequestRenderpass(framebuffer, device.IsGplEnabled());
     }
 }
 
@@ -4932,7 +4934,8 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) 
         // EDEN_NX2_FAST_DRAW_VERIFY: no dirty flag asked for it, so the vertex input recorded
         // last must be what the registers give.
         VertexInputState state;
-        BuildVertexInput(regs, max_attributes, max_bindings, state);
+        BuildVertexInput(regs, max_attributes, max_bindings, state,
+                         GplNullAttributeBinding(device, regs, max_attributes, max_bindings));
         if (vertex_input_recorded && !same_state(state, recorded_vertex_input)) {
             ++fast_draw_stats.vertex_input_mismatches;
         }
@@ -4949,9 +4952,13 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) 
     // The state these registers built before, recorded by reference instead of built and copied
     // into the command again (jpkto/Lichii e7581fa9f6): converting every attribute's format and
     // copying both arrays into the command was ~0.5 ms a frame of Mario Kart World's back.
+    // nx2 shaderwarm: with library vertex stages, constant attributes read a null vertex buffer.
+    const std::optional<u32> null_binding{
+        GplNullAttributeBinding(device, regs, max_attributes, max_bindings)};
     VideoCommon::VertexInputKey key{
         .num_attributes = max_attributes,
         .num_bindings = max_bindings,
+        .null_binding = null_binding ? *null_binding + 1 : 0U,
     };
     for (u32 index = 0; index < max_attributes; ++index) {
         key.attributes[index] = regs.vertex_attrib_format[index].hex;
@@ -4968,13 +4975,13 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) 
     std::shared_ptr<const VertexInputState> state = vertex_input_cache.Find(key, hash);
     if (!state) {
         auto built = std::make_shared<VertexInputState>();
-        BuildVertexInput(regs, max_attributes, max_bindings, *built);
+        BuildVertexInput(regs, max_attributes, max_bindings, *built, null_binding);
         state = std::move(built);
         vertex_input_cache.Insert(key, hash, state);
     } else if (fast_draw_verify) {
         // The key must hold everything the build reads.
         VertexInputState built;
-        BuildVertexInput(regs, max_attributes, max_bindings, built);
+        BuildVertexInput(regs, max_attributes, max_bindings, built, null_binding);
         if (!same_state(built, *state)) {
             ++fast_draw_stats.vertex_input_mismatches;
         }
@@ -4984,17 +4991,32 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) 
         vertex_input_recorded = true;
     }
 
-    scheduler.Record([input = std::move(state)](vk::CommandBuffer cmdbuf) {
+    scheduler.Record([input = std::move(state), null_binding](vk::CommandBuffer cmdbuf) {
         cmdbuf.SetVertexInputEXT(input->bindings, input->attributes);
+        if (null_binding) {
+            cmdbuf.BindVertexBuffer(*null_binding, VK_NULL_HANDLE, 0);
+        }
     });
 }
 
 void RasterizerVulkan::BuildVertexInput(const Tegra::Engines::Maxwell3D::Regs& regs,
                                         u32 max_attributes, u32 max_bindings,
-                                        VertexInputState& state) {
+                                        VertexInputState& state,
+                                        std::optional<u32> null_binding) {
     for (u32 index = 0; index < max_attributes; ++index) {
         const Maxwell::VertexAttribute attribute{regs.vertex_attrib_format[index]};
         const u32 binding{attribute.buffer};
+        if (attribute.constant && null_binding) {
+            state.attributes.push_back({
+                .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT,
+                .pNext = nullptr,
+                .location = index,
+                .binding = *null_binding,
+                .format = VK_FORMAT_R32_SFLOAT,
+                .offset = 0,
+            });
+            continue;
+        }
         if (attribute.constant || binding >= max_bindings) {
             continue;
         }
@@ -5020,6 +5042,11 @@ void RasterizerVulkan::BuildVertexInput(const Tegra::Engines::Maxwell3D::Regs& r
             .inputRate = is_instanced ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX,
             .divisor = is_instanced ? input_binding.frequency : 1,
         });
+    }
+    if (null_binding) {
+        state.bindings[*null_binding].stride = 0;
+        state.bindings[*null_binding].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+        state.bindings[*null_binding].divisor = 1;
     }
 }
 

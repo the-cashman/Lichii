@@ -26,6 +26,9 @@ struct VertexInputKey {
     u32 repacked{};
     u32 num_attributes{};
     u32 num_bindings{};
+    /// nx2 shaderwarm (EDEN_NX2_GPL): 1 + the binding constant attributes read as a null vertex
+    /// buffer, 0 for none.
+    u32 null_binding{};
 
     [[nodiscard]] bool operator==(const VertexInputKey&) const = default;
 
@@ -41,6 +44,7 @@ struct VertexInputKey {
             mix(u64{divisors[index]} | (u64{divisors[index + 1]} << 32));
         }
         mix(u64{instanced} | (u64{repacked} << 32));
+        mix(null_binding);
         return hash;
     }
 };

@@ -98,6 +98,10 @@ struct RuntimeInfo {
     bool convert_depth_mode{};
     bool force_early_z{};
 
+    /// Descriptor set of every resource the stage declares (0 normally; per-stage sets for
+    /// graphics pipeline libraries: vertex 0, fragment 1).
+    u32 descriptor_set{};
+
     TessPrimitive tess_primitive{};
     TessSpacing tess_spacing{};
     bool tess_clockwise{};

@@ -297,6 +297,16 @@ public:
         offset += sizeof(DescriptorUpdateEntry);
     }
 
+    /// Update template entries start at this entry of the descriptor payload (the second stage
+    /// of a library pipeline has its own set but shares the payload).
+    void SetFirstEntry(size_t entry_index) noexcept {
+        offset = entry_index * sizeof(DescriptorUpdateEntry);
+    }
+
+    [[nodiscard]] u32 NumDescriptors() const noexcept {
+        return num_descriptors;
+    }
+
     void Add(const Shader::Info& info, VkShaderStageFlags stage) {
         is_compute |= (stage & VK_SHADER_STAGE_COMPUTE_BIT) != 0 && !mesh_emulation;
         uses_mesh |= (stage & (VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT)) != 0;
@@ -370,6 +380,14 @@ public:
 
     const std::array<u32, NUM_TEXTURE_AND_IMAGE_SCALING_WORDS>& Data() const noexcept {
         return words;
+    }
+
+    /// Continues at these texture/image bit indices (per-stage bases of library pipelines).
+    void Seek(u32 texture_index, u32 image_index) noexcept {
+        texture_ptr = words.data() + texture_index / 32;
+        texture_bit = 1u << (texture_index % 32);
+        image_ptr = words.data() + Shader::Backend::SPIRV::NUM_TEXTURE_SCALING_WORDS + image_index / 32;
+        image_bit = 1u << (image_index % 32);
     }
 
     /// The words of an earlier draw's pushes (delta draws); push no more.

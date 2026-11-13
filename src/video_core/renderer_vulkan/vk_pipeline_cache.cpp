@@ -58,6 +58,7 @@
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/mesh_fallback_limits.h"
 #include "video_core/renderer_vulkan/pipeline_eviction_policy.h"
+#include "video_core/renderer_vulkan/nx2_pipeline_stats.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 #include "video_core/renderer_vulkan/pipeline_shader_emission.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
@@ -69,6 +70,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache_records.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_shaderwarm.h"
 #include "video_core/renderer_vulkan/vk_shader_cache_v2.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
@@ -520,6 +522,15 @@ size_t GetTotalPipelineWorkers() {
 
 } // Anonymous namespace
 
+// nx2 shaderwarm: the runtime info a pipeline's stage is emitted with, for vk_shaderwarm.cpp.
+Shader::RuntimeInfo Nx2::MakeRuntimeInfo(std::span<const Shader::IR::Program> programs,
+                                         const GraphicsPipelineCacheKey& key,
+                                         const Shader::IR::Program& program,
+                                         const Shader::IR::Program* previous_program,
+                                         const Device& device) {
+    return Vulkan::MakeRuntimeInfo(programs, key, program, previous_program, device);
+}
+
 size_t ComputePipelineCacheKey::Hash() const noexcept {
     const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(this), sizeof *this);
     return static_cast<size_t>(hash);
@@ -550,11 +561,14 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
                              DescriptorBufferRing& descriptor_buffer_ring_,
                              RenderPassCache& render_pass_cache_, BufferCache& buffer_cache_,
                              TextureCache& texture_cache_, VideoCore::ShaderNotify& shader_notify_)
-    : VideoCommon::ShaderCache{device_memory_}, device{device_}, scheduler{scheduler_},
+    : VideoCommon::ShaderCache{device_memory_}, gpl_libraries{device_}, device{device_}, scheduler{scheduler_},
       descriptor_pool{descriptor_pool_}, guest_descriptor_queue{guest_descriptor_queue_},
       descriptor_buffer_ring{descriptor_buffer_ring_}, render_pass_cache{render_pass_cache_},
       buffer_cache{buffer_cache_}, texture_cache{texture_cache_}, shader_notify{shader_notify_},
-      use_asynchronous_shaders{Settings::values.use_asynchronous_shaders.GetValue()},
+      // EDEN_NX2_ASYNC_SHADERS=0/1 overrides the setting (sandbox measurements).
+      use_asynchronous_shaders{std::getenv("EDEN_NX2_ASYNC_SHADERS")
+                                   ? std::getenv("EDEN_NX2_ASYNC_SHADERS")[0] == '1'
+                                   : Settings::values.use_asynchronous_shaders.GetValue()},
       use_vulkan_pipeline_cache{Settings::values.use_vulkan_driver_pipeline_cache.GetValue() &&
                                 !device_.DriverCachesPipelines()},
       serialization_thread(1, "VkPipelineSerialization", {}, Common::ThreadPlacement::Background) {
@@ -833,6 +847,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .driver_threads = driver_threads,
         .name = "VkShader",
     });
+    Nx2InitGpl(); // nx2 shaderwarm: library pipelines' optimized links
 }
 
 namespace {
@@ -930,6 +945,7 @@ void LogRuntimePipelineTotals();
 } // Anonymous namespace
 
 PipelineCache::~PipelineCache() {
+    Nx2StopPrecompile(); // nx2 shaderwarm
     serialization_stop.request_stop();
     StopBackgroundJobs();
     // The pipelines' builds end before the driver pipeline cache they build into goes.
@@ -937,6 +953,7 @@ PipelineCache::~PipelineCache() {
     Common::NoteShutdownProgress();
     serialization_thread.WaitForRequests();
     Common::NoteShutdownProgress();
+    Nx2Stats::FinalReport();
     SaveUsedPipelines();
     if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
@@ -1205,6 +1222,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     } else if (migration.failed) {
         LOG_WARNING(Render_Vulkan, "Couldn't start shader cache v2 from the older cache");
     }
+    Nx2OpenStageCache(base_dir); // nx2 shaderwarm: vulkan_ir.bin, EDEN_NX2_PRECOMPILE
     cache_v2 = std::make_unique<CacheV2::Cache>(pipeline_cache_filename);
     if (!build_at_boot) {
         cache_v2->KeepStalePrograms();
@@ -2271,6 +2289,7 @@ void PipelineCache::TickFrame() {
     ++frame_count;
     native_wait_budget_us =
         static_cast<s64>(Settings::values.native_pipeline_wait_ms.GetValue()) * 1000;
+    Nx2Stats::MaybeReport();
     while (!evicted_pipelines.empty() && scheduler.IsFree(evicted_pipelines.front().first)) {
         evicted_pipelines.pop_front();
     }
@@ -2467,6 +2486,9 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) noexc
                      skipped.load(std::memory_order_relaxed));
         }
     }
+    if (discard && Nx2Stats::Enabled()) {
+        Nx2Stats::Get().async_skipped_draws.fetch_add(1, std::memory_order_relaxed);
+    }
     return discard ? nullptr : pipeline;
 }
 
@@ -2505,6 +2527,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     ParallelTranslation* parallel) try {
     auto hash = key.Hash();
     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
+    auto& times = Nx2Stats::build_times;
+    times = {};
+    auto phase_begin = Nx2Stats::Clock::now();
     // Declared before the programs, whose IR they hold
     std::vector<std::shared_ptr<ShaderPools>> stage_pools;
     SCOPE_EXIT {
@@ -2526,6 +2551,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 !device.IsGeometryShaderSupported() && env.IsNativeProgram()) {
                 continue; // The pipeline is skipped below before this stage is needed
             }
+            // nx2 shaderwarm: a stage the per-stage cache serves (vulkan_ir.bin) or learns
+            // (EDEN_NX2_IR_LEARN logs the environment's queries during the translation) stays on
+            // this thread, in the loop below.
+            if (Nx2CacheableStage(index, env, key.unique_hashes[0] != 0)) {
+                continue;
+            }
             translations.push_back({
                 .env = &env,
                 .pools = stage_pools.emplace_back(TakeSparePools()).get(),
@@ -2535,7 +2566,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             translated[index] = &translations.back();
         }
         const auto begin = std::chrono::steady_clock::now();
-        VideoCommon::TranslateStages(*shader_jobs, translations, host_info);
+        if (!translations.empty()) {
+            VideoCommon::TranslateStages(*shader_jobs, translations, host_info);
+        }
         parallel->wait += std::chrono::steady_clock::now() - begin;
         for (const VideoCommon::StageTranslation& translation : translations) {
             parallel->stages += translation.time;
@@ -2549,6 +2582,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
 
     // Layer passthrough generation for devices without VK_EXT_shader_viewport_index_layer
     Shader::IR::Program* layer_source_program{};
+    bool all_native = true;
     bool mesh_unsupported{};
 
     for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
@@ -2575,6 +2609,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             }
             return nullptr;
         }
+        all_native = all_native && env.IsNativeProgram();
         // Without VK_EXT_mesh_shader the driver cannot build a task/mesh pipeline; the draw is
         // skipped (see the pipeline check in the rasterizer). The stages are still translated
         // so the skipped pipeline's needs can be reported below.
@@ -2601,10 +2636,23 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
             return TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
         };
-        if (!uses_vertex_a || index != 1) {
+        // nx2 shaderwarm: the stage's translation from the per-stage cache (vk_shaderwarm.cpp).
+        const bool cacheable_stage{Nx2CacheableStage(index, env, uses_vertex_a)};
+        if (cacheable_stage && Nx2TryCachedStage(pools, key, index, env, programs[index])) {
+            ++times.cached_stages;
+        } else if (!uses_vertex_a || index != 1) {
             // Normal path
+            const bool learn{cacheable_stage && Nx2LearnArm(env)}; // nx2 shaderwarm
             programs[index] = translate();
+            if (learn) {
+                Nx2LearnTranslation(Nx2StageRecordHash(key, index, env), env, programs[index]);
+            }
+            if (cacheable_stage) {
+                ++times.translated_stages;
+            }
         } else {
+            const u32 cfg_offset{static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
+            Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
             // VertexB path when VertexA is present.
             auto& program_va{programs[0]};
             auto program_vb{translate()};
@@ -2828,20 +2876,32 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 storage_buffers + auxiliary_buffers, auxiliary_buffers, set_limit);
         }
     }
-    u64 deferred_ir_bytes = 0;
-    std::unique_ptr<QueuedIrBudget::Reservation> ir_reservation;
-    if (emit_pools) {
-        deferred_ir_bytes = IrBytes(programs);
-        ir_reservation = queued_ir.TryReserve(deferred_ir_bytes);
-    }
-    const bool defer_emission = ir_reservation != nullptr;
     std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};
     std::array<std::vector<u32>, Maxwell::MaxShaderStage> stage_spirv;
     std::array<std::optional<Shader::RuntimeInfo>, Maxwell::MaxShaderStage> deferred_runtime_infos;
     std::array<std::vector<u32>, Maxwell::MaxShaderStage> reference_spirv;
+    times.translate = Nx2Stats::Clock::now() - phase_begin;
+    phase_begin = Nx2Stats::Clock::now();
 
     const Shader::IR::Program* previous_stage{};
     Shader::Backend::Bindings binding;
+    const char* const gpl_ineligible =
+        device.IsGplEnabled()
+            ? Nx2::GplIneligible(device, key, programs, layer_source_program != nullptr, all_native)
+            : "off";
+    const bool use_gpl = gpl_ineligible == nullptr;
+    // A native pipeline's SPIR-V emission is deferred to the build's job, within the queued IR
+    // budget; library pipelines emit their per-stage SPIR-V here (nx2 shaderwarm: the library
+    // state is keyed by it).
+    u64 deferred_ir_bytes = 0;
+    std::unique_ptr<QueuedIrBudget::Reservation> ir_reservation;
+    if (emit_pools && !use_gpl) {
+        deferred_ir_bytes = IrBytes(programs);
+        ir_reservation = queued_ir.TryReserve(deferred_ir_bytes);
+    }
+    const bool defer_emission = ir_reservation != nullptr;
+    Nx2CountMonolithic(key, gpl_ineligible); // nx2 shaderwarm: EDEN_NX2_PIPELINE_STATS
+    std::array<std::vector<u32>, 2> gpl_code;
     for (size_t index = uses_vertex_a && uses_vertex_b ? 1 : 0; index < Maxwell::MaxShaderProgram;
          ++index) {
         const bool is_emulated_stage = layer_source_program != nullptr &&
@@ -2867,6 +2927,20 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             // returning an error. The previous stage's legacy outputs are generics by now, so the
             // ones they were mapped to are kept.
             Shader::Maxwell::TrimGeometryPassthrough(program, previous_stage->info.stores);
+        }
+        if (use_gpl) {
+            // Emitted here, not deferred: the library state is keyed by the stage's SPIR-V.
+            const auto begin = std::chrono::steady_clock::now();
+            std::vector<u32> code{EmitGplStage(program, key)};
+            Nx2GplCheck(key, program, index, code); // nx2 shaderwarm: EDEN_NX2_GPL_CHECK, _DUMP
+            device.SaveShader(code);
+            stage_spirv[stage_index] = code; // the pipeline builds its module from this copy
+            gpl_code[index == 1 ? 0 : 1] = std::move(code);
+            if (build_in_parallel) {
+                AddRuntimeSpirvTime(0, begin);
+            }
+            previous_stage = &program;
+            continue;
         }
         auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
         if (mesh_emulation && (program.stage == Shader::Stage::Mesh ||
@@ -2959,6 +3033,15 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             return spirv;
         };
     }
+    // On the GPU thread: the SPIR-V of the stages not deferred to a job, with their modules.
+    times.spirv = Nx2Stats::Clock::now() - phase_begin;
+    phase_begin = Nx2Stats::Clock::now();
+    const GplParams gpl_params{
+        .libraries = &gpl_libraries,
+        .lto_worker = gpl_lto_workers.get(),
+        .vertex_spirv = gpl_code[0],
+        .fragment_spirv = gpl_code[1],
+    };
     static_assert(VideoCommon::EvictedPointerSlots::NumPrograms == Maxwell::MaxShaderProgram);
     VideoCommon::EvictedPointerSlots::Slots mapped_pointers;
     for (size_t index = 0, mapped_env = 0; index < Maxwell::MaxShaderProgram; ++index) {
@@ -2966,14 +3049,15 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             mapped_pointers[index] = envs[mapped_env++]->MappedStoragePointerKeys();
         }
     }
-    auto pipeline = std::make_unique<GraphicsPipeline>(
+    auto built = std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, pipeline_binaries.get(),
         &shader_notify, device, descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring,
         BuildQueue(build_in_parallel, defer_emission ? deferred_ir_bytes : 0), statistics,
         render_pass_cache, key, std::move(stage_spirv), infos, std::move(emit_stages),
-        std::move(mesh_emulation));
-    pipeline->SetMappedPointers(std::move(mapped_pointers));
-    return pipeline;
+        use_gpl ? &gpl_params : nullptr, std::move(mesh_emulation));
+    built->SetMappedPointers(std::move(mapped_pointers));
+    times.layout = Nx2Stats::Clock::now() - phase_begin;
+    return built;
 
 } catch (const Shader::Exception& exception) {
     auto hash = key.Hash();
@@ -3161,6 +3245,15 @@ void PipelineCache::WarnKeptPointer(size_t program, u64 slot) const {
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     const VideoCommon::EvictedPointerSlots::Slots* keep_pointers, bool evicted) {
+    // EDEN_NX2_PRECOMPILE_ONLY=1 (sandbox): build no pipeline while playing (draws are skipped),
+    // so a precompile host leaves only the precompile's libraries in the driver's cache.
+    static const bool precompile_only = [] {
+        const char* value = std::getenv("EDEN_NX2_PRECOMPILE_ONLY");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (precompile_only) {
+        return nullptr;
+    }
     const VideoCommon::Nx2Profile::Scope profile_scope{
         VideoCommon::Nx2Profile::Zone::GraphicsPipelineMiss};
     const auto begin = std::chrono::steady_clock::now();
@@ -3188,6 +3281,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     };
     GraphicsEnvironments environments;
     GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
+    const auto env_time = std::chrono::steady_clock::now() - begin;
     if (keep_pointers) {
         for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
             if (graphics_key.unique_hashes[index] == 0) {
@@ -3243,6 +3337,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     ShaderPools& pools = emit_pools ? *emit_pools : main_pools;
     auto pipeline{CreateGraphicsPipeline(pools, graphics_key, environments.Span(), nullptr, true,
                                          std::move(emit_pools), parallel ? &*parallel : nullptr)};
+    Nx2LogRuntimePipeline(environments, pipeline.get()); // nx2 shaderwarm: EDEN_NX2_PIPELINE_LOG
+    Nx2ReportGraphicsBuild(begin, env_time); // nx2 shaderwarm: EDEN_NX2_PIPELINE_STATS
     if (!pipeline || pipeline_cache_filename.empty()) {
         return pipeline;
     }
@@ -3292,10 +3388,29 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(const ComputePipe
     env.SetCachedSize(shader->size_bytes);
     env.KeepStoragePointers(keep_pointers);
 
+    const bool stats = Nx2Stats::Enabled();
+    if (stats) {
+        Nx2Stats::Get().cs_runtime.fetch_add(1, std::memory_order_relaxed);
+    }
     // The SPIR-V is emitted by the pipeline's job instead of here
     std::shared_ptr<ShaderPools> emit_pools = TakeSparePools();
     ShaderPools& pools = *emit_pools;
     auto entry{CreateComputePipeline(pools, key, env, nullptr, true, std::move(emit_pools))};
+    if (stats) {
+        auto& counters = Nx2Stats::Get();
+        (last_compute_from_ir ? counters.cs_ir : counters.cs_translated)
+            .fetch_add(1, std::memory_order_relaxed);
+        const auto elapsed = std::chrono::steady_clock::now() - begin;
+        Nx2Stats::Add(Nx2Stats::Phase::CsGpu, elapsed);
+        if (Nx2Stats::Level() >= 2) {
+            LOG_INFO(Render_Vulkan,
+                     "NX2STATS compute {:016x}: wg {}x{}x{} shared {} local {}: {} in {:.2f} ms",
+                     key.unique_hash, key.workgroup_size[0], key.workgroup_size[1],
+                     key.workgroup_size[2], key.shared_memory_size, env.LocalMemorySize(),
+                     last_compute_from_ir ? "cached translation" : "translated",
+                     Nx2Stats::Ms(elapsed));
+        }
+    }
     if (const char* directory = std::getenv("EDEN_NX2_SHADER_DUMP");
         directory && !entry.pipeline && env.CanBeSerialized()) {
         const auto path = std::filesystem::path{directory} /
@@ -3341,14 +3456,33 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
 
     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
 
-    Shader::Maxwell::Flow::CFG cfg{env, pools.flow_block, env.StartAddress()};
-
     // Dump it before error.
     if (Settings::values.dump_guest_shaders) {
         env.Dump(hash, key.unique_hash);
     }
 
-    auto program{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
+    // The per-stage translation cache first (compute records, EDEN_NX2_IR_CACHE_COMPUTE), then
+    // the translation.
+    Shader::IR::Program program;
+    const bool from_ir = ir_cache.IsOpen() && env.IsNativeProgram() && Nx2::ComputeIrCacheEnabled() &&
+                         TryCachedTranslation(pools, key.unique_hash, env, program);
+    if (build_in_parallel) {
+        last_compute_from_ir = from_ir; // the runtime path (GPU thread) reads it after the call
+    }
+    if (!from_ir) {
+        const auto translate_begin = Nx2Stats::Clock::now();
+        // nx2 shaderwarm: stored for the next session (EDEN_NX2_IR_LEARN).
+        const bool learn = ir_cache.IsOpen() && env.IsNativeProgram() &&
+                           Nx2::ComputeIrCacheEnabled() && Nx2LearnArm(env);
+        Shader::Maxwell::Flow::CFG cfg{env, pools.flow_block, env.StartAddress()};
+        program = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
+        if (learn) {
+            Nx2LearnTranslation(key.unique_hash, env, program);
+        }
+        if (build_in_parallel && Nx2Stats::Enabled()) {
+            Nx2Stats::Add(Nx2Stats::Phase::CsTranslate, Nx2Stats::Clock::now() - translate_begin);
+        }
+    }
     const VkDriverIdKHR driver_id = device.GetDriverID();
     const bool needs_shared_mem_clamp =
         driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||

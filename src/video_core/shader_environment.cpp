@@ -19,6 +19,7 @@
 #include <sstream>
 #include <utility>
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/cityhash.h"
 #include "common/common_types.h"
@@ -358,6 +359,15 @@ bool FileEnvironment::HasNativeInstructions() const {
     return Shader::Ampere::HasNativeAddressMap(code);
 }
 
+std::vector<u8> GenericEnvironment::ReadProgramBytes(u32 offset, u32 size) const {
+    std::vector<u8> bytes;
+    if (gpu_memory != nullptr) {
+        bytes.resize(size);
+        gpu_memory->ReadBlock(program_base + start_address + offset, bytes.data(), size);
+    }
+    return bytes;
+}
+
 u64 GenericEnvironment::CalculateHash() const {
     const size_t size{ReadSizeBytes()};
     const auto data{std::make_unique<char[]>(size)};
@@ -652,6 +662,20 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(
         }
         if (status == Shader::Ampere::ProgramCaptureState::Result::Complete) break;
     }
+    return LowerCapturedNative(native, native_header_size, geometry_stage, cache_v2,
+                               capture_begin);
+}
+
+std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerCapturedNative(
+    std::vector<Shader::Ampere::Instruction>& native, u32 source_header_size,
+    bool geometry_stage, ShaderCacheV2::Cache* cache_v2,
+    std::chrono::steady_clock::time_point capture_begin) {
+    using Shader::Ampere::Instruction;
+    using Clock = std::chrono::steady_clock;
+    if (cache_v2 && capture_begin == Clock::time_point{}) {
+        capture_begin = Clock::now();
+    }
+    const u32 native_header_size = source_header_size;
     const std::vector<u32> verified_traps = NativeTrapOffsets(native);
     const size_t trap_count = verified_traps.empty() ? 0 : verified_traps.back() / sizeof(Instruction) + 1;
     if (trap_count && (stage != Shader::Stage::Compute ||
@@ -712,7 +736,7 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(
             dump.write(reinterpret_cast<const char*>(native.data()),
                        native.size() * sizeof(Shader::Ampere::Instruction));
         }
-        if (native_header_size != 0) {
+        if (native_header_size != 0 && gpu_memory != nullptr) {
             auto header_path = path;
             header_path.replace_extension(".header.bin");
             if (!std::filesystem::exists(header_path) &&
@@ -731,7 +755,7 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(
             }
         }
     }
-    if (!found.code && !lowered) {
+    if (!found.code && !lowered && gpu_memory != nullptr) {
         if (const char* directory = std::getenv("EDEN_NATIVE_SHADER_OVERRIDE_DIR")) {
             const auto key = fmt::format("{:016x}", Shader::Ampere::NativeProgramKey(native));
             const auto folder = std::filesystem::path{directory};
@@ -969,9 +993,13 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
         const bool has_task{regs.IsShaderConfigEnabled(Maxwell::ShaderType::Tessellation)};
         stage = program == Maxwell::ShaderType::VertexB && has_task ? Shader::Stage::Task
                                                                     : Shader::Stage::Mesh;
-        mesh_registers = {regs.reg_array[Maxwell::MeshShaderA], regs.reg_array[Maxwell::MeshShaderB],
-                          regs.reg_array[Maxwell::MeshInitShader]};
-        if (stage == Shader::Stage::Mesh && regs.IsShaderConfigEnabled(Maxwell::ShaderType::Geometry)) {
+        mesh_registers = EffectiveMeshRegisters(
+            regs.reg_array[Maxwell::MeshShaderA], regs.reg_array[Maxwell::MeshShaderB],
+            regs.reg_array[Maxwell::MeshInitShader], has_task);
+        std::memset(&mesh_primitive_header, 0, sizeof(mesh_primitive_header));
+        // Translation reads it for the mesh program only; the task keeps it too, so the stage
+        // hash in the pipeline key can be undone from the environment (MeshStateHash).
+        if (regs.IsShaderConfigEnabled(Maxwell::ShaderType::Geometry)) {
             const auto& geometry_pipeline{
                 regs.pipelines[static_cast<size_t>(Maxwell::ShaderType::Geometry)]};
             const GPUVAddr address{(static_cast<u64>(geometry_pipeline.reserved[0] & 0xff) << 32) |
@@ -1044,6 +1072,7 @@ Shader::TextureType GraphicsEnvironment::ReadTextureType(u32 handle) {
         ReadTextureInfo(regs.tex_header.Address(), regs.tex_header.limit, via_header_index, handle);
     const Shader::TextureType result{ConvertTextureType(entry)};
     texture_types.emplace(handle, result);
+    LogTextureQuery(0, static_cast<u32>(result));
     return result;
 }
 
@@ -1054,17 +1083,27 @@ Shader::TexturePixelFormat GraphicsEnvironment::ReadTexturePixelFormat(u32 handl
         ReadTextureInfo(regs.tex_header.Address(), regs.tex_header.limit, via_header_index, handle);
     const Shader::TexturePixelFormat result(ConvertTexturePixelFormat(entry));
     texture_pixel_formats.emplace(handle, result);
+    if (!integer_query) {
+        LogTextureQuery(2, static_cast<u32>(result));
+    }
     return result;
 }
 
 bool GraphicsEnvironment::IsTexturePixelFormatInteger(u32 handle) {
-    return VideoCore::Surface::IsPixelFormatInteger(
+    integer_query = true;
+    const bool result = VideoCore::Surface::IsPixelFormatInteger(
         static_cast<VideoCore::Surface::PixelFormat>(ReadTexturePixelFormat(handle)));
+    integer_query = false;
+    LogTextureQuery(1, result ? 1U : 0U);
+    return result;
 }
 
 u32 GraphicsEnvironment::ReadViewportTransformState() {
     const auto& regs{maxwell3d->regs};
     viewport_transform_state = regs.viewport_scale_offset_enabled;
+    if (query_log_active) {
+        viewport_read = true;
+    }
     return viewport_transform_state;
 }
 
@@ -1128,6 +1167,7 @@ Shader::TextureType ComputeEnvironment::ReadTextureType(u32 handle) {
     auto entry = ReadTextureInfo(regs.tic.Address(), regs.tic.limit, qmd.linked_tsc != 0, handle);
     const Shader::TextureType result{ConvertTextureType(entry)};
     texture_types.emplace(handle, result);
+    LogTextureQuery(0, static_cast<u32>(result));
     return result;
 }
 
@@ -1137,6 +1177,9 @@ Shader::TexturePixelFormat ComputeEnvironment::ReadTexturePixelFormat(u32 handle
     auto entry = ReadTextureInfo(regs.tic.Address(), regs.tic.limit, qmd.linked_tsc != 0, handle);
     const Shader::TexturePixelFormat result(ConvertTexturePixelFormat(entry));
     const bool inserted{texture_pixel_formats.emplace(handle, result).second};
+    if (!integer_query) {
+        LogTextureQuery(2, static_cast<u32>(result));
+    }
     if (inserted && result == Shader::TexturePixelFormat::R16_FLOAT &&
         kepler_compute->IsNativeMode() && std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS")) {
         const auto pair{Tegra::Texture::TexturePair(handle, qmd.linked_tsc != 0)};
@@ -1178,11 +1221,18 @@ Shader::TexturePixelFormat ComputeEnvironment::ReadTexturePixelFormat(u32 handle
 }
 
 bool ComputeEnvironment::IsTexturePixelFormatInteger(u32 handle) {
-    return VideoCore::Surface::IsPixelFormatInteger(
+    integer_query = true;
+    const bool result = VideoCore::Surface::IsPixelFormatInteger(
         static_cast<VideoCore::Surface::PixelFormat>(ReadTexturePixelFormat(handle)));
+    integer_query = false;
+    LogTextureQuery(1, result ? 1U : 0U);
+    return result;
 }
 
 u32 ComputeEnvironment::ReadViewportTransformState() {
+    if (query_log_active) {
+        viewport_read = true;
+    }
     return viewport_transform_state;
 }
 
@@ -1467,6 +1517,22 @@ static std::filesystem::path FailedRewritePath(const std::filesystem::path& file
     auto path = filename;
     path += ".rewrite-failed";
     return path;
+}
+
+std::array<u32, 3> EffectiveMeshRegisters(u32 shader_a, u32 shader_b, u32 init, bool has_task) {
+    static const bool normalize = [] {
+        const char* value = std::getenv("EDEN_NX2_MESH_INIT");
+        return value != nullptr && std::string_view{value} == "0";
+    }();
+    return {shader_a, shader_b, normalize && !has_task ? 0U : init};
+}
+
+u64 MeshStateHash(const std::array<u32, 3>& registers,
+                  const Shader::ProgramHeader& primitive_header) {
+    static_assert(sizeof(primitive_header) == 20 * sizeof(u32));
+    std::array<u32, 3 + 20> state{registers[0], registers[1], registers[2]};
+    std::memcpy(state.data() + 3, &primitive_header, sizeof(primitive_header));
+    return Common::CityHash64(reinterpret_cast<const char*>(state.data()), sizeof(state)) | 1;
 }
 
 void SerializePipeline(std::span<const char> key, std::span<const GenericEnvironment* const> envs,

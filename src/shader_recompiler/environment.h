@@ -6,6 +6,7 @@
 #pragma once
 
 #include <array>
+#include <span>
 #include <utility>
 #include <vector>
 #include "common/container/unordered_map.h"
@@ -124,6 +125,24 @@ public:
     [[nodiscard]] virtual bool HasHLEMacroState() const = 0;
 
     [[nodiscard]] virtual bool HasNativeInstructions() const { return false; }
+
+    /// Takes over the answers a cached translation of this program used (live environments,
+    /// so the pipeline is serialized with them); others ignore them.
+    virtual void AdoptAnswers([[maybe_unused]] std::span<const u8> data) {}
+
+    /// Called with the constant buffer words the next texture handle query's handle is made of
+    /// ((word(index, offset) << shift_left) | (word(secondary) << secondary_shift_left)): the
+    /// precompile records them so the answers can be checked against live descriptors.
+    /// The live 3D/compute environments (video_core GraphicsEnvironment, ComputeEnvironment):
+    /// their translations can be stored as per-stage cache records (no RTTI to ask otherwise).
+    [[nodiscard]] virtual bool IsLiveEnvironment() const {
+        return false;
+    }
+    virtual void NoteTextureHandleSource([[maybe_unused]] u32 index, [[maybe_unused]] u32 offset,
+                                         [[maybe_unused]] u32 shift_left,
+                                         [[maybe_unused]] u32 secondary_index,
+                                         [[maybe_unused]] u32 secondary_offset,
+                                         [[maybe_unused]] u32 secondary_shift_left) {}
 
     [[nodiscard]] virtual std::optional<ReplaceConstant> GetReplaceConstBuffer(u32 bank,
                                                                                u32 offset) = 0;

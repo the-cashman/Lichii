@@ -22,6 +22,7 @@
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
+#include "video_core/renderer_vulkan/nx2_pipeline_stats.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_frame_dump.h"
 #include "video_core/renderer_vulkan/vk_pipeline_binaries.h"
@@ -310,10 +311,19 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             const bool unoptimized = (flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) != 0;
             const auto trace_begin = std::chrono::steady_clock::now();
             TracePipelineBuild("BEGIN", "compute", shader_hash, traced, unoptimized);
+            const auto driver_begin = Nx2Stats::Clock::now();
             pipeline = binaries ? binaries->CreateComputePipeline(compute_ci, *pipeline_cache,
                                                                   binary_key)
                                 : device.GetLogical().CreateComputePipeline(compute_ci,
                                                                             *pipeline_cache);
+            if (Nx2Stats::Enabled()) {
+                const auto driver_time = Nx2Stats::Clock::now() - driver_begin;
+                Nx2Stats::Add(Nx2Stats::Phase::CsDriver, driver_time);
+                if (Nx2Stats::Level() >= 2) {
+                    LOG_INFO(Render_Vulkan, "NX2STATS cs-driver {:016x}: {:.2f} ms", shader_hash,
+                             Nx2Stats::Ms(driver_time));
+                }
+            }
             TracePipelineBuild("END", "compute", shader_hash, traced, unoptimized,
                                std::chrono::duration<double, std::milli>(
                                    std::chrono::steady_clock::now() - trace_begin)
@@ -708,6 +718,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     if (!is_built.load(std::memory_order::relaxed)) {
         // Wait for the pipeline to be built
         scheduler.Record([this](vk::CommandBuffer) {
+            Nx2Stats::Timer wait_timer{Nx2Stats::Phase::CsWait};
             const VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::PipelineWait};
             const auto begin = std::chrono::steady_clock::now();
             if (jobs) {

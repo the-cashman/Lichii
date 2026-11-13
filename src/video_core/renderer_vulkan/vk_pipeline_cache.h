@@ -12,6 +12,7 @@
 #include <deque>
 #include <filesystem>
 #include <unordered_map>
+#include <thread>
 #include <unordered_set>
 #include <memory>
 #include <mutex>
@@ -29,6 +30,7 @@
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/object_pool.h"
 #include "shader_recompiler/profile.h"
+#include "shader_recompiler/runtime_info.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/bounded_store.h"
@@ -39,6 +41,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache_prebuild.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/shader_cache.h"
+#include "video_core/nx2_ir_cache.h" // nx2 shaderwarm
 #include "video_core/shader_cache_v2/cache.h"
 #include "video_core/shader_jobs.h"
 #include "video_core/shader_stage_translation.h"
@@ -262,6 +265,70 @@ private:
     void PrecacheShaders(u64 title_id, std::stop_token stop_loading,
                          const VideoCore::DiskResourceLoadCallback& callback);
 
+    // ---- nx2 shaderwarm (docs/shader-precompile.md; defined in vk_shaderwarm.cpp) ---------------
+    /// The stage's translation from the per-stage cache, when it has one whose environment
+    /// inputs match env (and adopts its answers into env). False: translate it.
+    bool TryCachedTranslation(ShaderPools& pools, u64 unique_hash, Shader::Environment& env,
+                              Shader::IR::Program& out);
+    /// EDEN_NX2_IR_LEARN=1: whether live translations are stored as per-stage cache records, and
+    /// arming env's query log before such a translation (no-op when off or env can't be stored).
+    [[nodiscard]] bool Nx2LearnArm(Shader::Environment& env) const;
+    /// The per-stage cache key of a graphics pipeline's stage (task/mesh: the program's own hash).
+    [[nodiscard]] u64 Nx2StageRecordHash(const GraphicsPipelineCacheKey& key, size_t index,
+                                         Shader::Environment& env) const;
+    /// Stores a live translation (made with the query log armed, right after TranslateProgram) as
+    /// a record under record_hash, so the next session uses it instead of translating again.
+    void Nx2LearnTranslation(u64 record_hash, Shader::Environment& env,
+                             const Shader::IR::Program& program);
+    /// EDEN_NX2_PRECOMPILE=<pack>: translates every stage program of the pack into the per-stage
+    /// cache on background threads.
+    void RunPrecompile(std::filesystem::path pack_path, std::stop_token stop);
+    /// Opens <title>/vulkan_ir.bin when it exists (or EDEN_NX2_PRECOMPILE makes it) and starts the
+    /// precompile.
+    void Nx2OpenStageCache(const std::filesystem::path& base_dir);
+    void Nx2StopPrecompile();
+    /// Whether a graphics pipeline's stage takes part in the per-stage translation cache, and its
+    /// cached translation when a record's inputs match env.
+    [[nodiscard]] bool Nx2CacheableStage(size_t index, Shader::Environment& env,
+                                         bool uses_vertex_a) const;
+    bool Nx2TryCachedStage(ShaderPools& pools, const GraphicsPipelineCacheKey& key, size_t index,
+                           Shader::Environment& env, Shader::IR::Program& out);
+    /// EDEN_NX2_PIPELINE_STATS: a native VS+PS pipeline left monolithic in library mode.
+    void Nx2CountMonolithic(const GraphicsPipelineCacheKey& key, const char* reason) const;
+    /// EDEN_NX2_GPL: the optimized-link workers.
+    void Nx2InitGpl();
+    /// EDEN_NX2_GPL_CHECK=1: logs the stage's SPIR-V inputs that differ from the precompile's;
+    /// EDEN_NX2_GPL_DUMP=<dir>: writes the stage's library SPIR-V and state.
+    void Nx2GplCheck(const GraphicsPipelineCacheKey& key, const Shader::IR::Program& program,
+                     size_t index, std::span<const u32> spirv) const;
+    /// EDEN_NX2_PIPELINE_STATS / EDEN_NX2_PIPELINE_LOG for a runtime graphics pipeline.
+    void Nx2ReportGraphicsBuild(std::chrono::steady_clock::time_point begin,
+                                std::chrono::steady_clock::duration env_time);
+    void Nx2LogRuntimePipeline(const GraphicsEnvironments& environments,
+                               const GraphicsPipeline* pipeline) const;
+    /// The library path's state for a stage library made without a pipeline (precompile): the
+    /// most common draw state, so the driver's cache key matches the first real use.
+    [[nodiscard]] GraphicsPipelineCacheKey GplDefaultKey(Shader::Stage stage) const;
+    /// The runtime info a library stage is emitted with (no previous stage; vertex attributes
+    /// class-independent when the device allows it).
+    [[nodiscard]] Shader::RuntimeInfo MakeGplRuntimeInfo(const Shader::IR::Program& program,
+                                                         const GraphicsPipelineCacheKey& key) const;
+    /// The stage's library SPIR-V (vertex set 0 / fragment set 1, own bindings, unpruned inputs).
+    [[nodiscard]] std::vector<u32> EmitGplStage(Shader::IR::Program& program,
+                                                const GraphicsPipelineCacheKey& key) const;
+
+    VideoCommon::Nx2IrCache::StageCache ir_cache;
+    /// Learned records stored this session (hash of the record's checks), so one translation is
+    /// stored once even when several pipelines translate the stage before the record is found.
+    std::mutex learned_mutex;
+    std::unordered_set<u64> learned_records;
+    std::jthread precompile_thread;
+    /// Graphics pipeline libraries (EDEN_NX2_GPL=1, vk_gpl.h); outlives the pipelines.
+    GplLibraryCache gpl_libraries;
+    /// Whether the last runtime compute pipeline came from the translation cache (GPU thread).
+    bool last_compute_from_ir{};
+    // ---- end nx2 shaderwarm ---------------------------------------------------------------------
+
     const Device& device;
     Scheduler& scheduler;
     DescriptorPool& descriptor_pool;
@@ -344,6 +411,9 @@ private:
     std::stop_source serialization_stop;
     Common::ThreadWorker serialization_thread;
     DynamicFeatures dynamic_features;
+    /// nx2 shaderwarm: optimized links of library pipelines (background); after graphics_cache:
+    /// stops first.
+    std::unique_ptr<Common::ThreadWorker> gpl_lto_workers;
 };
 
 } // namespace Vulkan

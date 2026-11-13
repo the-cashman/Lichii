@@ -454,6 +454,32 @@ public:
     /// once it ends.
     void MarkResolveShadowsUpToDate() const;
 
+    /// Dynamic rendering (graphics pipeline library path): the attachments by render target slot.
+    [[nodiscard]] VkImageView ColorView(size_t slot) const noexcept {
+        return color_views[slot];
+    }
+    [[nodiscard]] VkImageView DepthView() const noexcept {
+        return depth_view;
+    }
+    /// Highest render target slot with a color buffer + 1.
+    [[nodiscard]] u32 NumColorSlots() const noexcept {
+        return num_color_slots;
+    }
+    [[nodiscard]] u32 NumLayers() const noexcept {
+        return layers;
+    }
+    /// The depth attachment's format has depth / stencil (by format, as pipelines see it).
+    [[nodiscard]] bool FormatHasDepth() const noexcept {
+        return format_has_depth;
+    }
+    [[nodiscard]] bool FormatHasStencil() const noexcept {
+        return format_has_stencil;
+    }
+    /// Resolve attachments (tilers) have no dynamic rendering path here.
+    [[nodiscard]] bool HasResolveAttachments() const noexcept {
+        return num_resolve_shadows != 0;
+    }
+
 private:
     static constexpr size_t NUM_MEMOIZED_RENDER_PASS_VARIANTS = 8;
 
@@ -477,6 +503,11 @@ private:
     RenderPassCache* render_pass_cache{nullptr};
     bool discard_msaa_color{};
     bool discard_msaa_depth_stencil{};
+    std::array<VkImageView, NUM_RT> color_views{};
+    VkImageView depth_view{};
+    u32 num_color_slots{};
+    bool format_has_depth{};
+    bool format_has_stencil{};
     mutable std::array<u32, NUM_MEMOIZED_RENDER_PASS_VARIANTS> variant_keys{};
     mutable std::array<VkRenderPass, NUM_MEMOIZED_RENDER_PASS_VARIANTS> variant_render_passes{};
     mutable u32 num_memoized_variants{};

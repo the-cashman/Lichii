@@ -10,8 +10,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <condition_variable>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <type_traits>
@@ -28,6 +30,7 @@
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
+#include "video_core/renderer_vulkan/vk_gpl.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -89,6 +92,15 @@ inline bool DrawReuseProbeEnabled() {
     return enabled;
 }
 
+/// A native VS+PS pipeline linked from graphics pipeline libraries (vk_gpl.h): the stages'
+/// library SPIR-V (vertex set 0, fragment set 1) and where the libraries come from.
+struct GplParams {
+    GplLibraryCache* libraries{};
+    Common::ThreadWorker* lto_worker{}; ///< optimized link in the background; null: none
+    std::span<const u32> vertex_spirv;
+    std::span<const u32> fragment_spirv;
+};
+
 /// Mesh emulation on a device without VK_EXT_mesh_shader: the mesh program (stage 0) is built as
 /// a compute shader that writes its output to a storage buffer, and this vertex shader draws it
 /// (see Shader::Backend::SPIRV::EmitMeshEmulationVertex).
@@ -141,11 +153,17 @@ public:
         const GraphicsPipelineCacheKey& key, std::array<std::vector<u32>, NUM_STAGES> stages,
         const std::array<const Shader::Info*, NUM_STAGES>& infos,
         std::function<std::array<std::vector<u32>, NUM_STAGES>()> emit_stages = {},
+        const GplParams* gpl = nullptr,
         std::optional<MeshEmulationSetup> mesh_emulation = std::nullopt);
+    ~GraphicsPipeline();
 
     static std::chrono::nanoseconds TakeHoldTime() noexcept;
     /// Draws resolved from the texture memo and in full since the last call.
     static std::pair<u64, u64> TakeTextureMemoCounts() noexcept;
+
+    [[nodiscard]] bool IsLibraryPipeline() const noexcept {
+        return is_gpl;
+    }
 
     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
     u64 DynamicAttributeTypes() const noexcept { return key.state.attribute_types; }
@@ -420,6 +438,14 @@ private:
 
     void MakePipeline(VkRenderPass render_pass);
 
+    // ---- nx2 shaderwarm (vk_gpl_pipeline.cpp) ----
+    void Nx2InitLibraryPipeline(const GplParams& gpl, DescriptorPool& descriptor_pool);
+    void Nx2BindLibraryDescriptors(vk::CommandBuffer cmdbuf, const void* descriptor_data);
+    /// Library pipeline: gets the four libraries and fast-links them; queues the optimized link.
+    void MakeGplPipeline();
+
+    void SetupGplDescriptors(DescriptorPool& descriptor_pool);
+
     void Validate();
 
     const GraphicsPipelineCacheKey key;
@@ -536,6 +562,30 @@ private:
     std::array<MeshEmulationBuffer, 4> mesh_task_buffers{};
     u32 mesh_capacity{};
 
+    bool driver_cache_hit{false};
+
+    // Library pipeline (is_gpl): per-stage descriptor sets 0 (vertex) and 1 (fragment), the
+    // fast-linked pipeline in `pipeline` and the optimized one, when done, in lto_pipeline.
+    struct LtoControl {
+        std::mutex mutex;
+        bool alive{true};
+    };
+    bool is_gpl{false};
+    GplLibraryCache* gpl_libraries{};
+    Common::ThreadWorker* gpl_lto_worker{};
+    GplVertexInputState gpl_vi{};
+    GplPreRasterState gpl_pr{};
+    GplFragmentState gpl_fs{};
+    GplFragmentOutputState gpl_fo{};
+    std::array<vk::DescriptorSetLayout, 2> gpl_set_layouts;
+    std::array<vk::DescriptorUpdateTemplate, 2> gpl_templates;
+    std::array<DescriptorAllocator, 2> gpl_allocators;
+    std::atomic<VkPipeline> active_pipeline{VK_NULL_HANDLE};
+    std::atomic_bool lto_pipeline_done{false};
+    vk::Pipeline lto_pipeline;
+    std::shared_ptr<LtoControl> lto_control;
+
+    // Last: its destructor waits for the build, which uses the members above.
     std::optional<PipelineBuild> build;
 };
 

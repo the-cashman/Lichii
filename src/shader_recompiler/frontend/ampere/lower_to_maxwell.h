@@ -15,6 +15,7 @@
 #include <vector>
 #include "common/common_types.h"
 #include "shader_recompiler/frontend/ampere/geometry_exit.h"
+#include "shader_recompiler/frontend/ampere/nx2_relative_lepc.h"
 #include "shader_recompiler/frontend/ampere/register_pressure.h"
 
 namespace Shader::Ampere {
@@ -3969,7 +3970,13 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 native_predicate != 7)
                 return fail(index, "native program counter load mode");
             if (dest == 255) break;
-            const u64 address = native_code_address + u64{index} * sizeof(Instruction);
+            // nx2 shaderwarm: EDEN_NX2_RELATIVE_LEPC=1 lowers a dead LEPC address program-relative
+            // (nx2_relative_lepc.h), so the lowered code doesn't depend on the GPU address.
+            const u64 base_address =
+                Nx2RelativeLepcEnabled() && Nx2LepcAddressIsDead(code, index, dest)
+                    ? 0
+                    : native_code_address;
+            const u64 address = base_address + u64{index} * sizeof(Instruction);
             mov_imm(static_cast<u32>(dest), static_cast<u32>(address));
             mov_imm(static_cast<u32>(dest) + 1, static_cast<u32>(address >> 32));
             break;

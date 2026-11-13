@@ -120,8 +120,10 @@ public:
     /// Sends currently recorded work to the worker thread.
     void DispatchWork();
 
-    /// Requests to begin a renderpass.
-    void RequestRenderpass(const Framebuffer* framebuffer,
+    /// Requests to begin a renderpass. dynamic: a dynamic rendering instance (vkCmdBeginRendering)
+    /// instead of the framebuffer's render pass, for pipelines made without a render pass (the
+    /// graphics pipeline library path draws every 3D pipeline this way).
+    void RequestRenderpass(const Framebuffer* framebuffer, bool dynamic = false,
                            std::source_location location = std::source_location::current());
 
     /// Defers a full-attachment color clear so it becomes the next render pass.
@@ -456,6 +458,7 @@ private:
         bool needs_state_enable_refresh = false;
         u32 descriptor_buffer_chunk = 0;
         bool descriptor_buffer_bound = false;
+        bool dynamic_rendering = false;
     };
 
     struct DeferredClear {
@@ -470,8 +473,18 @@ private:
     void BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass renderpass,
                              const VkClearValue* clear_values, u32 clear_value_count);
 
+    /// Begins dynamic rendering into the framebuffer's attachments; the clear masks pick
+    /// VK_ATTACHMENT_LOAD_OP_CLEAR with the given values (by render target slot).
+    /// nx2 shaderwarm: takes the pending compute-to-graphics barrier where the base has one.
+    template <typename Self>
+    static bool Nx2TakeComputeWrites(Self& self);
+
+    void BeginRenderingImpl(const Framebuffer* framebuffer, u32 color_clear_mask,
+                            const std::array<VkClearValue, 8>* color_values, bool depth_stencil_clear,
+                            VkClearValue depth_stencil_value);
+
     /// If a deferred clear is pending.
-    void RealizeDeferredClear();
+    void RealizeDeferredClear(bool dynamic = false);
 
     void WorkerThread(std::stop_token stop_token);
 
