@@ -152,6 +152,13 @@ private:
 
     u64 output_format_key{~u64{}};
     u32 output_luminance_key{};
+    /// HDR output is on but the surface listed no HDR format the last time it was asked: asked
+    /// again every HdrRetryFrames presents. The window's first surface (the 100x30 startup window,
+    /// or a compositor that offers HDR formats only once the game is fullscreen) can list none,
+    /// and nothing else makes the choice again on Linux (no host HDR state to watch).
+    bool output_hdr_missing{};
+    u32 output_hdr_retry{};
+    static constexpr u32 HdrRetryFrames = 60;
     VkSurfaceFormatKHR output_format{};
     f32 output_reference_white{};
     f32 output_peak{};

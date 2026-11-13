@@ -118,7 +118,7 @@ std::string BuildCommaSeparatedExtensions(
 // The swapchain format and colour space to present in: an HDR pair the surface lists while HDR
 // output is on (Off/On/Auto with the monitor's state), else SDR.
 VkSurfaceFormatKHR ChooseOutputFormat(const vk::PhysicalDevice& physical, VkSurfaceKHR surface,
-                                      void* window) {
+                                      void* window, bool* hdr_missing = nullptr, bool quiet = false) {
     auto& monitor = Common::DisplayHdrMonitor::Instance();
     monitor.Watch(window);
     const auto output = Common::ResolveHdrOutput(
@@ -132,8 +132,14 @@ VkSurfaceFormatKHR ChooseOutputFormat(const vk::PhysicalDevice& physical, VkSurf
         if (hdr) {
             return *hdr;
         }
-        LOG_WARNING(Render_Vulkan,
-                    "HDR output is on, but the surface lists no HDR10 or scRGB format");
+        if (hdr_missing) {
+            *hdr_missing = true;
+        }
+        if (!quiet) {
+            LOG_WARNING(Render_Vulkan,
+                        "HDR output is on, but the surface lists no HDR10 or scRGB format "
+                        "(asked again every {} presents)", 60);
+        }
     }
 #ifdef __ANDROID__
     return {VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR};
@@ -402,14 +408,24 @@ HdrPresent RendererVulkan::UpdateHdrPresent() {
                     static_cast<u8>(Settings::values.hdr_swapchain.GetValue());
     const u32 luminance_key = (u32{Settings::values.hdr_peak_luminance.GetValue()} << 16) |
                               Settings::values.hdr_reference_white.GetValue();
-    if (key == output_format_key && luminance_key == output_luminance_key) {
+    // HDR on but no HDR format offered last time: ask the surface again now and then (see
+    // output_hdr_missing), quietly after the first warning.
+    bool retry = false;
+    if (output_hdr_missing && ++output_hdr_retry >= HdrRetryFrames) {
+        output_hdr_retry = 0;
+        retry = true;
+    }
+    if (!retry && key == output_format_key && luminance_key == output_luminance_key) {
         return {output_format.colorSpace, output_reference_white, output_peak};
     }
+    const bool quiet = retry && key == output_format_key;
     output_format_key = key;
     output_luminance_key = luminance_key;
     const auto previous = output_format;
+    output_hdr_missing = false;
     output_format = ChooseOutputFormat(device.GetPhysical(), *surface,
-                                       render_window.GetWindowInfo().render_surface);
+                                       render_window.GetWindowInfo().render_surface,
+                                       &output_hdr_missing, quiet);
     const auto told = CaptureHdrPresent();
     output_reference_white = told.reference_white;
     output_peak = told.peak;
