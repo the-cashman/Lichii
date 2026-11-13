@@ -597,8 +597,8 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             if (shadow_index || !kepler_compute.IsNativeMode() ||
                 kepler_compute.GetIndirectComputeAddress() || desc.count != 1 ||
                 desc.is_read || !desc.is_written || desc.type != Shader::TextureType::Color2D ||
-                desc.format != Shader::ImageFormat::R32_UINT || info.uses_global_memory) {
-                throw Shader::RuntimeError("Unsupported packed R16 surface dispatch or unbounded global access");
+                desc.format != Shader::ImageFormat::R32_UINT || info.stores_global_memory) {
+                throw Shader::RuntimeError("Unsupported packed R16 surface dispatch or unbounded global write");
             }
             shadow_index = image_index;
         }
