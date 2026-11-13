@@ -54,7 +54,8 @@ public:
     };
 
     /// Whether FSR 4 is turned on and the device can run it: AMD's driver on Windows, and on Linux
-    /// what CheckFsr4Port asks of the device (the log says why not).
+    /// what CheckFsr4Port asks of the device (the log says why not). Linux without the setting
+    /// (bazzite): whether EDEN_NX2_FSR4_LIB names an FFX API upscaler library.
     [[nodiscard]] static bool IsWanted(const Device& device);
 
     /// Throws vk::Exception when FSR 4 can't start on this device: the runtime is missing or

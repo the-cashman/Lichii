@@ -6,6 +6,7 @@
 // and records into our command buffer. Picking the FSR 4 provider by version follows
 // CheezerWheezer's FSR 4 integration for CheezyEmu.
 
+#include <cstdlib>
 #include <optional>
 #include <string>
 #include <vector>
@@ -109,10 +110,52 @@ struct Provider {
     std::string name;
 };
 
+/// The newest FSR 4 (or later) upscaler AMD's runtime offers for this device. The runtime also
+/// offers FSR 3.1 on GPUs without FSR 4; that one is left to the built-in FSR 3.1.
+std::optional<Provider> FindNewestFsr4(const FfxRuntime::Api& api, const Device& device) {
+    VkDeviceContext vk_context = DeviceContext(device);
+    u64 count = 0;
+    ffxQueryDescGetVersions versions{};
+    versions.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
+    versions.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+    versions.device = &vk_context;
+    versions.outputCount = &count;
+    if (api.query(nullptr, &versions.header) != FFX_API_RETURN_OK || count == 0) {
+        LOG_INFO(Render_Vulkan, "AMD FSR 4: the FidelityFX runtime offers no upscaler for {}",
+                 device.GetModelName());
+        return std::nullopt;
+    }
+    std::vector<u64> ids(count);
+    std::vector<const char*> names(count);
+    versions.versionIds = ids.data();
+    versions.versionNames = names.data();
+    if (api.query(nullptr, &versions.header) != FFX_API_RETURN_OK) {
+        return std::nullopt;
+    }
+    std::string offered;
+    std::optional<Provider> fsr4;
+    for (u64 i = 0; i < count; ++i) {
+        const std::string name = names[i] ? names[i] : "";
+        offered += (offered.empty() ? "" : ", ") + name;
+        // Newest first.
+        if (!fsr4 && !name.empty() && name[0] >= '4' && name[0] <= '9') {
+            fsr4 = Provider{ids[i], name};
+        }
+    }
+    LOG_INFO(Render_Vulkan, "AMD FSR 4: upscalers offered for {}: {}{}", device.GetModelName(),
+             offered, fsr4 ? "" : " (no FSR 4; using FSR 3.1)");
+    return fsr4;
+}
+
 #if defined(__linux__) && !defined(__ANDROID__)
 /// The fsr4-vk model CheckFsr4Port picked for the device's enabled features. fsr4-vk would pick
 /// by what the GPU supports, which can include features this device doesn't enable.
 std::optional<Provider> FindFsr4(const FfxRuntime::Api& api, const Device& device) {
+    if (api.legacy_vk_backend) {
+        // bazzite: EDEN_NX2_FSR4_LIB without the amd_fsr4 setting (no device features enabled
+        // for the port, so no model check): the library's newest FSR 4, as before #1496.
+        return FindNewestFsr4(api, device);
+    }
     const VideoCommon::Fsr4PortSupport support =
         VideoCommon::CheckFsr4Port(device.Fsr4PortDevice());
     if (!support.model) {
@@ -151,58 +194,28 @@ std::optional<Provider> FindFsr4(const FfxRuntime::Api& api, const Device& devic
     return std::nullopt;
 }
 #else
-/// The newest FSR 4 (or later) upscaler AMD's runtime offers for this device. The runtime also
-/// offers FSR 3.1 on GPUs without FSR 4; that one is left to the built-in FSR 3.1.
 std::optional<Provider> FindFsr4(const FfxRuntime::Api& api, const Device& device) {
-    VkDeviceContext vk_context = DeviceContext(device);
-    u64 count = 0;
-    ffxQueryDescGetVersions versions{};
-    versions.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
-    versions.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
-    versions.device = &vk_context;
-    versions.outputCount = &count;
-    if (api.query(nullptr, &versions.header) != FFX_API_RETURN_OK || count == 0) {
-        LOG_INFO(Render_Vulkan, "AMD FSR 4: the FidelityFX runtime offers no upscaler for {}",
-                 device.GetModelName());
-        return std::nullopt;
-    }
-    std::vector<u64> ids(count);
-    std::vector<const char*> names(count);
-    versions.versionIds = ids.data();
-    versions.versionNames = names.data();
-    if (api.query(nullptr, &versions.header) != FFX_API_RETURN_OK) {
-        return std::nullopt;
-    }
-    std::string offered;
-    std::optional<Provider> fsr4;
-    for (u64 i = 0; i < count; ++i) {
-        const std::string name = names[i] ? names[i] : "";
-        offered += (offered.empty() ? "" : ", ") + name;
-        // Newest first.
-        if (!fsr4 && !name.empty() && name[0] >= '4' && name[0] <= '9') {
-            fsr4 = Provider{ids[i], name};
-        }
-    }
-    LOG_INFO(Render_Vulkan, "AMD FSR 4: upscalers offered for {}: {}{}", device.GetModelName(),
-             offered, fsr4 ? "" : " (no FSR 4; using FSR 3.1)");
-    return fsr4;
+    return FindNewestFsr4(api, device);
 }
 #endif
 } // Anonymous namespace
 
 bool Fsr4Upscaler::IsWanted(const Device& device) {
 #if defined(__linux__) && !defined(__ANDROID__)
-    if (!Settings::values.amd_fsr4.GetValue()) {
-        return false;
+    if (Settings::values.amd_fsr4.GetValue()) {
+        const VideoCommon::Fsr4PortSupport support =
+            VideoCommon::CheckFsr4Port(device.Fsr4PortDevice());
+        if (!support.model) {
+            LOG_INFO(Render_Vulkan,
+                     "FSR 4 (fsr4-vk community Vulkan port) can't run on {} ({}): {}; using FSR 3.1",
+                     device.GetModelName(), device.GetDriverName(), support.reason);
+        }
+        return support.model.has_value();
     }
-    const VideoCommon::Fsr4PortSupport support =
-        VideoCommon::CheckFsr4Port(device.Fsr4PortDevice());
-    if (!support.model) {
-        LOG_INFO(Render_Vulkan,
-                 "FSR 4 (fsr4-vk community Vulkan port) can't run on {} ({}): {}; using FSR 3.1",
-                 device.GetModelName(), device.GetDriverName(), support.reason);
-    }
-    return support.model.has_value();
+    // bazzite: without the setting, an FFX API upscaler library named by EDEN_NX2_FSR4_LIB, given
+    // the older Vulkan backend description (FfxRuntime::Acquire), with no device check.
+    const char* const path = std::getenv("EDEN_NX2_FSR4_LIB");
+    return path != nullptr && path[0] != '\0';
 #else
     return Settings::values.amd_fsr4.GetValue() &&
            device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY;
@@ -242,9 +255,18 @@ bool Fsr4Upscaler::CreateContext(VkExtent2D render_size, VkExtent2D upscale_size
     backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
     backend.header.pNext = nullptr;
     backend.deviceContext = DeviceContext(device);
+    // bazzite: an FFX API 1.x library (EDEN_NX2_FSR4_LIB) knows only the older Vulkan backend
+    // description; it has the same device, physical device and proc address fields.
+    ffxCreateBackendVKDesc_DEPRECATED legacy_backend{};
+    legacy_backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK_DEPRECATED;
+    legacy_backend.header.pNext = nullptr;
+    legacy_backend.vkDevice = backend.deviceContext.vkDevice;
+    legacy_backend.vkPhysicalDevice = backend.deviceContext.vkPhysicalDevice;
+    legacy_backend.vkDeviceProcAddr = backend.deviceContext.vkDeviceProcAddr;
     ffxOverrideVersion version_override{};
     version_override.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
-    version_override.header.pNext = &backend.header;
+    version_override.header.pNext =
+        api->legacy_vk_backend ? &legacy_backend.header : &backend.header;
     version_override.versionId = provider_id;
     ffxCreateContextDescUpscaleVersion api_version{};
     api_version.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION;
@@ -270,13 +292,15 @@ bool Fsr4Upscaler::CreateContext(VkExtent2D render_size, VkExtent2D upscale_size
     context = ctx;
     render_extent = render_size;
     upscale_extent = upscale_size;
+    LOG_INFO(Render_Vulkan, "FSR 4: {} {} context {}x{} -> {}x{}",
+             api->legacy_vk_backend ? "EDEN_NX2_FSR4_LIB" :
 #if defined(__linux__) && !defined(__ANDROID__)
-    LOG_INFO(Render_Vulkan, "FSR 4: fsr4-vk {} context {}x{} -> {}x{}", provider_name,
-             render_size.width, render_size.height, upscale_size.width, upscale_size.height);
+                                    "fsr4-vk",
 #else
-    LOG_INFO(Render_Vulkan, "FSR 4: AMD FSR {} context {}x{} -> {}x{}", provider_name,
-             render_size.width, render_size.height, upscale_size.width, upscale_size.height);
+                                    "AMD FSR",
 #endif
+             provider_name, render_size.width, render_size.height, upscale_size.width,
+             upscale_size.height);
     return true;
 }
 

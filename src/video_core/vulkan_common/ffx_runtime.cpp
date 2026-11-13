@@ -4,8 +4,12 @@
 #include <mutex>
 #include <system_error>
 
+#include <cstdlib>
+
+#include "common/dynamic_library.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
+#include "common/settings.h"
 #include "video_core/vulkan_common/ffx_runtime.h"
 
 #ifdef _WIN32
@@ -237,7 +241,12 @@ std::shared_ptr<const Api> Acquire() {
     if (auto existing = current.lock()) {
         return existing;
     }
-    const std::filesystem::path path = PortLibrary();
+    // bazzite: EDEN_NX2_FSR4_LIB names the library (the launcher's fsr4-build.sh build). Without
+    // the amd_fsr4 setting it gets the older Vulkan backend description and no device features
+    // (the path before #1496); with it, the same as the port.
+    const char* const env_path = std::getenv("EDEN_NX2_FSR4_LIB");
+    const bool from_env = env_path != nullptr && env_path[0] != '\0';
+    const std::filesystem::path path = from_env ? std::filesystem::path{env_path} : PortLibrary();
     if (path.empty()) {
         LOG_INFO(Render_Vulkan, "FSR 4: {} is not in this build or in {}; using FSR 3.1",
                  PORT_LIBRARY, Common::FS::PathToUTF8String(Folder()));
@@ -251,6 +260,7 @@ std::shared_ptr<const Api> Acquire() {
     }
     auto loaded = std::make_unique<Loaded>();
     loaded->module = module;
+    loaded->legacy_vk_backend = from_env && !Settings::values.amd_fsr4.GetValue();
     loaded->create_context =
         reinterpret_cast<PfnFfxCreateContext>(dlsym(module, "ffxCreateContext"));
     loaded->destroy_context =
@@ -264,8 +274,9 @@ std::shared_ptr<const Api> Acquire() {
         dlclose(module);
         return nullptr;
     }
-    LOG_INFO(Render_Vulkan, "FSR 4: loaded the fsr4-vk community Vulkan port from {}",
-             Common::FS::PathToUTF8String(path));
+    LOG_INFO(Render_Vulkan, "FSR 4: loaded the fsr4-vk community Vulkan port from {}{}",
+             Common::FS::PathToUTF8String(path),
+             loaded->legacy_vk_backend ? " (EDEN_NX2_FSR4_LIB, older backend description)" : "");
     std::shared_ptr<const Loaded> shared{loaded.release(), [](const Loaded* l) {
                                              dlclose(l->module);
                                              delete l;

@@ -25,13 +25,16 @@ struct Api {
     PfnFfxDestroyContext destroy_context{};
     PfnFfxQuery query{};
     PfnFfxDispatch dispatch{};
+    /// bazzite: an FFX API upscaler library outside AMD's SDK (Linux, EDEN_NX2_FSR4_LIB, e.g.
+    /// fsr4-vk) that takes the Vulkan backend description of FFX API 1.x (type 3).
+    bool legacy_vk_backend{};
 };
 
 /// On Windows, loads AMD's runtime after checking every file, or null when a file is missing,
 /// doesn't match or the loader lacks its exports (the log says which). Files that passed are not
-/// checked again this session. On Linux, loads the fsr4-vk port (PortLibrary), or null when it
-/// isn't there or doesn't load; null on other systems. The runtime stays loaded while a returned
-/// pointer lives.
+/// checked again this session. On Linux, loads the fsr4-vk port (PortLibrary, or the library
+/// EDEN_NX2_FSR4_LIB names: bazzite), or null when it isn't there or doesn't load; null on other
+/// systems. The runtime stays loaded while a returned pointer lives.
 [[nodiscard]] std::shared_ptr<const Api> Acquire();
 
 } // namespace Vulkan::FfxRuntime
