@@ -14,6 +14,7 @@
 #include "video_core/renderer_vulkan/present/layer.h"
 #include "video_core/renderer_vulkan/present/util.h"
 #include "video_core/renderer_vulkan/vk_blit_screen.h"
+#include "video_core/renderer_vulkan/vk_ocarina_hdr.h"
 #include "video_core/renderer_vulkan/vk_present_manager.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
@@ -44,6 +45,15 @@ void BlitScreen::SetWindowAdaptPass(const Device& device) {
 
     hdr10_encode.reset();
     hdr10_composite.clear();
+    ocarina_hdr10 = OcarinaHdr::SwapchainHdr() &&
+                    (swapchain_view_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
+                     swapchain_view_format == VK_FORMAT_A2R10G10B10_UNORM_PACK32);
+    if (ocarina_hdr10) {
+        // HDR10 swapchain (Ocarina HDR, EDEN_NX2_OOT_HDR): every source is decoded and PQ-encoded
+        // here; it comes before Lichii's native HDR output (#1326), which the setting turns on.
+        window_adapt = MakeHdr10(device, swapchain_view_format);
+        return;
+    }
     if (swapchain_view_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32) {
         // Layers are blended in linear light (scRGB) and the composite encoded to PQ, as alpha
         // blending PQ code values darkens translucent layers far beyond their alpha.
@@ -177,8 +187,11 @@ void BlitScreen::DrawToFrame(const Device& device, RasterizerVulkan& rasterizer,
     if (hdr10_encode) {
         DrawHdr10(device, rasterizer, frame, framebuffers, layout, output);
     } else {
+        // Ocarina HDR's pass decodes the layers itself (SDR encoding, its composite above 1.0), so
+        // they reach it unconverted, without #1326's SDR -> HDR10 layer conversion.
         window_adapt->Draw(device, rasterizer, scheduler, image_index, layers, framebuffers, layout,
-                           *frame->framebuffer, VkExtent2D{frame->width, frame->height}, output);
+                           *frame->framebuffer, VkExtent2D{frame->width, frame->height},
+                           ocarina_hdr10 ? HdrPresent{} : output);
     }
 
     if (++image_index >= image_count) {

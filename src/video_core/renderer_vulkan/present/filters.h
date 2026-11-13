@@ -23,5 +23,7 @@ std::unique_ptr<WindowAdaptPass> MakeLanczos(const Device& device, VkFormat fram
 std::unique_ptr<WindowAdaptPass> MakeScaleForce(const Device& device, VkFormat frame_format);
 std::unique_ptr<WindowAdaptPass> MakeArea(const Device& device, VkFormat frame_format);
 std::unique_ptr<WindowAdaptPass> MakeMmpx(const Device& device, VkFormat frame_format);
+/// Bilinear onto an HDR10 frame: SDR-style encoded input -> nits -> BT.2020 PQ (Ocarina HDR).
+std::unique_ptr<WindowAdaptPass> MakeHdr10(const Device& device, VkFormat frame_format);
 
 } // namespace Vulkan

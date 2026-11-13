@@ -37,7 +37,7 @@ public:
     };
 
     struct Inputs {
-        Image color;          ///< Tonemapped (LDR) colour at the render size.
+        Image color;          ///< Tonemapped colour at the render size (linear in HDR mode).
         Image depth;          ///< Standard (not reversed) device depth at the render size.
         Image motion_vectors; ///< Motion to the previous frame, in render pixels.
         std::optional<Image> reactive;
@@ -60,8 +60,10 @@ public:
 
     /// Throws vk::Exception when FSR 4 can't start on this device: the runtime is missing or
     /// doesn't check out, or it offers no FSR 4 for the GPU.
+    /// hdr (bazzite, EDEN_NX2_OOT_HDR): the colour is linear HDR
+    /// (FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE, unit exposure).
     explicit Fsr4Upscaler(const Device& device, Scheduler& scheduler,
-                          MemoryAllocator& memory_allocator);
+                          MemoryAllocator& memory_allocator, bool hdr = false);
     ~Fsr4Upscaler();
 
     /// Records one evaluation into the output image (RGBA16F at the upscale size, GENERAL
@@ -97,6 +99,7 @@ private:
     vk::ImageView output_view;
     vk::Image exposure_image; ///< 1x1 R32F holding 1 (the input is tonemapped, unit exposure)
     std::atomic<bool> failed{};
+    bool hdr{};
 };
 
 } // namespace Vulkan

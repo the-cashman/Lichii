@@ -93,6 +93,7 @@ private:
 
     Settings::ScalingFilter scaling_filter{};
     std::unique_ptr<WindowAdaptPass> window_adapt{};
+    bool ocarina_hdr10{}; ///< window_adapt is Ocarina HDR's HDR10 pass (MakeHdr10)
     std::list<Layer> layers{};
 
     struct Hdr10Composite {

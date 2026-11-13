@@ -6,6 +6,9 @@
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
+#include <bit>
+#include <fstream>
+#include <limits>
 #include <optional>
 
 #include "common/logging.h"
@@ -21,6 +24,10 @@
 #include "video_core/host_shaders/ocarina_dlss_bias_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_effects_base_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_effects_comp_spv.h"
+#include "video_core/host_shaders/ocarina_hdr_color_comp_spv.h"
+#include "video_core/host_shaders/ocarina_hdr_composite_comp_spv.h"
+#include "video_core/host_shaders/ocarina_hdr_output_comp_spv.h"
+#include "video_core/renderer_vulkan/vk_ocarina_hdr.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/renderer_vulkan/vk_streamline_dlss.h"
@@ -516,9 +523,9 @@ class OcarinaCompositePass final : public ComputePass {
     static constexpr std::array push{VkPushConstantRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(u32)}};
 
 public:
-    OcarinaCompositePass(const Device& device_, Scheduler& scheduler, DescriptorPool& pool)
-        : ComputePass(device_, scheduler, pool, bindings, templates, bank, push,
-                      OCARINA_DLSS_4K_COMPOSITE_COMP_SPV) {}
+    OcarinaCompositePass(const Device& device_, Scheduler& scheduler, DescriptorPool& pool,
+                         std::span<const u32> code = OCARINA_DLSS_4K_COMPOSITE_COMP_SPV)
+        : ComputePass(device_, scheduler, pool, bindings, templates, bank, push, code) {}
 
     void Record(Scheduler& scheduler, const void* descriptors, VkImage image,
                 const OcarinaUpscaler& upscaler, u64 frame) {
@@ -715,20 +722,29 @@ struct OcarinaUpscaler::Impl {
          ComputePassDescriptorQueue& queue_, MemoryAllocator& allocator_, StagingBufferPool& staging,
          VideoCommon::OcarinaUpscaleBackend backend)
         : device{device_}, scheduler{scheduler_}, queue{queue_}, allocator{allocator_}, pool{pool_},
+          hdr{OcarinaHdr::Active()},
           motion_pass{device, scheduler, pool_},
-          color_pass{device, scheduler, pool_},
-          output_pass{device, scheduler, pool_, OCARINA_DLSS_OUTPUT_COMP_SPV} {
+          color_pass{device, scheduler, pool_,
+                     hdr ? std::span<const u32>(OCARINA_HDR_COLOR_COMP_SPV)
+                         : std::span<const u32>(OCARINA_DLSS_COLOR_COMP_SPV)},
+          output_pass{device, scheduler, pool_,
+                      hdr ? std::span<const u32>(OCARINA_HDR_OUTPUT_COMP_SPV)
+                          : std::span<const u32>(OCARINA_DLSS_OUTPUT_COMP_SPV)} {
+        if (hdr) {
+            LOG_INFO(Render_Vulkan, "Ocarina HDR: FSR 4 in HDR mode, HDR 4K composite");
+        }
 #ifdef EGLANTINE_STREAMLINE
         if (backend == VideoCommon::OcarinaUpscaleBackend::Dlss) {
             dlss = std::make_unique<StreamlineDlssUpscaler>(device, scheduler, allocator);
             return;
         }
 #endif
-        // FSR 4 when it's turned on and AMD's runtime offers it; FSR 3.1 stays the fallback (it
-        // takes over if FSR 4 fails to create or dispatch).
+        // FSR 4 when it's turned on and AMD's runtime offers it (on Linux also: EDEN_NX2_FSR4_LIB
+        // names an FFX API upscaler library); FSR 3.1 stays the fallback (it takes over if FSR 4
+        // fails to create or dispatch).
         if (Fsr4Upscaler::IsWanted(device)) {
             try {
-                fsr4 = std::make_unique<Fsr4Upscaler>(device, scheduler, allocator);
+                fsr4 = std::make_unique<Fsr4Upscaler>(device, scheduler, allocator, hdr);
             } catch (const vk::Exception& error) {
                 LOG_WARNING(Render_Vulkan, "Ocarina FSR 4 unavailable ({}); using FSR 3.1",
                             error.what());
@@ -756,6 +772,12 @@ struct OcarinaUpscaler::Impl {
     /// which didn't evaluate it.
     bool output_fsr4{};
     std::optional<std::chrono::steady_clock::time_point> last_evaluation;
+    const bool hdr; ///< OcarinaHdr::Active() when created: linear colour through FSR 4's HDR mode
+    vk::Buffer hdr_stats_buffer;
+    std::optional<u64> hdr_stats_tick;
+    u64 hdr_stats_frame{};
+    bool hdr_dumped{};
+    void ReadHdrStats();
 
     bool UsesFsr4() const {
         return fsr4 && !fsr4->Failed();
@@ -853,12 +875,19 @@ void OcarinaUpscaler::Composite4k(VkImageView native_composite, u64 frame) {
         return;
     }
     if (!state.composite_pass) {
-        constexpr VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+        const VkFormat format = state.hdr ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
         state.composite = CreateOcarinaImage(state.allocator, {3840, 2160}, format,
-                                            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+                                            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                                VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
         state.composite_view = CreateOcarinaView(state.device, *state.composite, format);
-        state.composite_pass = std::make_unique<OcarinaCompositePass>(
-            state.device, state.scheduler, state.pool);
+        if (state.hdr) {
+            const auto code = OcarinaHdr::Specialize(OCARINA_HDR_COMPOSITE_COMP_SPV);
+            state.composite_pass = std::make_unique<OcarinaCompositePass>(
+                state.device, state.scheduler, state.pool, code);
+        } else {
+            state.composite_pass = std::make_unique<OcarinaCompositePass>(
+                state.device, state.scheduler, state.pool);
+        }
     }
     state.scheduler.RequestOutsideRenderPassOperationContext();
     state.queue.Acquire(state.scheduler, 4);
@@ -871,6 +900,123 @@ void OcarinaUpscaler::Composite4k(VkImageView native_composite, u64 frame) {
                                  *this, frame);
     state.scheduler.InvalidateState();
     state.composited_frame = frame;
+    if (state.hdr && (OcarinaHdr::Get().stats || (OcarinaHdr::Get().dump_path && !state.hdr_dumped))) {
+        state.ReadHdrStats();
+        if (state.hdr_stats_frame == 0) {
+            state.hdr_stats_frame = frame; // the first composites are still black
+        }
+        if (!state.hdr_stats_tick && frame >= state.hdr_stats_frame + 600) {
+            // Copy this frame's composite for the luminance statistics (read when it is done).
+            constexpr VkDeviceSize size = VkDeviceSize{3840} * 2160 * 8;
+            if (!state.hdr_stats_buffer) {
+                state.hdr_stats_buffer = state.allocator.CreateBuffer(
+                    VkBufferCreateInfo{
+                        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                        .size = size,
+                        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                    },
+                    MemoryUsage::Download);
+            }
+            state.scheduler.RequestOutsideRenderPassOperationContext();
+            state.scheduler.Record([image = *state.composite,
+                                    buffer = *state.hdr_stats_buffer](vk::CommandBuffer cmd) {
+                const VkMemoryBarrier before{
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+                };
+                cmd.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, before);
+                const VkBufferImageCopy copy{
+                    .bufferOffset = 0,
+                    .bufferRowLength = 0,
+                    .bufferImageHeight = 0,
+                    .imageSubresource{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                    .imageOffset{0, 0, 0},
+                    .imageExtent{3840, 2160, 1},
+                };
+                cmd.CopyImageToBuffer(image, VK_IMAGE_LAYOUT_GENERAL, buffer, copy);
+                const VkMemoryBarrier after{
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+                };
+                cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                                    after);
+            });
+            state.hdr_stats_tick = state.scheduler.CurrentTick();
+            state.hdr_stats_frame = frame;
+        }
+    }
+}
+
+namespace {
+float HalfToFloat(u16 h) {
+    const u32 sign = static_cast<u32>(h >> 15) << 31;
+    const u32 exponent = (h >> 10) & 0x1f;
+    const u32 mantissa = h & 0x3ff;
+    if (exponent == 0) {
+        return (sign ? -1.0f : 1.0f) * std::ldexp(static_cast<float>(mantissa), -24);
+    }
+    if (exponent == 31) {
+        return std::numeric_limits<float>::infinity();
+    }
+    return std::bit_cast<float>(sign | ((exponent + 112) << 23) | (mantissa << 13));
+}
+} // Anonymous namespace
+
+void OcarinaUpscaler::Impl::ReadHdrStats() {
+    if (!hdr_stats_tick || !scheduler.IsFree(*hdr_stats_tick)) {
+        return;
+    }
+    hdr_stats_tick.reset();
+    hdr_stats_buffer.Invalidate();
+    const auto bytes = hdr_stats_buffer.Mapped();
+    const auto& params = OcarinaHdr::Get();
+    if (params.dump_path && !hdr_dumped) {
+        hdr_dumped = true;
+        std::ofstream file{params.dump_path, std::ios::binary};
+        file.write(reinterpret_cast<const char*>(bytes.data()),
+                   static_cast<std::streamsize>(bytes.size()));
+        LOG_INFO(Render_Vulkan, "Ocarina HDR: composite of frame {} written to {} (3840x2160 RGBA16F, "
+                 "encoded; nits = decode(value) * {})", hdr_stats_frame, params.dump_path,
+                 params.ui_nits);
+    }
+    if (!params.stats) {
+        return;
+    }
+    // Luminance (BT.709 weights) in nits of every 4th pixel of every 4th row.
+    std::vector<float> luminance;
+    luminance.reserve(960 * 540);
+    size_t above_white = 0;
+    size_t above_1000 = 0;
+    float brightest_channel = 0.0f;
+    for (u32 y = 0; y < 2160; y += 4) {
+        for (u32 x = 0; x < 3840; x += 4) {
+            u16 half[4];
+            std::memcpy(half, bytes.data() + (size_t{y} * 3840 + x) * 8, sizeof(half));
+            const float r = OcarinaHdr::DecodeToNits(HalfToFloat(half[0]));
+            const float g = OcarinaHdr::DecodeToNits(HalfToFloat(half[1]));
+            const float b = OcarinaHdr::DecodeToNits(HalfToFloat(half[2]));
+            const float l = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+            luminance.push_back(l);
+            above_white += l > params.ui_nits * 1.01f;
+            above_1000 += l > 1000.0f;
+            brightest_channel = std::max({brightest_channel, r, g, b});
+        }
+    }
+    std::ranges::sort(luminance);
+    const auto at = [&](double p) {
+        return luminance[std::min(luminance.size() - 1, static_cast<size_t>(p * luminance.size()))];
+    };
+    LOG_INFO(Render_Vulkan,
+             "Ocarina HDR stats frame {}: luminance nits p50 {:.1f} p90 {:.1f} p99 {:.1f} "
+             "p99.9 {:.1f} max {:.1f}; brightest channel {:.1f}; above UI white {:.2f}%, "
+             "above 1000 nits {:.3f}%",
+             hdr_stats_frame, at(0.5), at(0.9), at(0.99), at(0.999), luminance.back(),
+             brightest_channel, 100.0 * above_white / luminance.size(),
+             100.0 * above_1000 / luminance.size());
 }
 
 void OcarinaUpscaler::SaveEffectsBase(VkImageView scene, VkExtent2D extent, u64 frame) {
@@ -935,6 +1081,14 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
                             std::array<f32, 2> jitter, [[maybe_unused]] VkExtent2D depth_extent) {
     auto& state = *impl;
     if (state.last_frame == frame || state.Failed()) {
+        return false;
+    }
+    if (state.hdr && !state.UsesFsr4()) {
+        static bool logged = false;
+        if (!std::exchange(logged, true)) {
+            LOG_WARNING(Render_Vulkan, "Ocarina HDR needs FSR 4 (amd_fsr4, or EDEN_NX2_FSR4_LIB on "
+                        "Linux); the game's upscale runs, highlights clip");
+        }
         return false;
     }
     const auto transform = ClipToPreviousClip(current, previous);

@@ -223,9 +223,9 @@ bool Fsr4Upscaler::IsWanted(const Device& device) {
 }
 
 Fsr4Upscaler::Fsr4Upscaler(const Device& device_, Scheduler& scheduler_,
-                           MemoryAllocator& memory_allocator_)
+                           MemoryAllocator& memory_allocator_, bool hdr_)
     : device{device_}, scheduler{scheduler_}, memory_allocator{memory_allocator_},
-      api{FfxRuntime::Acquire()} {
+      api{FfxRuntime::Acquire()}, hdr{hdr_} {
     const auto provider = api ? FindFsr4(*api, device) : std::nullopt;
     if (!provider) {
         throw vk::Exception(VK_ERROR_FEATURE_NOT_PRESENT);
@@ -276,8 +276,9 @@ bool Fsr4Upscaler::CreateContext(VkExtent2D render_size, VkExtent2D upscale_size
     ffxCreateContextDescUpscale create{};
     create.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
     create.header.pNext = &api_version.header;
-    // Tonemapped LDR colour, standard (not reversed) finite depth, exposure given (unit).
-    create.flags = 0;
+    // Tonemapped LDR colour (linear HDR in bazzite's HDR mode), standard (not reversed) finite
+    // depth, exposure given (unit).
+    create.flags = hdr ? FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE : 0;
     create.maxRenderSize = {render_size.width, render_size.height};
     create.maxUpscaleSize = {upscale_size.width, upscale_size.height};
     create.fpMessage = Message;
@@ -292,7 +293,7 @@ bool Fsr4Upscaler::CreateContext(VkExtent2D render_size, VkExtent2D upscale_size
     context = ctx;
     render_extent = render_size;
     upscale_extent = upscale_size;
-    LOG_INFO(Render_Vulkan, "FSR 4: {} {} context {}x{} -> {}x{}",
+    LOG_INFO(Render_Vulkan, "FSR 4: {} {} context {}x{} -> {}x{}{}",
              api->legacy_vk_backend ? "EDEN_NX2_FSR4_LIB" :
 #if defined(__linux__) && !defined(__ANDROID__)
                                     "fsr4-vk",
@@ -300,7 +301,7 @@ bool Fsr4Upscaler::CreateContext(VkExtent2D render_size, VkExtent2D upscale_size
                                     "AMD FSR",
 #endif
              provider_name, render_size.width, render_size.height, upscale_size.width,
-             upscale_size.height);
+             upscale_size.height, hdr ? " (HDR colour)" : "");
     return true;
 }
 

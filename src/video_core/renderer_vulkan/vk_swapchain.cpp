@@ -20,6 +20,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
+#include "video_core/renderer_vulkan/vk_ocarina_hdr.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 #include "video_core/vulkan_common/vk_enum_string_helper.h"
@@ -69,8 +70,29 @@ void UnloadFrameGen(Scheduler& scheduler, const Device& device, std::string_view
 #endif
 
 VkSurfaceFormatKHR ChooseSwapSurfaceFormat(vk::Span<VkSurfaceFormatKHR> formats,
-                                         VkFormat requested_format,
-                                         VkColorSpaceKHR requested_color_space) {
+                                           VkFormat requested_format,
+                                           VkColorSpaceKHR requested_color_space,
+                                           bool* hdr10_offered = nullptr) {
+    // The SDR choice (no hdr10_offered) never takes Ocarina HDR's format.
+    if (hdr10_offered != nullptr && OcarinaHdr::Get().requested) {
+        // Ocarina HDR (EDEN_NX2_OOT_HDR): HDR10 = ST.2084 with a 10-bit format (gamescope's WSI
+        // layer offers A2B10G10R10 while HDR is on in Steam). Once the session chose SDR it stays.
+        auto hdr10 = formats.end();
+        for (const VkFormat wanted :
+             {VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_FORMAT_A2R10G10B10_UNORM_PACK32}) {
+            hdr10 = std::find_if(formats.begin(), formats.end(), [wanted](const auto& format) {
+                return format.format == wanted &&
+                       format.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT;
+            });
+            if (hdr10 != formats.end()) {
+                break;
+            }
+        }
+        *hdr10_offered = hdr10 != formats.end();
+        if (*hdr10_offered && OcarinaHdr::AllowHdr10Swapchain()) {
+            return *hdr10;
+        }
+    }
     if (requested_format == VK_FORMAT_R16G16B16A16_SFLOAT ||
         requested_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
         requested_color_space != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
@@ -388,7 +410,9 @@ void Swapchain::CreateSwapchain(const VkSurfaceCapabilitiesKHR& capabilities) {
                                  VK_PRESENT_MODE_FIFO_RELAXED_KHR) != present_modes.end();
 
     const VkCompositeAlphaFlagBitsKHR alpha_flags{ChooseAlphaFlags(capabilities)};
-    surface_format = ChooseSwapSurfaceFormat(formats, requested_format, requested_color_space);
+    bool hdr10_offered = false;
+    surface_format =
+        ChooseSwapSurfaceFormat(formats, requested_format, requested_color_space, &hdr10_offered);
     Common::DisplayHdrMonitor::Instance().SetPresentingHdr(surface_format.colorSpace !=
                                                            VK_COLOR_SPACE_SRGB_NONLINEAR_KHR);
 #ifdef EGLANTINE_STREAMLINE
@@ -464,6 +488,7 @@ void Swapchain::CreateSwapchain(const VkSurfaceCapabilitiesKHR& capabilities) {
         .viewFormatCount = static_cast<u32>(view_formats.size()),
         .pViewFormats = view_formats.data(),
     };
+    const bool hdr10 = surface_format.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT;
     if (device.IsKhrSwapchainMutableFormatEnabled() &&
         surface_format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
         format_list.pNext = std::exchange(swapchain_ci.pNext, &format_list);
@@ -507,6 +532,13 @@ void Swapchain::CreateSwapchain(const VkSurfaceCapabilitiesKHR& capabilities) {
     if (surface_format.colorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
         image_view_format = surface_format.format;
     }
+    LOG_INFO(Render_Vulkan, "Swapchain: {}x{} format {} colour space {}", extent.width, extent.height,
+             string_VkFormat(surface_format.format), string_VkColorSpaceKHR(surface_format.colorSpace));
+    OcarinaHdr::NoteSwapchain(hdr10, hdr10_offered,
+                              fmt::format("{}x{} {} {}, {} formats offered", extent.width,
+                                          extent.height, string_VkFormat(surface_format.format),
+                                          string_VkColorSpaceKHR(surface_format.colorSpace),
+                                          formats.size()));
 }
 
 void Swapchain::CreateSemaphores() {

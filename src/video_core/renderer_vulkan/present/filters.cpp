@@ -20,6 +20,8 @@
 #include "video_core/host_shaders/present_zero_tangent_frag_spv.h"
 #include "video_core/host_shaders/present_mmpx_frag_spv.h"
 #include "video_core/host_shaders/vulkan_present_frag_spv.h"
+#include "video_core/host_shaders/vulkan_present_hdr10_frag_spv.h"
+#include "video_core/renderer_vulkan/vk_ocarina_hdr.h"
 #include "video_core/host_shaders/vulkan_present_scaleforce_fp16_frag_spv.h"
 #include "video_core/host_shaders/vulkan_present_scaleforce_fp32_frag_spv.h"
 #include "video_core/renderer_vulkan/present/filters.h"
@@ -90,6 +92,11 @@ std::unique_ptr<WindowAdaptPass> MakeScaleForce(const Device& device, VkFormat f
 std::unique_ptr<WindowAdaptPass> MakeArea(const Device& device, VkFormat frame_format) {
     return std::make_unique<WindowAdaptPass>(device, frame_format, CreateBilinearSampler(device),
         BuildShader(device, PRESENT_AREA_FRAG_SPV));
+}
+
+std::unique_ptr<WindowAdaptPass> MakeHdr10(const Device& device, VkFormat frame_format) {
+    return std::make_unique<WindowAdaptPass>(device, frame_format, CreateBilinearSampler(device),
+        BuildShader(device, OcarinaHdr::Specialize(VULKAN_PRESENT_HDR10_FRAG_SPV)));
 }
 
 std::unique_ptr<WindowAdaptPass> MakeMmpx(const Device& device, VkFormat frame_format) {

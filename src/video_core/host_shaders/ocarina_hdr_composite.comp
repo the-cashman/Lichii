@@ -1,0 +1,44 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#version 450
+
+// HDR version of ocarina_dlss_4k_composite.comp. The scene is FSR 4's linear HDR output (game
+// white = 1); the HUD comes, as in SDR, from the difference between the guest's finished 1440p
+// frame and a 1440p copy of the (clamped) scene. Output: SDR-style encoded values relative to
+// UI white, above 1 for highlights; vulkan_present_hdr10.frag decodes them, scales by the UI
+// white and encodes PQ. The same values on an SDR swapchain show the SDR picture (clipped).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(constant_id = 202) const float SCENE_SCALE = 1.0; // game white / UI white (nits ratio)
+layout(constant_id = 203) const float GAMMA = 2.2;       // 0: sRGB curve
+layout(binding = 0) uniform sampler2D dlss_scene;
+layout(binding = 1) uniform sampler2D native_scene;
+layout(binding = 2) uniform sampler2D native_composite;
+layout(binding = 3, rgba16f) uniform writeonly image2D output_color;
+layout(push_constant) uniform Controls { uint use_dlss; } controls;
+
+vec3 encode_srgb(vec3 linear) {
+    linear = max(linear, vec3(0.0));
+    return mix(1.055 * pow(linear, vec3(1.0 / 2.4)) - 0.055,
+               12.92 * linear, lessThan(linear, vec3(0.0031308)));
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 extent = imageSize(output_color);
+    if (any(greaterThanEqual(pixel, extent))) {
+        return;
+    }
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(extent);
+    vec3 composite = textureLod(native_composite, uv, 0).rgb;
+    if (controls.use_dlss != 0) {
+        vec3 hdr = max(texelFetch(dlss_scene, pixel, 0).rgb, vec3(0.0));
+        // The scene in the encoded domain the present pass decodes, at game brightness.
+        vec3 scene = GAMMA == 0.0 ? encode_srgb(hdr * SCENE_SCALE)
+                                  : encode_srgb(hdr) * pow(SCENE_SCALE, 1.0 / GAMMA);
+        vec3 reference = textureLod(native_scene, uv, 0).rgb;
+        vec3 overlay = composite - reference;
+        float difference = max(max(abs(overlay.r), abs(overlay.g)), abs(overlay.b));
+        float coverage = smoothstep(0.025, 0.12, difference);
+        composite = mix(scene + overlay, composite, coverage);
+    }
+    imageStore(output_color, pixel, vec4(max(composite, vec3(0.0)), 1.0));
+}

@@ -32,6 +32,7 @@
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 #include "video_core/renderer_vulkan/vk_blit_screen.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/vk_ocarina_hdr.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
@@ -403,7 +404,11 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
 
 HdrPresent RendererVulkan::UpdateHdrPresent() {
     const auto& monitor = Common::DisplayHdrMonitor::Instance();
-    const u64 key = (monitor.Generation() << 8) |
+    // Ocarina HDR (EDEN_NX2_OOT_HDR) took an HDR10 swapchain itself (vk_swapchain.cpp): the frame
+    // is presented in it, PQ-encoded by its own pass. Choosing SDR here instead had the SDR pass
+    // write the composite's code values unconverted into the ST.2084 swapchain (overexposed).
+    const bool ocarina_hdr10 = OcarinaHdr::SwapchainHdr();
+    const u64 key = (monitor.Generation() << 9) | (u64{ocarina_hdr10} << 8) |
                     (u64{static_cast<u8>(Settings::values.hdr_mode.GetValue())} << 4) |
                     static_cast<u8>(Settings::values.hdr_swapchain.GetValue());
     const u32 luminance_key = (u32{Settings::values.hdr_peak_luminance.GetValue()} << 16) |
@@ -411,7 +416,7 @@ HdrPresent RendererVulkan::UpdateHdrPresent() {
     // HDR on but no HDR format offered last time: ask the surface again now and then (see
     // output_hdr_missing), quietly after the first warning.
     bool retry = false;
-    if (output_hdr_missing && ++output_hdr_retry >= HdrRetryFrames) {
+    if (output_hdr_missing && !ocarina_hdr10 && ++output_hdr_retry >= HdrRetryFrames) {
         output_hdr_retry = 0;
         retry = true;
     }
@@ -423,15 +428,24 @@ HdrPresent RendererVulkan::UpdateHdrPresent() {
     output_luminance_key = luminance_key;
     const auto previous = output_format;
     output_hdr_missing = false;
-    output_format = ChooseOutputFormat(device.GetPhysical(), *surface,
-                                       render_window.GetWindowInfo().render_surface,
-                                       &output_hdr_missing, quiet);
+    if (ocarina_hdr10) {
+        output_format = {swapchain.GetImageViewFormat(), VK_COLOR_SPACE_HDR10_ST2084_EXT};
+    } else {
+        output_format = ChooseOutputFormat(device.GetPhysical(), *surface,
+                                           render_window.GetWindowInfo().render_surface,
+                                           &output_hdr_missing, quiet);
+    }
     const auto told = CaptureHdrPresent();
     output_reference_white = told.reference_white;
     output_peak = told.peak;
     if (previous.format != output_format.format ||
         previous.colorSpace != output_format.colorSpace) {
-        if (output_format.colorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+        if (ocarina_hdr10) {
+            LOG_INFO(Render_Vulkan,
+                     "HDR output: {} {} from Ocarina HDR (EDEN_NX2_OOT_HDR), its own PQ encode",
+                     string_VkFormat(output_format.format),
+                     string_VkColorSpaceKHR(output_format.colorSpace));
+        } else if (output_format.colorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
             LOG_INFO(Render_Vulkan,
                      "HDR output: {} {}, reference white {} nits, peak {} nits. Anti-aliasing, "
                      "post-processing and upscaling filters are off",

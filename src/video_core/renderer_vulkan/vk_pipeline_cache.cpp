@@ -68,6 +68,7 @@
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_pipeline_binaries.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/vk_ocarina_hdr.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache_records.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shaderwarm.h"
@@ -428,6 +429,7 @@ std::vector<u32> EmitStageSpirv(const Device& device, const Shader::Profile& pro
                                 u64 shader_hash, size_t stage_index,
                                 std::span<const u32> reference = {}) {
     auto code = EmitPipelineShader(profile, runtime_info, program, binding, shader_hash, reference);
+    OcarinaHdr::PatchFragment(shader_hash, stage_index, code); // EDEN_NX2_OOT_HDR
     device.SaveShader(code);
 
     // Text log + .spv dump. Text log is gated by gpu_log_level != Off; .spv dump
@@ -2563,6 +2565,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
     bool build_in_parallel, std::shared_ptr<ShaderPools> emit_pools,
     ParallelTranslation* parallel) try {
+    if (!build_in_parallel && OcarinaHdr::DeferBootPipeline(key.unique_hashes[5])) {
+        return nullptr; // EDEN_NX2_OOT_HDR: built at its first draw, once the mode is chosen
+    }
     auto hash = key.Hash();
     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
     auto& times = Nx2Stats::build_times;
@@ -2970,6 +2975,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             // Emitted here, not deferred: the library state is keyed by the stage's SPIR-V.
             const auto begin = std::chrono::steady_clock::now();
             std::vector<u32> code{EmitGplStage(program, key, key.unique_hashes[index])};
+            OcarinaHdr::PatchFragment(key.unique_hashes[index], stage_index, code); // EDEN_NX2_OOT_HDR
             Nx2GplCheck(key, program, index, code); // nx2 shaderwarm: EDEN_NX2_GPL_CHECK, _DUMP
             device.SaveShader(code);
             stage_spirv[stage_index] = code; // the pipeline builds its module from this copy

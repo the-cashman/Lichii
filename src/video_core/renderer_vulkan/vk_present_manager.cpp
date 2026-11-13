@@ -18,6 +18,7 @@
 #ifdef HAS_LSFG
 #include "video_core/renderer_vulkan/present/lsfg_common.h"
 #endif
+#include "video_core/renderer_vulkan/vk_ocarina_hdr.h"
 #include "video_core/renderer_vulkan/vk_present_manager.h"
 #include "video_core/renderer_vulkan/nx2_pipeline_stats.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -297,6 +298,7 @@ bool PresentManager::NeedsStorage(const Frame* frame, bool required) const {
 
 VkFormat PresentManager::GetFrameImageFormat(VkFormat image_view_format) const {
     if (image_view_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
+        image_view_format == VK_FORMAT_A2R10G10B10_UNORM_PACK32 || // Ocarina HDR's alternative
         image_view_format == VK_FORMAT_R16G16B16A16_SFLOAT) {
         return image_view_format;
     }
@@ -468,6 +470,11 @@ void PresentManager::UpdateHdrMetadata() {
     auto& monitor = Common::DisplayHdrMonitor::Instance();
     monitor.Watch(render_window.GetWindowInfo().render_surface);
     hdr_metadata_generation = monitor.Generation();
+    if (OcarinaHdr::SwapchainHdr()) {
+        // Ocarina HDR's frames go out without mastering metadata, as before #1326: its peak isn't
+        // the one the guest was told.
+        return;
+    }
     const auto output = Common::ResolveHdrOutput(monitor.Current(), Settings::HdrMode::On,
                                                  Settings::values.hdr_peak_luminance.GetValue(),
                                                  Settings::values.hdr_reference_white.GetValue());
