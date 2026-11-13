@@ -56,6 +56,8 @@ else()
     target_sources(input_common PRIVATE
         drivers/joycon.cpp
         drivers/joycon.h
+        drivers/renhdrum_pad.cpp
+        drivers/renhdrum_pad.h
         drivers/sdl_driver.cpp
         drivers/sdl_driver.h
         helpers/dualsense_haptics.cpp
@@ -98,3 +100,11 @@ endif()
 
 create_target_directory_groups(input_common)
 target_link_libraries(input_common PUBLIC hid_core PRIVATE common Boost::headers)
+
+if (ENABLE_RENHDRUM AND NOT ANDROID)
+    target_compile_definitions(input_common PRIVATE ENABLE_RENHDRUM)
+    target_include_directories(input_common PRIVATE ${PROJECT_SOURCE_DIR}/externals/renhdrum)
+    if (RENHDRUM_SDL_PATCHES)
+        target_compile_definitions(input_common PRIVATE RENHDRUM_SDL_HDRUMBLE)
+    endif()
+endif()

@@ -150,6 +150,8 @@ add_executable(lichii
     configuration/configure_ui.cpp
     configuration/configure_ui.h
     configuration/configure_ui.ui
+    configuration/configure_hd_rumble.cpp
+    configuration/configure_hd_rumble.h
     configuration/configure_vibration.cpp
     configuration/configure_vibration.h
     configuration/configure_vibration.ui
@@ -507,3 +509,21 @@ if (TARGET nxformat::static_nozstd)
     target_compile_definitions(lichii PRIVATE LICHII_NX_TOOLS)
 endif()
 create_target_directory_groups(lichii)
+
+if (ENABLE_RENHDRUM AND RENHDRUM_DOWNLOAD AND WIN32 AND NOT ARCHITECTURE_x86_64)
+    message(WARNING "RENHDRUM_DOWNLOAD: the prebuilt renhdrum.dll is x64 only; skipped for this architecture")
+endif()
+if (ENABLE_RENHDRUM AND RENHDRUM_DOWNLOAD AND WIN32 AND ARCHITECTURE_x86_64)
+    set(RENHDRUM_VERSION 0.2.1)
+    set(RENHDRUM_DLL "${CMAKE_BINARY_DIR}/renhdrum/${RENHDRUM_VERSION}/renhdrum.dll")
+    if (NOT EXISTS "${RENHDRUM_DLL}")
+        file(DOWNLOAD
+            "https://github.com/trzz1214/RenHDrum/releases/download/v${RENHDRUM_VERSION}/renhdrum.dll"
+            "${RENHDRUM_DLL}"
+            EXPECTED_HASH SHA256=35bce3b64a851405ead5484a51d36e51d7ed654f9f5295bd9abce61fdc4e69f1
+            SHOW_PROGRESS)
+    endif()
+    add_custom_command(TARGET lichii POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${RENHDRUM_DLL}" "$<TARGET_FILE_DIR:lichii>"
+        VERBATIM)
+endif()
