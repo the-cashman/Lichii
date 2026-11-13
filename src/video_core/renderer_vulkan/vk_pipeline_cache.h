@@ -318,7 +318,8 @@ private:
                                                          const GraphicsPipelineCacheKey& key) const;
     /// The stage's library SPIR-V (vertex set 0 / fragment set 1, own bindings, unpruned inputs).
     [[nodiscard]] std::vector<u32> EmitGplStage(Shader::IR::Program& program,
-                                                const GraphicsPipelineCacheKey& key) const;
+                                                const GraphicsPipelineCacheKey& key,
+                                                u64 hash) const;
 
     VideoCommon::Nx2IrCache::StageCache ir_cache;
     /// Learned records stored this session (hash of the record's checks), so one translation is

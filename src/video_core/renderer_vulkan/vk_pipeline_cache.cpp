@@ -2969,7 +2969,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         if (use_gpl) {
             // Emitted here, not deferred: the library state is keyed by the stage's SPIR-V.
             const auto begin = std::chrono::steady_clock::now();
-            std::vector<u32> code{EmitGplStage(program, key)};
+            std::vector<u32> code{EmitGplStage(program, key, key.unique_hashes[index])};
             Nx2GplCheck(key, program, index, code); // nx2 shaderwarm: EDEN_NX2_GPL_CHECK, _DUMP
             device.SaveShader(code);
             stage_spirv[stage_index] = code; // the pipeline builds its module from this copy

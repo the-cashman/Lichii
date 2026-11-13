@@ -306,8 +306,13 @@ Shader::RuntimeInfo PipelineCache::MakeGplRuntimeInfo(const Shader::IR::Program&
 }
 
 std::vector<u32> PipelineCache::EmitGplStage(Shader::IR::Program& program,
-                                             const GraphicsPipelineCacheKey& key) const {
+                                             const GraphicsPipelineCacheKey& key,
+                                             u64 hash) const {
     Shader::RuntimeInfo runtime_info{MakeGplRuntimeInfo(program, key)};
+    // EDEN_NX2_NAN_GUARD reaches library stages here (most draws on RADV), not only the
+    // monolithic path in CreateGraphicsPipeline.
+    runtime_info.nan_guard_frag_colors =
+        program.stage == Shader::Stage::Fragment && NanGuardShader(hash);
     runtime_info.input_topology = Shader::InputTopology::Triangles;
     Shader::Backend::Bindings bindings{};
     if (program.stage == Shader::Stage::Fragment) {
@@ -1045,7 +1050,7 @@ void PipelineCache::RunPrecompile(std::filesystem::path pack_path, std::stop_tok
                 return;
             }
             const GraphicsPipelineCacheKey key{GplDefaultKey(record.stage)};
-            const std::vector<u32> spirv{EmitGplStage(program, key)};
+            const std::vector<u32> spirv{EmitGplStage(program, key, record.unique_hash)};
             GplLibraryCache::Result result;
             if (fragment) {
                 const GplFragmentState state{MakeGplFragmentState(
