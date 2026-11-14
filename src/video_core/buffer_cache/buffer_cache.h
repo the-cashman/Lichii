@@ -2605,7 +2605,17 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             return alignment > 1 && (offset % alignment) != 0;
         }
     }();
-    if (native_bank &&
+    // EDEN_NX2_BANK_RECHECK=0: skip that once-a-frame upload (~2,700 pages a frame in Ocarina of
+    // Time, about 5 % of the back thread). Unset or anything else: unchanged.
+    static const bool bank_recheck = [] {
+        const char* value = std::getenv("EDEN_NX2_BANK_RECHECK");
+        const bool on = value == nullptr || value[0] != '0';
+        if (!on) {
+            LOG_INFO(HW_GPU, "EDEN_NX2_BANK_RECHECK=0: native banks are not uploaded again each frame");
+        }
+        return on;
+    }();
+    if (native_bank && bank_recheck &&
         (Nx2Perf::Verify() || !native_indirect_uniforms_this_frame.contains(device_addr)) &&
         !memory_tracker.IsRegionGpuModified(device_addr, size) &&
         native_indirect_uniforms_this_frame.insert(device_addr).second) {
