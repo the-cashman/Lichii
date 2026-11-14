@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -56,6 +57,8 @@ struct RenHDrumApi {
     decltype(&renhdrum_xbox_rumble_push_half_sample) xbox_push_half_sample{};
     decltype(&renhdrum_xbox_rumble_tick) xbox_tick{};
     decltype(&renhdrum_xbox_rumble_resend) xbox_resend{};
+    // Optional (RenHDrum 0.3.0+): Switch 2 rumble Mode. An older library keeps Switch 1 behaviour.
+    decltype(&renhdrum_set_nx2_mode) set_nx2_mode{};
     bool HasXbox() const {
         return xbox_create && xbox_destroy && xbox_push_half_sample && xbox_tick && xbox_resend;
     }
@@ -101,6 +104,7 @@ const RenHDrumApi& Api() {
                                       &a.xbox_push_half_sample);
             (void)a.library.GetSymbol("renhdrum_xbox_rumble_tick", &a.xbox_tick);
             (void)a.library.GetSymbol("renhdrum_xbox_rumble_resend", &a.xbox_resend);
+            (void)a.library.GetSymbol("renhdrum_set_nx2_mode", &a.set_nx2_mode);
             LOG_INFO(Input, "RenHDrum: loaded {}", name);
         } else {
             LOG_WARNING(Input, "RenHDrum: {} is missing functions, using the standard rumble", name);
@@ -108,6 +112,32 @@ const RenHDrumApi& Api() {
         return a;
     }();
     return api;
+}
+
+/// SDL audio for DualSense USB haptics: initialized once and never quit while the emulator runs.
+/// Quitting it on unplug ran SDL's queued "device lost" work on freed state (RenHDrum#4, fix by
+/// iafx). Every pad shares this one reference.
+bool EnsureAudioForHaptics() {
+    static std::mutex audio_mutex;
+    static bool audio_ready = false;
+    std::scoped_lock lock{audio_mutex};
+    if (audio_ready) {
+        return true;
+    }
+    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+        return false;
+    }
+    audio_ready = true;
+    return true;
+}
+
+/// Hands the guest's Switch 2 Mode (set by HID commands 213 / 214) to RenHDrum when it changes.
+void ApplyNx2Mode(const RenHDrumApi& api) {
+    static std::atomic<int> applied{0};
+    const int mode = Settings::nx2_active_mode.load(std::memory_order_relaxed);
+    if (applied.exchange(mode, std::memory_order_relaxed) != mode && api.set_nx2_mode) {
+        api.set_nx2_mode(mode);
+    }
 }
 
 constexpr Uint16 NintendoVendorId = 0x057E;
@@ -245,7 +275,6 @@ struct RenHDrumPad::Impl {
     RenHdcEngine* engine{};
     RenHdcDualSenseDsp* dsp{};
     SDL_AudioStream* audio_stream{};
-    bool audio_inited{};
     bool audio_opening{};
     int audio_attempts{};
     std::int64_t audio_next_us{};
@@ -418,10 +447,8 @@ struct RenHDrumPad::Impl {
             StartDualSenseBluetooth(js, gp);
             return;
         }
-        // SDL counts subsystem references: every pad with a stream holds one, so one pad going
-        // away does not stop another's audio.
         SDL_AudioStream* stream = nullptr;
-        const bool inited = SDL_InitSubSystem(SDL_INIT_AUDIO);
+        const bool inited = EnsureAudioForHaptics();
         if (inited) {
             stream = OpenDualSenseAudioStream(js);
         } else {
@@ -433,7 +460,6 @@ struct RenHDrumPad::Impl {
             audio_opening = false;
             if (stream && joystick && dsp && !audio_stream) {
                 audio_stream = stream;
-                audio_inited = true;
                 opened = true;
                 // Start only once published: from here on, the DSP is replaced or freed only
                 // under SDL_LockAudioStream or after SDL_DestroyAudioStream. The callback never
@@ -444,7 +470,6 @@ struct RenHDrumPad::Impl {
                     LOG_WARNING(Input, "RenHDrum: DualSense audio did not start: {}",
                                 SDL_GetError());
                     audio_stream = nullptr;
-                    audio_inited = false;
                     opened = false;
                 }
             }
@@ -453,9 +478,6 @@ struct RenHDrumPad::Impl {
             // No device yet, or shut down while opening
             if (stream) {
                 SDL_DestroyAudioStream(stream);
-            }
-            if (inited) {
-                SDL_QuitSubSystem(SDL_INIT_AUDIO);
             }
         }
         if (opened) {
@@ -641,10 +663,6 @@ struct RenHDrumPad::Impl {
             // Waits for a running audio callback; the callback never takes `mutex`
             SDL_DestroyAudioStream(audio_stream);
             audio_stream = nullptr;
-        }
-        if (audio_inited) {
-            SDL_QuitSubSystem(SDL_INIT_AUDIO);
-            audio_inited = false;
         }
         if (xbox) {
             api.xbox_destroy(xbox);
@@ -841,6 +859,7 @@ bool RenHDrumPad::Vibrate(std::int64_t now_us, bool is_right,
         change = impl->RefreshUserSettings();
         const auto& u = impl->user;
         const auto& api = Api();
+        ApplyNx2Mode(api);
         if (impl->xbox && u.hd_enabled && u.xbox_enabled && u.xbox_direct) {
             // Both halves share one pad: each motor follows the stronger side
             const std::size_t side = is_right ? 1 : 0;

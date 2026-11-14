@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <map>
 #include <memory>
 #include <optional>
@@ -1164,6 +1165,10 @@ struct Values {
 };
 
 extern Values values;
+
+// Switch 2 rumble Mode the guest sent last (HID 213 / 214): 2 = Mode 2, else 0. Written by the HID
+// service, read by the RenHDrum pad driver (renhdrum_set_nx2_mode). Not a user setting.
+inline std::atomic<int> nx2_active_mode{0};
 
 struct NvidiaDlssRuntimeSettings {
     NvidiaDlssQuality quality;

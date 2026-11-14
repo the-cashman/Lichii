@@ -959,6 +959,7 @@ Result IHidServer::SendVibrationValue(Core::HID::VibrationDeviceHandle vibration
               vibration_device_handle.npad_type, vibration_device_handle.npad_id,
               vibration_device_handle.device_index, aruid.pid);
 
+    Settings::nx2_active_mode.store(0, std::memory_order_relaxed); // Switch 1 style vibration
     GetResourceManager()->SendVibrationValue(aruid.pid, vibration_device_handle, vibration_value);
     R_SUCCEED()
 }
@@ -1023,6 +1024,7 @@ Result IHidServer::SendVibrationValues(
     LOG_DEBUG(Service_HID, "called, applet_resource_user_id={}", aruid.pid);
 
     R_UNLESS(vibration_handles.size() == vibration_values.size(), ResultVibrationArraySizeMismatch);
+    Settings::nx2_active_mode.store(0, std::memory_order_relaxed); // Switch 1 style vibration
 
     for (std::size_t i = 0; i < vibration_handles.size(); i++) {
         R_TRY(GetResourceManager()->SendVibrationValue(aruid.pid, vibration_handles[i],
@@ -1122,6 +1124,9 @@ Result IHidServer::SendNx2VibrationValues(
     InArray<Core::HID::VibrationDeviceHandle, BufferAttr_HipcPointer> vibration_handles,
     InArray<Core::HID::VibrationValue, BufferAttr_HipcPointer> vibration_values) {
     LOG_DEBUG(Service_HID, "called, unknown={}, applet_resource_user_id={}", unknown, aruid.pid);
+    // The u64 is the Switch 2 rumble Mode (RenHDrum's research: retail games send Mode 2). It
+    // reaches RenHDrum through the pad driver, which reads it on each sample.
+    Settings::nx2_active_mode.store(unknown == 2 ? 2 : 0, std::memory_order_relaxed);
 
     // Unlike 206 this never fails: rumble is best effort and the command is only known from
     // captures, so an unexpected handle or layout shouldn't return an error a game may treat as
@@ -1153,10 +1158,18 @@ Result IHidServer::SendVibrationValueInMode(std::array<u8, 0x18> raw,
                                 std::isfinite(value.low_frequency) &&
                                 std::isfinite(value.high_frequency);
     constexpr std::array<std::size_t, 2> handle_offsets{0x04, 0x00};
+    std::size_t handle_offset = 0;
     const bool has_handle = std::ranges::any_of(handle_offsets, [&](std::size_t offset) {
         std::memcpy(&handle, raw.data() + offset, sizeof(handle));
+        handle_offset = offset;
         return IsVibrationHandleValid(handle).IsSuccess();
     });
+    if (has_handle) {
+        // The mode sits in the other 4 bytes (RenHDrum takes Mode 2 as Switch 2 rumble).
+        u32 mode = 0;
+        std::memcpy(&mode, raw.data() + (handle_offset == 0x04 ? 0x00 : 0x04), sizeof(mode));
+        Settings::nx2_active_mode.store(mode == 2 ? 2 : 0, std::memory_order_relaxed);
+    }
 
     static std::once_flag logged;
     std::call_once(logged, [&raw] {

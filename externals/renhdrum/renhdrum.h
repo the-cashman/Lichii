@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define RENHDRUM_VERSION 0x000201
+#define RENHDRUM_VERSION 0x000301
 
 #define RENHDRUM_OK 0
 #define RENHDRUM_ERR_NULL_PTR -1
@@ -200,6 +200,7 @@ typedef struct RenHdcEngine RenHdcEngine;
 typedef struct RenHdcDualSenseDsp RenHdcDualSenseDsp;
 typedef struct RenHdcXboxRumble RenHdcXboxRumble;
 
+/* Thread safety: never call a handle's destroy in parallel with any other call on the same handle. */
 RenHdcEngine *renhdrum_engine_create(bool is_bluetooth, bool is_pro_controller);
 void renhdrum_engine_destroy(RenHdcEngine *engine);
 int32_t renhdrum_engine_apply_settings(RenHdcEngine *engine, const RenHdcSettings *settings);
@@ -247,6 +248,7 @@ int32_t renhdrum_dualsense_dsp_set_half_target(
     float ah,
     float fh
 );
+/* out_interleaved_4ch must hold frame_count * 4 floats. */
 int32_t renhdrum_dualsense_dsp_fill_f32(
     RenHdcDualSenseDsp *dsp,
     float *out_interleaved_4ch,
@@ -257,6 +259,7 @@ int32_t renhdrum_dualsense_dsp_fill_f32(
 #define RENHDRUM_DS5_BT_REPORT_SIZE 142
 #define RENHDRUM_DS5_BT_PERIOD_NS 10666666ULL
 #define RENHDRUM_DS5_BT_BUFFER_LENGTH_DEFAULT 0xFF
+/* out_report142 must be a buffer of at least 142 bytes (RENHDRUM_DS5_BT_REPORT_SIZE). */
 int32_t renhdrum_dualsense_dsp_build_bt_report(
     RenHdcDualSenseDsp *dsp,
     uint8_t buffer_length,
@@ -286,6 +289,9 @@ int32_t renhdrum_xbox_rumble_push_half_sample(
 /* out_motors4: left grip, right grip, left trigger, right trigger. Returns 1 when they must be sent now. */
 int32_t renhdrum_xbox_rumble_tick(RenHdcXboxRumble *rumble, int64_t now_us, uint16_t *out_motors4);
 int32_t renhdrum_xbox_rumble_resend(RenHdcXboxRumble *rumble);
+
+/* Switch 2 rumble mode: 0 = Switch 1 default / untouched, 2 = Switch 2 Mode 2 translation */
+void renhdrum_set_nx2_mode(int32_t mode);
 
 #ifdef __cplusplus
 }
