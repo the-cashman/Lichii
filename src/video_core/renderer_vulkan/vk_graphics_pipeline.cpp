@@ -704,10 +704,13 @@ GraphicsPipeline::GraphicsPipeline(
         for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
             spv_modules[stage].reset();
             if (!spirv[stage].empty()) {
-                kept_spirv[stage] = Common::Compression::CompressDataZSTD(
-                    reinterpret_cast<const u8*>(spirv[stage].data()),
-                    spirv[stage].size() * sizeof(u32), 1);
-                kept_spirv[stage].shrink_to_fit();
+                // Library stages (nx2 shaderwarm) aren't rebuilt from it: not kept.
+                if (!is_gpl) {
+                    kept_spirv[stage] = Common::Compression::CompressDataZSTD(
+                        reinterpret_cast<const u8*>(spirv[stage].data()),
+                        spirv[stage].size() * sizeof(u32), 1);
+                    kept_spirv[stage].shrink_to_fit();
+                }
                 spirv[stage] = std::vector<u32>{};
             }
         }

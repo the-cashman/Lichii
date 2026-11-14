@@ -1123,7 +1123,8 @@ void PipelineCache::RunPrecompile(std::filesystem::path pack_path, std::stop_tok
                                      nullptr,
                                      program.info,
                                      std::move(module),
-                                     record.unique_hash};
+                                     record.unique_hash,
+                                     {}};
             cs_pipeline_ns += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                    Nx2Stats::Clock::now() - build_begin)
                                                    .count());

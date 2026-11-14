@@ -2379,9 +2379,13 @@ void PipelineCache::EvictUnusedPipelines() {
         }
         evicted_hashes.insert(it->first.Hash());
         evicted_pointer_slots.Remember(it->first.Hash(), it->second->MappedPointers());
-        KeptGraphicsStages kept = it->second->TakeKeptStages();
-        const u64 bytes = kept.Bytes();
-        kept_stages.Add(it->first, std::move(kept), bytes);
+        // nx2 shaderwarm: a library pipeline's stages are library SPIR-V (a set per stage), which
+        // RebuildGraphicsPipeline can't build as one pipeline: it is translated again instead.
+        if (!it->second->IsLibraryPipeline()) {
+            KeptGraphicsStages kept = it->second->TakeKeptStages();
+            const u64 bytes = kept.Bytes();
+            kept_stages.Add(it->first, std::move(kept), bytes);
+        }
         evicted_pipelines.emplace_back(tick, std::move(it->second));
         graphics_cache.erase(it);
     }
@@ -2516,7 +2520,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::RebuildGraphicsPipeline(KeptGra
         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, pipeline_binaries.get(),
         &shader_notify, device, descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring,
         BuildQueue(true, bytes), nullptr, render_pass_cache, graphics_key,
-        std::array<std::vector<u32>, Maxwell::MaxShaderStage>{}, infos, std::move(emit),
+        std::array<std::vector<u32>, Maxwell::MaxShaderStage>{}, infos, std::move(emit), nullptr,
         std::move(kept.mesh_emulation));
     pipeline->SetMappedPointers(std::move(kept.mapped_pointers));
     return pipeline;
