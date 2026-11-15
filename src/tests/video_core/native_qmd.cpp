@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -18,7 +17,6 @@
 #include "video_core/front_qmd.h"
 #include "video_core/gpu_split.h"
 #include "video_core/native_qmd.h"
-#include "video_core/nx2_list_indirect.h"
 
 using Tegra::NativeQmdScheduler;
 using Address = NativeQmdScheduler::Address;
@@ -391,60 +389,4 @@ TEST_CASE("The front's QMD view finds a release into a QMD through another GPU a
     // Right past it, and right before it in the other page.
     REQUIRE(signal(alias + 0x100, Increment));
     REQUIRE(signal(alias - 0x10, Timestamped));
-}
-
-TEST_CASE("A QMD whose grid is list placeholders schedules and releases as its real grid does",
-          "[video_core][native_qmd]") {
-    namespace List = Tegra::Nx2ListIndirect;
-    constexpr Address first = 0x60000;
-    constexpr Address second = 0x60100;
-    // Placeholders are never zero where the scheduler tests the grid, whatever the real words.
-    for (const std::array<Word, 3> real :
-         {std::array<Word, 3>{3, 2, 1}, std::array<Word, 3>{0, 1, 1},
-          std::array<Word, 3>{5, 0x10000, 1}}) {
-        auto qmd = MakeQmd();
-        SetRelease(qmd, 24, 0x7000, Enable | OneWord, 4);
-        SetRelease(qmd, 28, 0x7010, Enable | OneWord, 5);
-        qmd[15] = Word(second >> 8);
-        qmd[16] = 1 | (1U << 1);
-        auto dependent = MakeQmd();
-        SetRelease(dependent, 24, 0x7020, Enable | OneWord, 6);
-        const auto launch = [&](const std::array<Word, 3>& grid, std::vector<Descriptor>& run) {
-            auto launched = qmd;
-            std::copy(grid.begin(), grid.end(), launched.begin() + 12);
-            const std::map<Address, Descriptor> memory{{first, launched}, {second, dependent}};
-            NativeQmdScheduler scheduler{NativeQmdScheduler::OwnTable{}};
-            Launch result;
-            result.error = scheduler.Signal(
-                first, 3,
-                [&](Address address, Descriptor& descriptor) {
-                    descriptor = memory.at(address);
-                    return true;
-                },
-                [&](Address destination, Word payload, Word flags) {
-                    result.released.push_back({destination, payload, flags});
-                    return true;
-                },
-                [&](const Descriptor& descriptor) {
-                    run.push_back(descriptor);
-                    return true;
-                });
-            return result;
-        };
-        std::vector<Descriptor> real_runs;
-        std::vector<Descriptor> slot_runs;
-        const auto old_path = launch(real, real_runs);
-        const auto slot_path = launch({List::Placeholder(9, 0), List::Placeholder(9, 1),
-                                       List::Placeholder(9, 2)},
-                                      slot_runs);
-        CHECK(slot_path.error == old_path.error);
-        CHECK(slot_path.released == old_path.released);
-        CHECK(slot_path.released.size() == 3);
-        // The back gets every placeholder grid, to dispatch it from slot 9 (no groups for an
-        // empty real grid), where the old path skips an empty one.
-        REQUIRE(!slot_runs.empty());
-        CHECK(List::GridSlot(slot_runs[0][12], slot_runs[0][13], slot_runs[0][14]) == 9U);
-        const bool empty = !(real[0] && (real[1] & 0xffff) && (real[2] & 0xffff));
-        CHECK(real_runs.size() + (empty ? 1 : 0) == slot_runs.size());
-    }
 }

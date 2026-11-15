@@ -30,8 +30,6 @@
 #include "video_core/nx2_async_readback.h"
 #include "video_core/nx2_cmdpage_diag.h"
 #include "video_core/nx2_fast_draw.h"
-#include "video_core/nx2_list_indirect.h"
-#include "video_core/nx2_list_indirect_stats.h"
 #include "video_core/nx2_list_macro_trace.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
@@ -1543,41 +1541,6 @@ bool BackWritable(const Maxwell3D& maxwell3d, u32 method) {
     }
 }
 
-// GPU-written list words the channel's compute macros left in its data RAM (Nx2ListIndirect):
-// the front runs 3D macros on the words themselves, so a macro at `start` that may read one
-// gets them first, read back from their slots.
-void ConcretizeListWords(VideoCommon::GpuSplit& split, VideoCore::RasterizerInterface* rasterizer,
-                         Nx2ListIndirect::DataRamWords& channel, std::span<u32> data_ram,
-                         const MacroEngine& engine, u32 start) {
-    const auto& reads =
-        channel.reads_3d.Get(engine.native_code, engine.native_code_generation, start);
-    if (!Nx2ListIndirect::MayRead(reads.data_ram_known, reads.data_ram, channel.words)) {
-        return;
-    }
-    const auto release = [&](u32 slot) {
-        Nx2ListIndirect::ReleaseSlot(split, rasterizer, slot);
-    };
-    Nx2ListIndirect::Prune(
-        channel.words,
-        [data_ram](u32 word) {
-            return data_ram[word];
-        },
-        release);
-    if (!Nx2ListIndirect::MayRead(reads.data_ram_known, reads.data_ram, channel.words)) {
-        return;
-    }
-    Nx2ListIndirect::Stats::NoteConcretized(Nx2ListIndirect::Reason::Macro3d);
-    Nx2ListIndirect::ConcretizeDataRam(
-        channel.words, data_ram,
-        [&](std::span<const u32> slots, std::span<u32> words) {
-            const u64 read_start = Nx2ListIndirect::Stats::NowNs();
-            Nx2ListIndirect::ReadSlots(split, rasterizer, slots, words);
-            Nx2ListIndirect::Stats::NoteRead(slots.size(),
-                                             Nx2ListIndirect::Stats::NowNs() - read_start);
-        },
-        release);
-}
-
 // split.WaitUntil for a macro the back runs in the front's place (FrontRunOnBack), counted for the
 // async read-back line (EDEN_NX2_GPU_PROFILE).
 bool WaitForBackMacros(VideoCommon::GpuSplit& split, u64 position, VideoCommon::DrainSite site) {
@@ -1626,21 +1589,6 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
 // split stopped (accuracy settings changed mid-game). Hand the macros back: the front's copy
 // goes stale from now on, and a restart copies the registers again (Front).
 void Maxwell3D::ReleaseFront() {
-    // The macros run on the engine from now on: the data RAM gets the GPU-written list words
-    // its words hold placeholders of (Nx2ListIndirect).
-    if (auto* channel = Nx2ListIndirect::FindChannel(&native_data_ram);
-        channel != nullptr && !channel->words.empty()) {
-        auto& split = VideoCommon::GpuSplit::Get();
-        Nx2ListIndirect::Stats::NoteConcretized(Nx2ListIndirect::Reason::Stop);
-        Nx2ListIndirect::ConcretizeDataRam(
-            channel->words, std::span<u32>{native_data_ram},
-            [&](std::span<const u32> slots, std::span<u32> words) {
-                Nx2ListIndirect::ReadSlots(split, rasterizer, slots, words);
-            },
-            [&](u32 slot) {
-                Nx2ListIndirect::ReleaseSlot(split, rasterizer, slot);
-            });
-    }
     executing_macro = front->executing_macro;
     macro_params = std::move(front->parameters);
     // Entries macros the back ran may have written are the engine's already.
@@ -1918,10 +1866,6 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     const bool on_back = FrontRunOnBack(system, split, fs, engine, start);
     if (!on_back) {
         VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
-        if (auto* channel = Nx2ListIndirect::FindChannel(&native_data_ram);
-            channel != nullptr && !channel->words.empty()) {
-            ConcretizeListWords(split, rasterizer, *channel, native_data_ram, engine, start);
-        }
         engine.native_interpreter.active_dram = &native_data_ram;
         const auto parameter_count = fs.parameters.size();
         const auto read = [&](u32 address) {
