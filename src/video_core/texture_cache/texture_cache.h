@@ -241,8 +241,47 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         }
         return true;
     };
+    // Images the GPU wrote are downloaded before the collector drops them. Each used to wait for the
+    // GPU on its own (Finish per image), so a pass with dozens of them drained the GPU dozens of
+    // times. A pass now records the copies, waits once and swizzles them back in the order they were
+    // queued (the order the writes used to land in), as DownloadMemory does. The deleted images'
+    // memory waits for the GPU tick (gpu_sentenced_images); an immediate delete flushes first. A
+    // batch is capped so the staging memory held at once stays bounded.
+    constexpr size_t MaxWriteBackBatchBytes = 64_MiB;
+    using WriteBackMap = decltype(runtime.DownloadStagingBuffer(size_t{}));
+    using WriteBackCopies = decltype(FullDownloadCopies(std::declval<const ImageInfo&>()));
+    struct PendingWriteBack {
+        GPUVAddr gpu_addr;
+        ImageInfo info;
+        WriteBackCopies copies;
+        WriteBackMap map;
+    };
+    boost::container::small_vector<PendingWriteBack, 16> pending_write_backs;
+    size_t pending_write_back_bytes = 0;
+    const auto FlushWriteBacks = [&] {
+        if (pending_write_backs.empty()) {
+            return;
+        }
+        runtime.Finish();
+        for (PendingWriteBack& entry : pending_write_backs) {
+            SwizzleImage(*gpu_memory, entry.gpu_addr, entry.info, entry.copies,
+                         entry.map.mapped_span, swizzle_data_buffer);
+        }
+        pending_write_backs.clear();
+        pending_write_back_bytes = 0;
+    };
+    const auto QueueWriteBack = [&](Image& image) {
+        if (pending_write_back_bytes + image.unswizzled_size_bytes > MaxWriteBackBatchBytes) {
+            FlushWriteBacks();
+        }
+        auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
+        auto copies = FullDownloadCopies(image.info);
+        image.DownloadMemory(map, copies);
+        pending_write_back_bytes += image.unswizzled_size_bytes;
+        pending_write_backs.push_back({image.gpu_addr, image.info, std::move(copies), std::move(map)});
+    };
     const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode, &CanEvict,
-                          out_of_memory](ImageId image_id) {
+                          out_of_memory, &QueueWriteBack, &FlushWriteBacks](ImageId image_id) {
         if (num_iterations == 0) {
             return true;
         }
@@ -253,11 +292,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         --num_iterations;
         auto& image = slot_images[image_id];
         if (must_download) {
-            auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
-            const auto copies = FullDownloadCopies(image.info);
-            image.DownloadMemory(map, copies);
-            runtime.Finish();
-            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
+            QueueWriteBack(image);
             ++gc_download_deletes;
             ClearStaleImage(image);
         } else {
@@ -280,7 +315,11 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         trace_delete_reason = aggressive_mode      ? "gc-aggressive"
                               : high_priority_mode ? "gc-high-priority"
                                                    : "gc";
-        DeleteImage(image_id, image.scale_tick > frame_tick + 5);
+        const bool immediate_delete = image.scale_tick > frame_tick + 5;
+        if (immediate_delete) {
+            FlushWriteBacks(); // the image goes at once, before a queued copy of it ran
+        }
+        DeleteImage(image_id, immediate_delete);
         if (out_of_memory) {
             return false;
         }
@@ -399,6 +438,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         Configure(true);
         Collect();
     }
+    FlushWriteBacks();
 }
 
 template <class P>
