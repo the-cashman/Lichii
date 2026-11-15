@@ -59,9 +59,7 @@ namespace VideoCommon {
 ///   MemoryManager::Read<u32>), bool InSyncpointShim(GPUVAddr, u64);
 /// - std::optional<u64> Device(GPUVAddr), bool GpuWritten(u64 device, u64 size);
 /// - u64 WritesTarget(const GpuSplit&, GPUVAddr, u64), void NoteWrite(GpuSplit&, GPUVAddr, u64),
-///   void NoteWriteAt(GpuSplit&, GPUVAddr, u64 size, u64 position), and for the word of a one-word
-///   release u64 OtherWritesTarget(const GpuSplit&, GPUVAddr) and
-///   void NoteSemaphoreRelease(GpuSplit&, GPUVAddr);
+///   void NoteWriteAt(GpuSplit&, GPUVAddr, u64 size, u64 position);
 /// - const void* Id(): the address space's, the same for every Memory of it.
 class FrontQmdView {
 public:
@@ -161,12 +159,11 @@ public:
         }
         if (!synced) {
             Count(g_acquire_stats.qmd_unvalued);
-            split.NoteUnnotedReleases();
             return;
         }
         if (!waiting.empty()) {
             // Behind a signal still waiting.
-            Wait(split, position, memory.Id(), address, argument, inline_qmd);
+            Wait(position, memory.Id(), address, argument, inline_qmd);
             return;
         }
         const Outcome outcome =
@@ -177,11 +174,10 @@ public:
         }
         if (outcome.retry_after) {
             retry_after = *outcome.retry_after;
-            Wait(split, position, memory.Id(), address, argument, inline_qmd);
+            Wait(position, memory.Id(), address, argument, inline_qmd);
             return;
         }
         LoseTable(outcome.loss);
-        split.NoteUnnotedReleases();
     }
 
     /// EDEN_NX2_DRAIN_CHECK: what the view read and noted for the signals of the entry just sent,
@@ -251,11 +247,10 @@ private:
     /// Signals that wait, at most: a back that far behind leaves the view to its next takeover.
     static constexpr size_t MaxWaiting = 4096;
 
-    /// The signal just sent at `position` waits, first or behind the others. None of its releases
-    /// is noted: they are placed once it is valued.
-    void Wait(GpuSplit& split, u64 position, const void* memory_id, GPUVAddr address, u32 argument,
+    /// The signal sent at `position` waits, first or behind the others. None of its releases is
+    /// noted: they are placed once it is valued.
+    void Wait(u64 position, const void* memory_id, GPUVAddr address, u32 argument,
               const Descriptor* inline_qmd) {
-        split.NoteUnnotedReleases();
         if (waiting.size() >= MaxWaiting) {
             LoseTable(QmdLoss::TooMany);
             ClearWaiting();
@@ -586,20 +581,12 @@ private:
         const bool maximum = !reduction && !four_words && (flags & (1U << 19)) != 0;
         const u64 size = four_words ? 16 : sizeof(u32);
         const auto device = memory.Device(address);
-        // Plain and four-word releases are fence-flagged reports; reductions and maxima run in
-        // SignalFence operations (KeplerCompute::ProcessNativeMethod).
-        const auto landing =
-            reduction || maximum ? GpuSplit::FenceLanding() : GpuSplit::Landing::Fenced;
         // The word a reduction or a maximum combines the payload with, before this write.
-        Base base{0, QmdBase::Unknown};
+        std::optional<Base> base;
         if (device && (reduction || maximum)) {
-            base = WordAt(split, memory, address, *device, landing == GpuSplit::Landing::Fenced);
+            base = WordAt(split, memory, address, *device);
         }
-        if (four_words) {
-            memory.NoteWrite(split, address, size);
-        } else {
-            memory.NoteSemaphoreRelease(split, address);
-        }
+        memory.NoteWrite(split, address, size);
         if (!device) {
             return;
         }
@@ -613,6 +600,10 @@ private:
                 written.overwritten = true;
             }
         }
+        // Plain and four-word releases are fence-flagged reports; reductions and maxima run in
+        // SignalFence operations (KeplerCompute::ProcessNativeMethod).
+        const auto landing =
+            reduction || maximum ? GpuSplit::FenceLanding() : GpuSplit::Landing::Fenced;
         const auto note = [&](u64 word, u32 value, bool known, bool at_least) {
             split.NoteSemaphoreWrite(word, value, known, at_least, landing);
             if (Nx2DrainCheck::g_enabled && !checks.empty()) {
@@ -620,15 +611,13 @@ private:
             }
         };
         if (reduction) {
-            Count(g_acquire_stats.qmd_reduction_bases[static_cast<size_t>(base.kind)]);
             const u32 op = (flags >> 20) & 7;
             const bool is_signed = ((flags >> 24) & 1) != 0;
-            // Over a lower bound, only the unsigned MIN and MAX give one: an ADD wraps. Over an
-            // exact base the value is the back's, wrapped as it wraps.
+            // Over a lower bound, only the unsigned MIN and MAX give one: an ADD wraps.
             const bool keeps_bound = !is_signed && (op == 1 || op == 2);
-            if (base.Exact() || (keeps_bound && base.kind == QmdBase::LowerBound)) {
-                note(*device, Tegra::ReduceSemaphore(op, is_signed, base.value, payload), true,
-                     !base.Exact());
+            if (base && (base->exact || keeps_bound)) {
+                note(*device, Tegra::ReduceSemaphore(op, is_signed, base->value, payload), true,
+                     !base->exact);
             } else {
                 note(*device, 0, false, false);
             }
@@ -636,64 +625,51 @@ private:
             // The payload as 64 bits, a timestamp after it.
             note(*device, payload, true, false);
             note(*device + 4, 0, true, false);
-            split.NoteUnknownWrites(*device + 8, 8, landing);
         } else if (maximum) {
             // Whatever the word held, it holds the payload at least.
-            const bool bound = base.Exact() || base.kind == QmdBase::LowerBound;
-            note(*device, bound ? (std::max)(base.value, payload) : payload, true, !base.Exact());
+            const u32 value = base ? (std::max)(base->value, payload) : payload;
+            note(*device, value, true, !base || !base->exact);
         } else {
             note(*device, payload, true, false);
         }
     }
 
-    /// A word the back finds: `value`, exactly or at least (`kind`).
+    /// A word the back finds: `value`, or `value` at least where not `exact`.
     struct Base {
         u32 value;
-        QmdBase kind;
-
-        [[nodiscard]] bool Exact() const {
-            return kind == QmdBase::ExactNote || kind == QmdBase::ExactMemory;
-        }
+        bool exact;
     };
 
-    /// The word the back finds at `address` (`device`) when it runs the entry just sent, as
-    /// far as the front knows it; `fenced`: the write combining with it lands as a fence
-    /// operation. Exactly:
-    /// - the last release noted there, if it lands before this write (as the back runs it, or as
-    ///   an earlier fence operation) and nothing sent since may have written over it but noted
-    ///   releases to other words (OtherWritesTarget: the note map knows those word by word);
-    /// - memory, if every write sent there landed: no note there is queued (QueuedSemaphoreWriteAt
-    ///   keeps a fenced one until it landed), the back ran the other writes sent there, GPU work
-    ///   never wrote the page, and no release the front did not note may land yet. The shape of
-    ///   jpkto's MemoryHoldsBase (#1703), with the unnoted releases always guarded.
-    /// Memory gives a lower bound only while a fenced release the back ran there, or one the
-    /// front did not note, may land over it yet. The entry itself is held unpublished
-    /// (PublishHold): an idle back that ran it before this read would leave its own increment in
-    /// memory, and the front would count it twice.
+    /// The word the back finds at `address` (`device`) when it runs the entry just sent, where
+    /// the front knows it: the last release sent there, if nothing sent since may have written
+    /// over it, else memory, once the back ran every write sent there before the entry. The entry
+    /// itself is held unpublished (PublishHold): an idle back that ran it before this read would
+    /// leave its own increment in memory, and the front would count it twice. Memory gives a
+    /// lower bound only: a fence-flagged release the back ran lands once the host GPU passed it
+    /// (FenceManager::SignalFence), so memory may hold an older value of the word until then.
     template <typename Memory>
-    [[nodiscard]] Base WordAt(const GpuSplit& split, const Memory& memory, GPUVAddr address,
-                              u64 device, bool fenced) const {
+    [[nodiscard]] std::optional<Base> WordAt(const GpuSplit& split, const Memory& memory,
+                                             GPUVAddr address, u64 device) const {
         // The back reads the syncpoint shim from the syncpoints.
         if (memory.InSyncpointShim(address, sizeof(u32)) ||
             Tegra::Nx2MirrorShadow::Get().Diverts(device)) {
-            return {0, QmdBase::Diverted};
+            return std::nullopt;
         }
-        const u64 target = memory.OtherWritesTarget(split, address);
-        const auto queued = split.QueuedSemaphoreWriteAt(device);
+        // The last write sent to the word's granule, placed or not.
+        const u64 target = memory.WritesTarget(split, address, sizeof(u32));
         // A fenced release the back ran may not have landed yet, and the back reads memory: from
         // there, as below.
-        if (queued && !(queued->fenced && split.Ran(queued->position))) {
-            if (queued->known && queued->position >= target && (!queued->fenced || fenced)) {
-                return {queued->payload,
-                        queued->at_least ? QmdBase::LowerBound : QmdBase::ExactNote};
+        if (const auto queued = split.QueuedSemaphoreWriteAt(device);
+            queued && !(queued->fenced && split.Ran(queued->position))) {
+            if (queued->known && queued->position >= target) {
+                return Base{queued->payload, !queued->at_least};
             }
-            return {0, QmdBase::Unknown};
+            return std::nullopt;
         }
         if (memory.GpuWritten(device, sizeof(u32)) || !split.Ran(target)) {
-            return {0, QmdBase::Unknown};
+            return std::nullopt;
         }
-        const bool exact = !queued && split.UnnotedReleasesLanded();
-        return {memory.ReadWord(address), exact ? QmdBase::ExactMemory : QmdBase::LowerBound};
+        return Base{memory.ReadWord(address), false};
     }
 
     Tegra::NativeQmdScheduler scheduler{Tegra::NativeQmdScheduler::OwnTable{}};

@@ -89,11 +89,7 @@ void NoteRelease(DmaPusher& dma_pusher, GPUVAddr address, u32 payload, bool four
     if (!split.Active()) {
         return;
     }
-    if (four_words) {
-        split.NoteWrite(dma_pusher.memory_manager, address, 16);
-    } else {
-        split.NoteSemaphoreRelease(dma_pusher.memory_manager, address);
-    }
+    split.NoteWrite(dma_pusher.memory_manager, address, four_words ? 16 : 4);
     const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
     if (!device) {
         return;
@@ -102,7 +98,6 @@ void NoteRelease(DmaPusher& dma_pusher, GPUVAddr address, u32 payload, bool four
     if (four_words) {
         // The payload as 64 bits (a timestamp follows).
         split.NoteSemaphoreWrite(*device + 4, 0, true, false, landing);
-        split.NoteUnknownWrites(*device + 8, 8, landing);
     }
 }
 
@@ -151,11 +146,6 @@ AcquireCheck CheckWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcqui
         // Else a fenced release the back ran whose fence has yet to run decides nothing: memory
         // does, as once it landed.
         if (!split.Ran(queued->position)) {
-            if (queued->known && !queued->at_least) {
-                // The word will hold the value, which falls short. Waiting without a drain never
-                // passes it early; the 1 ms valve drains for writes the front did not note.
-                return AcquireCheck::NotMet;
-            }
             VideoCommon::Count(stats.drain_queued);
             if (VideoCommon::g_acquire_counting && !queued->known) {
                 VideoCommon::Count(stats.queued_unknown);
@@ -440,20 +430,14 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                                   properties | VideoCommon::QueryPropertiesFlags::Nx2Mirror, payload, 0);
             }
         }, VideoCommon::GpuSplit::Writes::Noted);
-        const bool four_words = properties == VideoCommon::QueryPropertiesFlags::HasTimeout;
-        const auto landing = VideoCommon::GpuSplit::ReportLanding(
-            properties == VideoCommon::QueryPropertiesFlags::IsAFence);
-        NoteRelease(dma_pusher, sequence_address, payload, four_words, landing);
-        if (auto& split = VideoCommon::GpuSplit::Get(); mirror != 0 && split.Active()) {
-            const u64 size = four_words ? 16 : 4;
-            split.NoteWrite(dma_pusher.memory_manager, mirror, size);
-            // It lands in guest memory as the release does, unless mirrored releases into the
-            // word go to Nx2MirrorShadow (which only grows): unvalued, it keeps QMD reductions
-            // there from taking memory for their base until it landed.
-            if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(mirror);
-                device && !Nx2MirrorShadow::Get().Diverts(*device)) {
-                split.NoteUnknownWrites(*device, size, landing);
-            }
+        NoteRelease(dma_pusher, sequence_address, payload,
+                    properties == VideoCommon::QueryPropertiesFlags::HasTimeout,
+                    VideoCommon::GpuSplit::ReportLanding(
+                        properties == VideoCommon::QueryPropertiesFlags::IsAFence));
+        if (mirror != 0 && VideoCommon::GpuSplit::Get().Active()) {
+            VideoCommon::GpuSplit::Get().NoteWrite(
+                dma_pusher.memory_manager, mirror,
+                properties == VideoCommon::QueryPropertiesFlags::HasTimeout ? 16 : 4);
         }
     } else if (g_nx2_ampere) {
         // Switch 2 waits on semaphores the CPU (or another channel) releases, e.g. once it has

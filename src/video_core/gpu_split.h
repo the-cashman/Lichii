@@ -70,17 +70,6 @@ enum class QmdLoss : u32 {
     Count,
 };
 
-/// What the front knows of the word a QMD reduction or maximum combines with when the back runs
-/// it (FrontQmdView::WordAt), counted for the reductions.
-enum class QmdBase : u32 {
-    ExactNote,   ///< The last release noted there, which lands before it
-    ExactMemory, ///< Memory: every write sent there landed
-    LowerBound,  ///< At least that: a write sent there may still land over memory
-    Unknown,
-    Diverted, ///< Unknown: the syncpoint shim, or a word mirrored releases go beside
-    Count,
-};
-
 /// How semaphore acquires and the polls of suspended ones were decided, counted with
 /// EDEN_NX2_GPU_PROFILE, EDEN_NX2_ACQUIRE_VERIFY, EDEN_NX2_ACQUIRE_STATS or
 /// EDEN_NX2_GUEST_THREAD_STATS and logged every 10 s (GpuSplit::ReportAcquire).
@@ -123,7 +112,6 @@ struct AcquireStats {
     std::atomic<u64> qmd_inline_reads{};  ///< Descriptors read from an inline QMD still queued
     std::atomic<u64> qmd_patched_reads{}; ///< ...from memory with inline uploads still queued
     std::array<std::atomic<u64>, static_cast<size_t>(QmdLoss::Count)> qmd_losses{};
-    std::array<std::atomic<u64>, static_cast<size_t>(QmdBase::Count)> qmd_reduction_bases{};
     /// The front's waits for its back (Drain, WaitFor, a full ring) and their time, by site
     std::array<std::atomic<u64>, static_cast<size_t>(DrainSite::Count)> site_drains{};
     std::array<std::atomic<u64>, static_cast<size_t>(DrainSite::Count)> site_drain_ns{};
@@ -457,24 +445,6 @@ public:
     /// yet.
     [[nodiscard]] std::optional<QueuedSemaphoreWrite> QueuedSemaphoreWriteAt(
         u64 device_address) const;
-    /// A release just sent writes `size` bytes from `device_address` that the front does not
-    /// value (a report's timestamp, a mirrored release): noted word by word as unknown, so that
-    /// nothing takes memory there for what the back finds until they landed.
-    void NoteUnknownWrites(u64 device_address, u64 size, Landing landing) {
-        for (u64 word = 0; word < size; word += sizeof(u32)) {
-            NoteSemaphoreWrite(device_address + word, 0, false, false, landing);
-        }
-    }
-    /// The entry just sent may release words the front does not note (a QMD signal its view did
-    /// not value as sent): memory may not hold what they write until every fence operation of the
-    /// entry ran.
-    void NoteUnnotedReleases() {
-        unnoted_releases_landed = EntryTag(last_entry_start) + 1;
-    }
-    /// Whether every release NoteUnnotedReleases told of landed.
-    [[nodiscard]] bool UnnotedReleasesLanded() const {
-        return fenced_landed.load(std::memory_order_acquire) >= unnoted_releases_landed;
-    }
 
     /// A fence operation's hold on the back's entry that queued it (TrackFencedWrite): until it is
     /// released, the fenced writes of that entry and of the entries after it have not landed.
@@ -523,10 +493,6 @@ public:
 
     /// The entry just sent (Writes::Noted) writes [address, address + size) of `memory`.
     void NoteWrite(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size);
-    /// The same for a one-word release to `address` noted with NoteSemaphoreWrite. Placed apart
-    /// from the other writes: the noted releases are known word by word, so one to the next word
-    /// leaves what a note tells of this one (OtherWritesTarget). Readers wait for both.
-    void NoteSemaphoreRelease(const Tegra::MemoryManager& memory, GPUVAddr address);
     /// The same for the entry that ends at `position`, sent earlier (the releases of a QMD signal
     /// the front valued late).
     void NoteWriteAt(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size, u64 position);
@@ -568,10 +534,6 @@ public:
     /// memory then. Placed as WaitForWrites places writes.
     [[nodiscard]] u64 MemoryWritesTarget(const Tegra::MemoryManager& memory, GPUVAddr address,
                                          u64 size) const;
-    /// MemoryWritesTarget of the word at `address`, without the releases NoteSemaphoreRelease
-    /// placed: those to the word are in its note (QueuedSemaphoreWriteAt), the others write
-    /// elsewhere.
-    [[nodiscard]] u64 OtherWritesTarget(const Tegra::MemoryManager& memory, GPUVAddr address) const;
     /// Waits until the back executed every entry sent so far that can write guest memory in
     /// [address, address + size) of `memory`, not the others. Returns whether one was queued.
     /// Writes are placed by the device memory the GPU addresses map to when noted and read: GPU
@@ -619,8 +581,6 @@ private:
     static constexpr u32 CoarseGranuleBits = 16;
     static constexpr u64 MaxCoarseNotedBytes = u64{16} << 20;
     static constexpr u32 CoarseSlotBits = 10;
-    /// Sets of the one-word releases NoteSemaphoreRelease places, by 256-byte granule as well.
-    static constexpr u32 SemaphoreSlotBits = 8;
     static constexpr size_t WriteWays = 4;
 
     /// One cache line.
@@ -639,9 +599,6 @@ private:
     static size_t CoarseSlot(u64 granule) {
         return static_cast<size_t>((granule * 0x9E3779B97F4A7C15ULL) >> (64 - CoarseSlotBits));
     }
-    static size_t SemaphoreSlot(u64 granule) {
-        return static_cast<size_t>((granule * 0x9E3779B97F4A7C15ULL) >> (64 - SemaphoreSlotBits));
-    }
     /// A write to `granule` at `position` (the newest, or an earlier one placed late).
     static void NoteSetWrite(WriteSet& set, u64 granule, u64 position);
     /// The latest position of the writes to `granule` in its set, at most.
@@ -651,8 +608,7 @@ private:
     /// The position WaitForWrites waits for.
     [[nodiscard]] u64 WritesTarget(const Tegra::MemoryManager& memory, GPUVAddr address,
                                    u64 size) const;
-    /// `releases`: with the ones NoteSemaphoreRelease placed.
-    [[nodiscard]] u64 DeviceWritesTarget(DAddr address, u64 size, bool releases = true) const;
+    [[nodiscard]] u64 DeviceWritesTarget(DAddr address, u64 size) const;
 
     template <typename Func>
     static void CallThunk(const u64* payload) {
@@ -768,9 +724,6 @@ private:
     u64 last_noted_write{};
     alignas(64) std::array<WriteSet, size_t{1} << WriteSlotBits> write_sets{};
     alignas(64) std::array<WriteSet, size_t{1} << CoarseSlotBits> coarse_sets{};
-    alignas(64) std::array<WriteSet, size_t{1} << SemaphoreSlotBits> semaphore_sets{};
-    /// fenced_landed reaches it once the releases NoteUnnotedReleases told of landed.
-    u64 unnoted_releases_landed{};
     /// A PublishHold lives: Commit publishes nothing.
     bool publish_held{};
     u64 published_local{};

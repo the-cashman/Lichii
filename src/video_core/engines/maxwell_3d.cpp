@@ -1780,7 +1780,6 @@ void Maxwell3D::FrontNoteReport(VideoCommon::GpuSplit& split, const FrontState& 
     if (report.query.short_query == 0) {
         // 64 bits (a timestamp follows).
         split.NoteSemaphoreWrite(*device + 4, 0, payload, false, landing);
-        split.NoteUnknownWrites(*device + 8, 8, landing);
     }
 }
 

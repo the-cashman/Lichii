@@ -224,8 +224,6 @@ void GpuSplit::Stop() {
     last_noted_write = 0;
     write_sets.fill({});
     coarse_sets.fill({});
-    semaphore_sets.fill({});
-    unnoted_releases_landed = 0;
     published_local = 0;
     consumed_cache = 0;
     publish_every = PublishEvery;
@@ -354,13 +352,6 @@ GpuSplit::Landing GpuSplit::FenceLanding() {
 
 void GpuSplit::NoteSemaphoreWrite(u64 device_address, u32 payload, bool known, bool at_least,
                                   Landing landing) {
-    if (device_address % sizeof(u32) != 0) {
-        // Unaligned, it writes part of two words, neither of which then holds a value it names.
-        const u64 word = device_address & ~u64{3};
-        NoteSemaphoreWrite(word, 0, false, false, landing);
-        NoteSemaphoreWrite(word + sizeof(u32), 0, false, false, landing);
-        return;
-    }
     if (semaphore_writes.size() >= semaphore_writes_limit) {
         // The words of releases in memory hold their values.
         boost::unordered::erase_if(semaphore_writes,
@@ -491,18 +482,6 @@ void GpuSplit::NoteWriteAt(const Tegra::MemoryManager& memory, GPUVAddr address,
     });
 }
 
-void GpuSplit::NoteSemaphoreRelease(const Tegra::MemoryManager& memory, GPUVAddr address) {
-    const auto device = address % sizeof(u32) == 0 ? memory.GpuToCpuAddress(address) : std::nullopt;
-    if (!device) {
-        // Unaligned, it writes two words, and the note names one; unmapped, nothing.
-        NoteWrite(memory, address, sizeof(u32));
-        return;
-    }
-    const u64 granule = *device >> WriteGranuleBits;
-    NoteSetWrite(semaphore_sets[SemaphoreSlot(granule)], granule, write_position);
-    last_noted_write = std::max(last_noted_write, write_position);
-}
-
 void GpuSplit::NoteSetWrite(WriteSet& set, u64 granule, u64 position) {
     const u32 tag = static_cast<u32>(granule);
     size_t oldest = 0;
@@ -572,22 +551,11 @@ u64 GpuSplit::MemoryWritesTarget(const Tegra::MemoryManager& memory, GPUVAddr ad
     return std::min(target, write_position);
 }
 
-u64 GpuSplit::OtherWritesTarget(const Tegra::MemoryManager& memory, GPUVAddr address) const {
-    u64 target = last_unplaced_write;
-    ForEachDeviceRange(memory, address, sizeof(u32), [this, &target](DAddr device, u64 bytes) {
-        target = std::max(target, DeviceWritesTarget(device, bytes, false));
-    });
-    return std::min(target, write_position);
-}
-
-u64 GpuSplit::DeviceWritesTarget(DAddr address, u64 size, bool releases) const {
+u64 GpuSplit::DeviceWritesTarget(DAddr address, u64 size) const {
     u64 target = 0;
     const u64 last = (address + size - 1) >> WriteGranuleBits;
     for (u64 granule = address >> WriteGranuleBits; granule <= last; ++granule) {
         target = std::max(target, SetTarget(write_sets[WriteSlot(granule)], granule));
-        if (releases) {
-            target = std::max(target, SetTarget(semaphore_sets[SemaphoreSlot(granule)], granule));
-        }
     }
     const u64 last_coarse = (address + size - 1) >> CoarseGranuleBits;
     for (u64 granule = address >> CoarseGranuleBits; granule <= last_coarse; ++granule) {
@@ -1027,21 +995,14 @@ void GpuSplit::ReportAcquire() {
     for (size_t loss = 0; loss < qmd_losses.size(); ++loss) {
         qmd_losses[loss] = take(stats.qmd_losses[loss]);
     }
-    std::array<u64, static_cast<size_t>(QmdBase::Count)> bases{};
-    for (size_t base = 0; base < bases.size(); ++base) {
-        bases[base] = take(stats.qmd_reduction_bases[base]);
-    }
-    LOG_INFO(
-        HW_GPU,
-        "QMD view in 10 s: {} signals valued as sent, {} waited ({} valued late), {} sent "
-        "without a table; descriptors from inline QMDs still queued: {}, with uploads still "
-        "queued: {}; {} takeovers; table lost: {} mappings, {} GPU-written or unmapped QMD, "
-        "{} QMD written after the signal, {} release into a QMD read, {} too many waiting; QMD "
-        "reduction bases: {} exact from a queued note, {} exact from memory, {} lower bound, "
-        "{} unknown ({} of them the syncpoint shim or a word mirrored releases go beside)",
-        qmd_valued, qmd_waits, qmd_late, qmd_unvalued, qmd_inline_reads, qmd_patched_reads,
-        qmd_takeovers, qmd_losses[0], qmd_losses[1], qmd_losses[2], qmd_losses[3], qmd_losses[4],
-        bases[0], bases[1], bases[2], bases[3] + bases[4], bases[4]);
+    LOG_INFO(HW_GPU,
+             "QMD view in 10 s: {} signals valued as sent, {} waited ({} valued late), {} sent "
+             "without a table; descriptors from inline QMDs still queued: {}, with uploads still "
+             "queued: {}; {} takeovers; table lost: {} mappings, {} GPU-written or unmapped QMD, "
+             "{} QMD written after the signal, {} release into a QMD read, {} too many waiting",
+             qmd_valued, qmd_waits, qmd_late, qmd_unvalued, qmd_inline_reads, qmd_patched_reads,
+             qmd_takeovers, qmd_losses[0], qmd_losses[1], qmd_losses[2], qmd_losses[3],
+             qmd_losses[4]);
     const u64 mismatches = take(stats.mismatches);
     const u64 unlanded = take(stats.unlanded);
     const u64 late = take(stats.late);

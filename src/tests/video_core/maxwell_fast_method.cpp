@@ -1053,15 +1053,6 @@ TEST_CASE("Split remembers the semaphore writes its back has not run yet",
     REQUIRE(queued.has_value());
     REQUIRE_FALSE(queued->known);
     REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x1004).has_value());
-    // Unaligned, a write leaves both words it covers unknown.
-    split.Defer([] {});
-    split.NoteSemaphoreWrite(0x3001, 8, true);
-    split.Publish();
-    for (const u64 word : {0x3000, 0x3004}) {
-        queued = split.QueuedSemaphoreWriteAt(word);
-        REQUIRE(queued.has_value());
-        REQUIRE_FALSE(queued->known);
-    }
     // The last write sent to a word decides.
     split.Defer([] {});
     split.NoteSemaphoreWrite(0x1000, 9, true);
@@ -2062,7 +2053,7 @@ TEST_CASE("Split front values the releases of the QMD launches it sends as the b
     Access::RunBack(split);
 
     // One that waits for a dependency runs at the decrement, a maximum with the word in memory:
-    // exact, as every write sent there landed.
+    // at least, as memory may hold an older value than the back finds.
     f.memory.Write<u32>(words + 0x10, 9);
     inline_qmd(qmds + 0x100, make_qmd(1, 0x10, Enable | OneWord | Maximum, 7), false);
     CHECK_FALSE(queued(0x10).has_value());
@@ -2072,7 +2063,7 @@ TEST_CASE("Split front values the releases of the QMD launches it sends as the b
     release = queued(0x10);
     REQUIRE(release.has_value());
     CHECK(release->known);
-    CHECK_FALSE(release->at_least);
+    CHECK(release->at_least);
     CHECK(release->payload == 9);
     Access::RunBack(split);
     CHECK(word(0x10) == 9);
@@ -2090,10 +2081,8 @@ TEST_CASE("Split front values the releases of the QMD launches it sends as the b
     CHECK(word(0x10) == 12);
 
     // A reduction over the release before it, still queued: an unsigned maximum keeps the lower
-    // bound, an ADD (which wraps) does not. The maximum is over a value the front can't tell.
+    // bound, an ADD (which wraps) does not.
     constexpr u32 ReduceMax = 2U << 20;
-    split.Defer([] {}, 0, Writes::Noted);
-    split.NoteSemaphoreWrite(word_devices + 0x20, 0, false);
     inline_qmd(qmds + 0x300, make_qmd(0, 0x20, Enable | OneWord | Maximum, 4), false);
     inline_qmd(qmds + 0x400, make_qmd(0, 0x20, Enable | OneWord | Reduction | ReduceMax, 6), false);
     release = queued(0x20);
@@ -2157,37 +2146,21 @@ TEST_CASE("Split front values the releases of the QMD launches it sends as the b
     Access::RunBack(split);
     CHECK(word(0x50) == 9);
 
-    // Over the word in memory, once every write sent there landed: exact, as the back combines
-    // it. Then over the ADD still queued, while a counter next to it (in the same granule) gets
-    // one of its own in between.
+    // Over the word in memory, which may be older than the back finds it (a fence-flagged
+    // release lands once the host GPU passed it): an ADD may wrap and an XOR could hold anything.
     constexpr u32 Xor = 7U << 20;
     f.memory.Write<u32>(words + 0x60, 5);
-    f.memory.Write<u32>(words + 0x70, 0xffffffff);
     f.memory.Write<u32>(words + 0x200, 5);
     inline_qmd(qmds + 0x900, make_qmd(0, 0x60, Enable | OneWord | Reduction, 3), false);
     release = queued(0x60);
     REQUIRE(release.has_value());
-    CHECK(release->known);
-    CHECK_FALSE(release->at_least);
-    CHECK(release->payload == 8);
+    CHECK_FALSE(release->known);
     inline_qmd(qmds + 0xa00, make_qmd(0, 0x200, Enable | OneWord | Reduction | Xor, 3), false);
     release = queued(0x200);
     REQUIRE(release.has_value());
-    CHECK(release->known);
-    CHECK(release->payload == 6);
-    inline_qmd(qmds + 0xc00, make_qmd(0, 0x70, Enable | OneWord | Reduction, 2), false);
-    release = queued(0x70);
-    REQUIRE(release.has_value());
-    CHECK(release->known);
-    CHECK(release->payload == 1); // Wrapped
-    inline_qmd(qmds + 0xd00, make_qmd(0, 0x60, Enable | OneWord | Reduction, 1), false);
-    release = queued(0x60);
-    REQUIRE(release.has_value());
-    CHECK(release->known);
-    CHECK(release->payload == 9);
+    CHECK_FALSE(release->known);
     Access::RunBack(split);
-    CHECK(word(0x60) == 9);
-    CHECK(word(0x70) == 1);
+    CHECK(word(0x60) == 8);
     CHECK(word(0x200) == 6);
     CHECK(DrainCheck::g_compared > compared);
     CHECK(DrainCheck::g_differences == differences);
@@ -2290,56 +2263,6 @@ TEST_CASE("Split front passes an acquire on a QMD release the back ran before it
     CHECK(acquire(5));
     CHECK(stats.by_queued.load() == by_queued + 1);
     CHECK(stats.drained.load() == drained);
-
-    // An inline QMD at `address` with one release to `target`, which the back then runs.
-    const auto launch = [&](GPUVAddr address, GPUVAddr target, u32 flags, u32 payload) {
-        Descriptor launched{};
-        launched[18] = 0x30;
-        launched[24] = static_cast<u32>(target);
-        launched[25] = flags;
-        launched[26] = payload;
-        std::memcpy(pages.backing + (address - qmd_address), launched.data(), sizeof(launched));
-        send(0xc6, static_cast<u32>((address >> 8) >> 32));
-        send(0xc7, static_cast<u32>(address >> 8));
-        for (u32 i = 0; i < 64; ++i) {
-            send(0xc8 + i, launched[i]);
-        }
-        split.Drain(VideoCommon::DrainSite::Other);
-    };
-    using VideoCommon::QmdBase;
-    const auto bases = [&](QmdBase base) {
-        return stats.qmd_reduction_bases[static_cast<size_t>(base)].load();
-    };
-    constexpr u32 Add = 1U << 26;
-
-    // An ADD while a release the back ran there has yet to land: memory is a lower bound.
-    launch(qmd_address + 0x100, word, Enable | OneWord, 9);
-    const u64 lower = bases(QmdBase::LowerBound);
-    launch(qmd_address + 0x200, word, Enable | OneWord | Add, 1);
-    CHECK(bases(QmdBase::LowerBound) == lower + 1);
-    fences.RunFence();
-    CHECK(f.memory.Read<u32>(word) == 9);
-
-    // The same while a release the front did not note (a QMD signal it did not value) may still
-    // land, here on the word.
-    constexpr GPUVAddr other = word + 0x10;
-    split.Defer(
-        [&fences] {
-            fences.reports.push_back({other, 2, VideoCommon::GpuSplit::Get().TrackFencedWrite()});
-        },
-        0, VideoCommon::GpuSplit::Writes::Noted);
-    split.NoteUnnotedReleases();
-    split.Drain(VideoCommon::DrainSite::Other);
-    launch(qmd_address + 0x300, other, Enable | OneWord | Add, 1);
-    CHECK(bases(QmdBase::LowerBound) == lower + 2);
-    fences.RunFence();
-    CHECK(f.memory.Read<u32>(other) == 2);
-
-    // Once it landed, memory is exact.
-    const u64 exact = bases(QmdBase::ExactMemory);
-    launch(qmd_address + 0x400, other, Enable | OneWord | Add, 1);
-    CHECK(bases(QmdBase::ExactMemory) == exact + 1);
-    CHECK(f.memory.Read<u32>(other) == 3);
 }
 
 TEST_CASE("Split front sends state writes to the back as register blocks that match single writes",

@@ -1711,13 +1711,6 @@ struct FrontQmdMemory {
     void NoteWriteAt(VideoCommon::GpuSplit& split, GPUVAddr address, u64 size, u64 position) const {
         split.NoteWriteAt(memory, address, size, position);
     }
-    [[nodiscard]] u64 OtherWritesTarget(const VideoCommon::GpuSplit& split,
-                                        GPUVAddr address) const {
-        return split.OtherWritesTarget(memory, address);
-    }
-    void NoteSemaphoreRelease(VideoCommon::GpuSplit& split, GPUVAddr address) const {
-        split.NoteSemaphoreRelease(memory, address);
-    }
     [[nodiscard]] const void* Id() const {
         return &memory;
     }
@@ -2106,7 +2099,6 @@ void KeplerCompute::FrontNoteReport(VideoCommon::GpuSplit& split, const FrontSta
     if (!reduction && !one_word) {
         // 64 bits (a timestamp follows).
         split.NoteSemaphoreWrite(*device + 4, 0, true, false, landing);
-        split.NoteUnknownWrites(*device + 8, 8, landing);
     }
 }
 

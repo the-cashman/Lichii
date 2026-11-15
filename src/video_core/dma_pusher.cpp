@@ -1121,7 +1121,6 @@ void DmaPusher::NoteEngineWrites(Engines::EngineTypes type, u32 method) {
     if (writes.semaphore.size > sizeof(u32)) {
         // The payload as 64 bits (a timestamp follows).
         split.NoteSemaphoreWrite(*device + 4, 0, true, false, landing);
-        split.NoteUnknownWrites(*device + 8, writes.semaphore.size - 8, landing);
     }
 }
 
