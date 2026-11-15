@@ -6,10 +6,12 @@
 // same shape must still parse.
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <iterator>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -26,6 +28,7 @@
 #include "core/file_sys/fssystem/fssystem_integrity_verification_storage.h"
 #include "core/file_sys/fssystem/fssystem_nca_file_system_driver.h"
 #include "core/file_sys/fssystem/fssystem_nca_header.h"
+#include "core/file_sys/ips_layer.h"
 #include "core/file_sys/partition_filesystem.h"
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/vfs/vfs_vector.h"
@@ -504,7 +507,7 @@ TEST_CASE("NCA opens a section only when it is used", "[core][file_sys]") {
 
     class FarthestRead final : public VectorVfsFile {
     public:
-        explicit FarthestRead(std::vector<u8> data) : VectorVfsFile(std::move(data), "test.nca") {}
+        explicit FarthestRead(std::vector<u8> raw) : VectorVfsFile(std::move(raw), "test.nca") {}
         std::size_t Read(u8* out, std::size_t size, std::size_t offset) const override {
             farthest = std::max(farthest, offset + size);
             return VectorVfsFile::Read(out, size, offset);
@@ -586,6 +589,38 @@ TEST_CASE("Integrity storage zeroes only the requested bytes past the data",
     REQUIRE(buffer[47] == 0xAA);
 
     REQUIRE(storage.Read(buffer.data(), 1, 0x1000) == 0);
+}
+
+VirtualFile MakeText(std::string_view text) {
+    return MakeFile(std::vector<u8>(text.begin(), text.end()));
+}
+
+// Applies an IPSwitch text patch to `size` zero bytes.
+std::vector<u8> ApplyIPSwitch(const IPSwitchCompiler& compiler, size_t size) {
+    return compiler.Apply(MakeFile(std::vector<u8>(size)))->ReadAllBytes();
+}
+
+TEST_CASE("IPSwitch applies a record after an offset shift", "[core][file_sys]") {
+    const IPSwitchCompiler compiler{MakeText("@flag offset_shift 0x10\n@enabled\n00000000 AB\n")};
+    const auto out = ApplyIPSwitch(compiler, 0x40);
+    REQUIRE(out[0] == 0);
+    REQUIRE(out[0x10] == 0xAB);
+}
+
+TEST_CASE("IPSwitch build ID line shorter than @nsobid- names no build ID", "[core][file_sys]") {
+    const IPSwitchCompiler compiler{MakeText("@nso\n@enabled\n00000000 AB\n")};
+    REQUIRE(compiler.GetBuildID() == std::array<u8, 0x20>{});
+    REQUIRE(ApplyIPSwitch(compiler, 0x10)[0] == 0xAB);
+}
+
+TEST_CASE("IPSwitch offset shift without a value does not read the next lines",
+          "[core][file_sys]") {
+    // Parsing the value from the raw line used to skip the line break and read "0x20".
+    const IPSwitchCompiler compiler{
+        MakeText("@flag offset_shift\n\n0x20\n@enabled\n00000000 AB\n")};
+    const auto out = ApplyIPSwitch(compiler, 0x40);
+    REQUIRE(out[0] == 0xAB);
+    REQUIRE(out[0x20] == 0);
 }
 
 } // namespace

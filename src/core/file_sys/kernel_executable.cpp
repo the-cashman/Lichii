@@ -105,6 +105,12 @@ KIP::KIP(const VirtualFile& file) : status(Loader::ResultStatus::Success) {
         offset += header.sections[i].compressed_size;
 
         if (header.sections[i].compressed_size == 0 && header.sections[i].decompressed_size != 0) {
+            // Sections 3 to 5 (.bss and two unused ones) hold no file data and nothing reads
+            // them: the loader takes the .bss size from the header. Their sizes come from the
+            // file, so do not allocate them.
+            if (i >= 3) {
+                continue;
+            }
             decompressed_sections[i] = std::vector<u8>(header.sections[i].decompressed_size);
         } else if (header.sections[i].compressed_size == header.sections[i].decompressed_size) {
             decompressed_sections[i] = std::move(compressed);
@@ -186,6 +192,14 @@ u32 KIP::GetDataOffset() const {
     return header.sections[2].offset;
 }
 
+u64 KIP::GetSize() const {
+    u64 size = sizeof(KIPHeader);
+    for (const auto& section : header.sections) {
+        size += section.compressed_size;
+    }
+    return size;
+}
+
 u32 KIP::GetBSSSize() const {
     return header.sections[3].decompressed_size;
 }
@@ -210,14 +224,18 @@ INI::INI(const VirtualFile& file) : status(Loader::ResultStatus::Success) {
         return;
     }
 
+    // The KIPs follow the header back to back. A KIP that does not parse gives no reliable size,
+    // so the ones after it cannot be found.
     u64 offset = sizeof(INIHeader);
-    for (std::size_t i = 0; i < header.kip_count; ++i) {
+    for (std::size_t i = 0; i < header.kip_count && offset < file->GetSize(); ++i) {
         const auto kip_file =
             std::make_shared<OffsetVfsFile>(file, file->GetSize() - offset, offset);
         KIP kip(kip_file);
-        if (kip.GetStatus() == Loader::ResultStatus::Success) {
-            kips.push_back(std::move(kip));
+        if (kip.GetStatus() != Loader::ResultStatus::Success) {
+            break;
         }
+        offset += kip.GetSize();
+        kips.push_back(std::move(kip));
     }
 }
 

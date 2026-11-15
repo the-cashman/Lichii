@@ -108,6 +108,12 @@ std::optional<std::pair<std::vector<Section>, std::optional<BlockHeader>>> Parse
             static_cast<u64>(n) * 4 > fsize - block_start - BlockFixed)
             return std::nullopt;
         b.decompressed_size = Le(fixed.data() + 16, 8);
+        // nsz writes ceil(decompressed_size / block_size) blocks, the last one short. Any other
+        // count makes a non-final block claim a whole block of output, up to 4 GiB.
+        const u64 block_size = u64{1} << b.exponent;
+        if (static_cast<u64>(n) !=
+            b.decompressed_size / block_size + (b.decompressed_size % block_size != 0 ? 1 : 0))
+            return std::nullopt;
         const auto sizes = f->ReadBytes(static_cast<u64>(n) * 4, block_start + BlockFixed);
         if (sizes.size() != static_cast<u64>(n) * 4) return std::nullopt;
         b.sizes.resize(n);
@@ -574,7 +580,7 @@ private:
                 Key128 iv{};
                 SetIv(iv, section.counter, frontier);
                 cipher.SetIV(iv);
-                std::fill_n(output.get(), prefix, 0);
+                std::fill_n(output.get(), prefix, u8{0});
                 cipher.Transcode(output.get(), prefix + produced, output.get(), Op::Encrypt);
             }
             if (!cache->Write(std::span{output.get() + prefix, produced}, frontier)) {

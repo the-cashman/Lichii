@@ -242,6 +242,9 @@ public:
             return false;
         }
         if (sensor_timestamp < last_motion_update) {
+            // The sensor clock went back (a reconnected controller starts it again from zero).
+            // Follow it instead of dropping every report until it passes the old value.
+            last_motion_update = sensor_timestamp;
             return false;
         }
 
@@ -521,6 +524,12 @@ public:
         }
         if (old_pad) {
             old_pad->Shutdown();
+        }
+        {
+            std::scoped_lock lock{mutex};
+            last_motion_update = 0;
+            motion_error_count = 0;
+            motion_restart_threshold = InitialMotionRestartThreshold;
         }
         sdl_joystick.reset(joystick);
         sdl_controller.reset(controller);

@@ -51,6 +51,7 @@ enum class DrainSite : u32 {
     NarrowListWriters,  ///< ListWriters narrowed (WaitForWritersTo)
     QmdRead,            ///< EDEN_NX2_QMD_PREDICT: a QMD the front reads has a queued write
     RingFull,           ///< The ring is full: the front waits for the back to make room
+    SafeRead,           ///< Safe command list reads: images and reports on the list's pages
     Count,
 };
 
@@ -104,7 +105,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> 
     "other",       "fetch drain",     "acquire",    "semaphore flush", "fence release",
     "list writers", "list sync",      "list flush", "macro dma read",  "macro dma flush",
     "gp sync fence", "map",           "front start", "front verify",   "macro dma read (narrow)",
-    "acquire (narrow)", "list writers (narrow)", "qmd read", "ring full",
+    "acquire (narrow)", "list writers (narrow)", "qmd read", "ring full",       "safe read",
 };
 
 /// What made the front note an unbounded write (BarrierOnly tells the kinds apart).

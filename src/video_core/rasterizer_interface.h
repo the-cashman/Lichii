@@ -215,6 +215,14 @@ public:
         return true;
     }
 
+    /// Any thread: whether the texture or query cache may hold GPU data for the range that guest
+    /// memory lacks (an image was registered there, or a report can still land). Without caches
+    /// that can tell, assume so.
+    [[nodiscard]] virtual bool MayHoldImagesOrReports([[maybe_unused]] DAddr addr,
+                                                      [[maybe_unused]] u64 size) {
+        return true;
+    }
+
     /// Notify rasterizer that any caches of the specified region should be invalidated
     virtual void InvalidateRegion(DAddr addr, u64 size,
                                   VideoCommon::CacheType which = VideoCommon::CacheType::All) = 0;
@@ -225,7 +233,7 @@ public:
 
     virtual void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) {
         // The skip keeps the texture cache: software engine writes reach images only here.
-        const auto which = Settings::values.skip_cpu_inner_invalidation.GetValue()
+        const auto which = Settings::SkipCpuInnerInvalidation()
                                ? VideoCommon::CacheType::TextureCache
                                : VideoCommon::CacheType::All;
         for (const auto& [cpu_addr, size] : sequences) {

@@ -1769,6 +1769,11 @@ bool Device::GetSuitability(bool requires_swapchain) {
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR;
         SetNext(next, properties.push_descriptor);
     }
+    if (extensions.descriptor_indexing || instance_version >= VK_API_VERSION_1_2) {
+        properties.descriptor_indexing.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES;
+        SetNext(next, properties.descriptor_indexing);
+    }
     if (extensions.depth_stencil_resolve || instance_version >= VK_API_VERSION_1_2) {
         properties.depth_stencil_resolve.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES;

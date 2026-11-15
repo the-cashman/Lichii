@@ -1424,16 +1424,20 @@ bool KeplerCompute::BypassOotBaseNetwork() {
         return false;
     }
     const u32 first_word = memory_manager.Read<u32>(program);
-    const auto match =
-        std::ranges::find(BaseOutputPrograms, first_word, &BaseOutputProgram::first_word);
-    if (match == BaseOutputPrograms.end() ||
-        !memory_manager.IsFullyMappedRange(program, match->size)) {
-        return false;
+    // Several output programs start with the same instruction.
+    for (const auto& candidate : BaseOutputPrograms) {
+        if (candidate.first_word != first_word ||
+            !memory_manager.IsFullyMappedRange(program, candidate.size)) {
+            continue;
+        }
+        std::vector<Shader::Ampere::Instruction> code(candidate.size /
+                                                     sizeof(Shader::Ampere::Instruction));
+        memory_manager.ReadBlock(program, code.data(), candidate.size);
+        if (Shader::Ampere::NativeProgramKey(code) == candidate.key) {
+            return BypassOotNetwork(program_id, candidate.key);
+        }
     }
-    std::vector<Shader::Ampere::Instruction> code(match->size / sizeof(Shader::Ampere::Instruction));
-    memory_manager.ReadBlock(program, code.data(), match->size);
-    return Shader::Ampere::NativeProgramKey(code) == match->key &&
-           BypassOotNetwork(program_id, match->key);
+    return false;
 }
 
 /// Replace a known output pass with the latest tonemap, using scaling for the base game.

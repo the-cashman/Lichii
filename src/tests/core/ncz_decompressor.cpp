@@ -38,9 +38,9 @@ TEST_CASE("NCZ discovery accepts solid headers without decoding payloads", "[ncz
     class CountingFile final : public FileSys::VectorVfsFile {
     public:
         using FileSys::VectorVfsFile::VectorVfsFile;
-        std::size_t Read(u8* data, std::size_t length, std::size_t offset) const override {
+        std::size_t Read(u8* buffer, std::size_t length, std::size_t offset) const override {
             bytes_read += length;
-            return FileSys::VectorVfsFile::Read(data, length, offset);
+            return FileSys::VectorVfsFile::Read(buffer, length, offset);
         }
         mutable std::size_t bytes_read{};
     };
@@ -93,6 +93,18 @@ TEST_CASE("NCZBLOCK playback remains supported", "[ncz]") {
     }
     SECTION("truncated block-size table") {
         Put(bytes, Payload + 12, 0x7fffffff, 4);
+        CHECK_FALSE(Core::Crypto::IsSupportedNCZ(
+            std::make_shared<FileSys::VectorVfsFile>(std::move(bytes))));
+    }
+    SECTION("block count that does not match the decompressed size") {
+        // With 4 GiB blocks, 20000 bytes fit in one block; the second entry made the reader
+        // allocate a whole 4 GiB block for the first one.
+        bytes[Payload + 11] = 32;
+        CHECK_FALSE(Core::Crypto::IsSupportedNCZ(
+            std::make_shared<FileSys::VectorVfsFile>(std::move(bytes))));
+    }
+    SECTION("decompressed size that needs more blocks than the table holds") {
+        Put(bytes, Payload + 16, 40000);
         CHECK_FALSE(Core::Crypto::IsSupportedNCZ(
             std::make_shared<FileSys::VectorVfsFile>(std::move(bytes))));
     }
@@ -384,9 +396,9 @@ TEST_CASE("A released solid NCZ reader resumes with identical bytes", "[ncz][res
     class StartCountingFile final : public FileSys::VectorVfsFile {
     public:
         using FileSys::VectorVfsFile::VectorVfsFile;
-        std::size_t Read(u8* data, std::size_t length, std::size_t offset) const override {
+        std::size_t Read(u8* buffer, std::size_t length, std::size_t offset) const override {
             starts += offset == Payload + 64;
-            return FileSys::VectorVfsFile::Read(data, length, offset);
+            return FileSys::VectorVfsFile::Read(buffer, length, offset);
         }
         mutable std::size_t starts{};
     };

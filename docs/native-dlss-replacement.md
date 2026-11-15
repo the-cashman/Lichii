@@ -45,11 +45,17 @@ the game keeps its own pass whenever DLSS is off, unavailable or fails to start.
 `EDEN_NX2_DLSS_REPLACEMENT=fsr` explicitly enables FSR; `native` disables both replacements;
 `dlss` asks for DLSS as its setting does.
 
-- Max Resolution add-on off: the 3/4-scale pass (`e40f5efb5480e692`; `ef542df87cacfe9e` on the
-  Linux RADV build, same contract) is replaced and FSR/DLSS
+The passes are recognised by native program key (`FindOcarinaUpscalePass` in
+`src/video_core/ocarina_upscale.h`), which lowering changes leave alone. Passes no capture has
+shown the native program of yet (`ef542df87cacfe9e`, `4c1ae2fe58f30a97`, `c033c3ddc9f0897b`) are
+matched by shader hash, and stop matching when the lowering of their program changes.
+
+- Max Resolution add-on off: the 3/4-scale pass (native program `6f9367bd41dc0b58`, shader
+  `e40f5efb5480e692`; also shader `ef542df87cacfe9e`, same contract) is replaced and FSR/DLSS
   writes the game's output size (1080p to 1440p docked, 810p to 1080p handheld).
-- Max Resolution add-on on, docked: the full-size pass (`6bd913e1f34e83eb`) at 2560x1440 is
-  replaced by a 3840x2160 temporal image. The game still finishes its 1440p frame. At presentation,
+- Max Resolution add-on on, docked: the full-size pass (native program `da6df3e54c716df2`,
+  shader `6bd913e1f34e83eb`) at 2560x1440 is replaced by a 3840x2160 temporal image. The game
+  still finishes its 1440p frame. At presentation,
   the HUD is taken from the difference between that frame and a 1440p copy of the temporal scene,
   and composited over the 4K scene. The 4K image skips the presentation's post-processing and
   upscale filters.

@@ -51,6 +51,7 @@
 #include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/k_system_control.h"
 #include "core/hle/kernel/kernel.h"
+#include "core/hle/kernel/nx2_thread_stats.h"
 #include "core/hle/kernel/physical_core.h"
 #include "core/hle/service/acc/profile_manager.h"
 #include "core/hle/service/am/applet_manager.h"
@@ -58,6 +59,7 @@
 #include "core/hle/service/am/process_creation.h"
 #include "core/hle/service/apm/apm_controller.h"
 #include "core/hle/service/filesystem/filesystem.h"
+#include "core/hle/service/filesystem/fsp/fs_read_trace.h"
 #include "core/hle/service/glue/glue_manager.h"
 #include "core/hle/service/glue/time/static.h"
 #include "core/hle/service/psc/time/static.h"
@@ -404,6 +406,8 @@ struct System::Impl {
             LOG_CRITICAL(Core, "Not enough host memory to start the guest kernel");
             return SystemResultStatus::ErrorMemoryAllocation;
         }
+        Kernel::Nx2ThreadStats::ReadSwitch();
+        Service::FileSystem::ReadTraceScope::ReadSwitch();
         kernel.Initialize();
         return SystemResultStatus::Success;
     }
@@ -1258,6 +1262,9 @@ void System::RegisterApplicationChangedCallback(ApplicationChangedCallback&& cal
 void System::NotifyApplicationChanged(u64 program_id) {
     //LOG_DEBUG(Core, "Running application changed to {:016X}", program_id);
 
+    if (impl->gpu_core) {
+        impl->gpu_core->NotifyApplicationChanged(program_id);
+    }
     if (impl->application_changed_callback) {
         impl->application_changed_callback(program_id);
     }

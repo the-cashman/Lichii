@@ -257,7 +257,8 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             builder.CreateTemplate(*descriptor_set_layout, *pipeline_layout, uses_push_descriptor);
         if (!uses_push_descriptor) {
             descriptor_allocator =
-                descriptor_pool.Allocator(device, scheduler, *descriptor_set_layout, info);
+                descriptor_pool.Allocator(device, scheduler, *descriptor_set_layout, info,
+                                          builder.UsesUpdateAfterBindPool());
         }
     }
 
@@ -429,11 +430,7 @@ void ComputePipeline::RunBuild() {
 }
 
 bool ComputePipeline::CanReplaceOcarinaUpscale() const {
-    const bool known_shader =
-        shader_hash == OcarinaThreeQuarterShader || shader_hash == 0xef542df87cacfe9eULL ||
-        shader_hash == Ocarina1440pShader || shader_hash == Ocarina1440pScaledShader ||
-        shader_hash == Ocarina1440pScaledFieldShader || shader_hash == OcarinaFullSizeShader;
-    return known_shader && !info.stores_global_memory &&
+    return !info.stores_global_memory &&
            info.image_buffer_descriptors.empty() && info.image_descriptors.size() == 1 &&
            info.image_descriptors.front().count == 1 && info.image_descriptors.front().is_written &&
            !info.image_descriptors.front().is_read && !info.image_descriptors.front().is_byte_addressed &&

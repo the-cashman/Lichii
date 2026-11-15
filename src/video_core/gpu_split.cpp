@@ -257,6 +257,10 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     // The front reads command lists straight from guest memory; a read that flushes the caches
     // first (safe DMA, accurate GPU) would touch back-owned state. The settings can change
     // mid-game: hand the engines back to the front (and start again when they allow it).
+    // Upstream's #1808 runs its split at High accuracy and with safe DMA reads, relying on its
+    // acquires draining while releases wait for fences (puller ReleasesLandAtOnce); the #717
+    // front decides acquires by its own release prediction, unverified with delayed fences, so
+    // it keeps the split off there.
     const bool safe_reads = Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh()
                                                           : Settings::IsDMALevelSafe();
     const bool allowed = !safe_reads && !Settings::IsGPULevelHigh() &&

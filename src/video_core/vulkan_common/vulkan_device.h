@@ -20,6 +20,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "video_core/fsr4_support.h"
+#include "video_core/vulkan_common/descriptor_limits.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 #include <vulkan/vulkan_beta.h>
@@ -604,6 +605,17 @@ FN_MAX_LIMIT_LIST
     /// Returns the maximum number of push descriptors.
     u32 MaxPushDescriptors() const {
         return properties.push_descriptor.maxPushDescriptors;
+    }
+
+    SampledDescriptorLimits CoreSampledLimits() const {
+        return CoreSampledDescriptorLimits(properties.properties.limits);
+    }
+
+    /// Returns the sampled descriptor limits of sets from update-after-bind pools, when they are
+    /// larger than the core limits.
+    std::optional<SampledDescriptorLimits> UpdateAfterBindSampledLimits() const {
+        return UpdateAfterBindSampledDescriptorLimits(properties.properties.limits,
+                                                      properties.descriptor_indexing);
     }
 
     /// Returns true if robust buffer access is enabled on the device.
@@ -1427,6 +1439,7 @@ private:
         VkPhysicalDeviceSubgroupProperties subgroup_properties{};
         VkPhysicalDeviceFloatControlsProperties float_controls{};
         VkPhysicalDevicePushDescriptorPropertiesKHR push_descriptor{};
+        VkPhysicalDeviceDescriptorIndexingProperties descriptor_indexing{};
         VkPhysicalDeviceDescriptorBufferPropertiesEXT descriptor_buffer{};
         VkPhysicalDeviceSubgroupSizeControlProperties subgroup_size_control{};
         VkPhysicalDeviceTransformFeedbackPropertiesEXT transform_feedback{};

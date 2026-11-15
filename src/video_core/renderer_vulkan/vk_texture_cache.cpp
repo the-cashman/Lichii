@@ -390,6 +390,9 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
     return HugeAstcHostFormat(device, info);
 }
 
+// Finished decode images wait for the next texture of their shape, up to this much memory.
+constexpr u64 MaxFreeTranscodeBytes = u64{256} << 20;
+
 // ASTC that the GPU decodes and re-compresses to BC1/BC3 itself (TranscodeAstcToBcn): no CPU
 // decode, so streamed textures are ready the frame they are first used instead of seconds later.
 [[nodiscard]] bool WillUseGpuBcnTranscode(const Device& device, const ImageInfo& info) {
@@ -2986,8 +2989,6 @@ void TextureCacheRuntime::TickFrame() {
         pending_byte_addressed_shadows.pop_front();
     }
     static constexpr u32 MAX_UNUSED_SCRATCH_FRAMES = 60;
-    // Finished decode images wait for the next texture of their shape, up to this much memory.
-    static constexpr u64 MaxFreeTranscodeBytes = u64{256} << 20;
     const auto decode_bytes = [](const PendingTranscode& t) {
         u64 bytes{};
         for (u32 level = 0; level < t.levels; ++level) {
@@ -5241,6 +5242,19 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     // of the texture, forever (#1035). When the whole array does not fit, decode and encode it a
     // few layers at a time through a smaller image; the encoded output is the same.
     u32 batch = layers;
+    if (device.IsIntegrated()) {
+        // Device memory is host RAM here, and an over-budget decode image is still allocated
+        // (#1756: two ~890 MiB images on a 15 GiB Meteor Lake laptop just before it froze). Start
+        // with as many layers as the free pool keeps.
+        u64 layer_bytes{};
+        for (u32 level = 0; level < levels; ++level) {
+            layer_bytes +=
+                u64{(std::max)(width >> level, 1U)} * (std::max)(height >> level, 1U) * 4;
+        }
+        while (batch > 1 && layer_bytes * batch > MaxFreeTranscodeBytes) {
+            batch = Common::DivCeil(batch, 2U);
+        }
+    }
     PendingTranscode pending;
     bool reused = take_free(batch, pending);
     if (!reused) {

@@ -77,7 +77,8 @@ void GraphicsPipeline::SetupGplDescriptors(DescriptorPool& descriptor_pool) {
         gpl_templates[set] =
             builders[set]->CreateTemplate(*gpl_set_layouts[set], *pipeline_layout, false);
         gpl_allocators[set] = descriptor_pool.Allocator(device, scheduler, *gpl_set_layouts[set],
-                                                        stage_infos[set == 0 ? 0 : 4]);
+                                                        stage_infos[set == 0 ? 0 : 4],
+                                                        builders[set]->UsesUpdateAfterBindPool());
     }
 }
 
