@@ -30,6 +30,7 @@
 #include <ranges>
 #include "common/settings.h"
 #include "common/settings_enums.h"
+#include "video_core/host_vsync.h"
 #include "video_core/nx2_stutter_trace.h"
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/vma.h"
@@ -1742,7 +1743,7 @@ bool Device::GetSuitability(bool requires_swapchain) {
 
     // VK_KHR_present_id + VK_KHR_present_wait: the presenter learns when the display shows a
     // present. Each pair is asked for on its own and chained for device creation only when its
-    // extensions are enabled.
+    // extensions are enabled. Only host vsync uses them (EDEN_NX2_HOST_VSYNC=0: neither).
     const auto probe_present_wait = [this, &next](auto& id_features, auto& wait_features,
                                                   VkBool32& id, VkBool32& wait,
                                                   const char* id_name, const char* wait_name) {
@@ -1767,9 +1768,10 @@ bool Device::GetSuitability(bool requires_swapchain) {
         LOG_INFO(Render_Vulkan, "{}/{}: {}", id_name, wait_name,
                  enabled ? "enabled" : "not supported by the device");
     };
-    const bool has_swapchain =
-        requires_swapchain && loaded_extensions.contains(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
-    if (has_swapchain && supported_extensions.contains(VK_KHR_PRESENT_ID_EXTENSION_NAME) &&
+    const bool wants_present_wait =
+        requires_swapchain && VideoCore::HostVsync::Enabled() &&
+        loaded_extensions.contains(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    if (wants_present_wait && supported_extensions.contains(VK_KHR_PRESENT_ID_EXTENSION_NAME) &&
         supported_extensions.contains(VK_KHR_PRESENT_WAIT_EXTENSION_NAME)) {
         present_id_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR;
         present_wait_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR;
@@ -1781,7 +1783,7 @@ bool Device::GetSuitability(bool requires_swapchain) {
     // surface supports them. They need VK_KHR_get_surface_capabilities2 on the instance.
     // EDEN_NX2_PRESENT_WAIT2=0 keeps to the first versions.
     const char* const present_wait2_switch = std::getenv("EDEN_NX2_PRESENT_WAIT2");
-    if (has_swapchain && (present_wait2_switch == nullptr || present_wait2_switch[0] != '0') &&
+    if (wants_present_wait && (present_wait2_switch == nullptr || present_wait2_switch[0] != '0') &&
         dld.vkGetPhysicalDeviceSurfaceCapabilities2KHR != nullptr &&
         supported_extensions.contains(VK_KHR_PRESENT_ID_2_EXTENSION_NAME) &&
         supported_extensions.contains(VK_KHR_PRESENT_WAIT_2_EXTENSION_NAME)) {

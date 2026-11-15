@@ -75,6 +75,8 @@ struct BuiltinPatch {
     // Applies only with NVIDIA DLSS on at this quality in docked mode, and is not listed in
     // Add-Ons.
     std::optional<Settings::NvidiaDlssQuality> dlss_quality{};
+    // Lets the game run faster than its console frame rate (KProcess::IsFrameRateUnlocked).
+    bool unlocks_frame_rate = false;
 };
 
 // EDEN_NX2_<NAME>: unset or empty gives the default, otherwise on unless it starts with '0'.
@@ -656,6 +658,7 @@ constexpr std::array BUILTIN_PATCHES{
         .records = FPS_UNLOCK_RECORDS,
         .states = FPS_UNLOCK_STATES,
         .replaces = "Dynamic FPS by Dark (built-in)",
+        .unlocks_frame_rate = true,
     },
     BuiltinPatch{
         .name = "Dynamic FPS by Dark (built-in)",
@@ -664,6 +667,7 @@ constexpr std::array BUILTIN_PATCHES{
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = DYNAMIC_FPS_RECORDS,
         .states = DYNAMIC_FPS_STATES,
+        .unlocks_frame_rate = true,
     },
     // The NVIDIA DLSS quality lowers Ocarina's render resolution under Max Resolution, since DLSS
     // replaces the game's own 1440p -> 4K upscale and takes whatever the game renders.
@@ -1155,7 +1159,8 @@ std::vector<VirtualFile> PatchManager::CollectPatches(const std::vector<VirtualD
     return out;
 }
 
-std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::string& name) const {
+std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::string& name,
+                                       bool* frame_rate_unlocked) const {
     if (name == "main") {
         Settings::SetAppliedOcarinaRenderScale(std::nullopt);
     }
@@ -1339,6 +1344,9 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         applied.push_back(patch.name);
         if (!patch.replaces.empty()) {
             replaced.push_back(patch.replaces);
+        }
+        if (patch.unlocks_frame_rate && frame_rate_unlocked != nullptr) {
+            *frame_rate_unlocked = true;
         }
         if (patch.dlss_quality) {
             Settings::SetAppliedOcarinaRenderScale(patch.dlss_quality);

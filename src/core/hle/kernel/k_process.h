@@ -120,6 +120,7 @@ private:
 
     std::atomic<s64> m_cpu_time{};
     std::atomic_bool m_mkw_dynamic_fps_patch_applied{};
+    std::atomic_bool m_frame_rate_unlocked{};
     std::atomic<u64> m_mkw_frame_mode_address{};
     std::atomic<u64> m_frame_interval_address{};
     std::atomic<u64> m_frame_interval_source_address{};
@@ -192,6 +193,16 @@ public:
 
     void SetMkwDynamicFpsPatchApplied(bool applied) {
         m_mkw_dynamic_fps_patch_applied.store(applied, std::memory_order_relaxed);
+    }
+
+    /// A built-in patch lets the game run faster than its console frame rate
+    /// (PatchManager::PatchNSO): the host's display may start its frames (nx2:vi2).
+    bool IsFrameRateUnlocked() const {
+        return m_frame_rate_unlocked.load(std::memory_order_relaxed);
+    }
+
+    void SetFrameRateUnlocked(bool unlocked) {
+        m_frame_rate_unlocked.store(unlocked, std::memory_order_relaxed);
     }
 
     /// Mario Kart World's frame mode word that the 60 FPS mode switches (loader/nso.cpp), or 0.
