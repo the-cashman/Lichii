@@ -15,6 +15,7 @@
 #include <utility>
 
 #include "common/assert.h"
+#include "common/nx2_ab.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
@@ -530,6 +531,8 @@ struct GPU::Impl {
              composite_fences = std::move(fences)] {
                 if (num_fences == 0) {
                     renderer->Composite(composite_layers);
+                    // EDEN_NX2_AB_PERIOD: arms flip between frames, on the back after the composite.
+                    Common::Nx2Ab::OnFrame();
                     return;
                 }
                 auto& syncpoint_manager = system.Host1x().GetSyncpointManager();
@@ -542,6 +545,7 @@ struct GPU::Impl {
                         free_swap_counters.push_back(current_request_counter);
                     }
                     renderer->Composite(composite_layers);
+                    Common::Nx2Ab::OnFrame();
                 };
                 for (size_t i = 0; i < num_fences; i++) {
                     syncpoint_manager.RegisterGuestAction(composite_fences[i].id,
