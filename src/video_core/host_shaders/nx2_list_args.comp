@@ -1,0 +1,66 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#version 450
+
+// List draws and dispatches (nx2_list_draw.h, nx2_list_dispatch.h): the arguments of an indirect
+// draw or dispatch from GPU-written list words, held to what the direct paths accept. A draw
+// whose first vertex plus count passes 2^24 is skipped as RasterizerVulkan::Draw skips it, a
+// task/mesh draw past the device's group limit and a grid past the compute limits are skipped
+// (count 0) instead of reaching the GPU; each one held back is counted.
+
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 0) readonly buffer Source {
+    uint source[];
+};
+
+layout(std430, binding = 1) buffer Destination {
+    uint destination[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint source_word;
+    uint destination_word;
+    uint mode;        // 0 vertex draw, 1 task/mesh draw, 2 dispatch grid
+    uint counter_word;
+    uint limit_x;
+    uint limit_y;
+    uint limit_z;
+};
+
+const uint MAX_VERTICES = 1u << 24;
+
+void main() {
+    if (mode == 2u) {
+        uint x = source[source_word];
+        uint y = source[source_word + 1u];
+        uint z = source[source_word + 2u];
+        if (x > limit_x || y > limit_y || z > limit_z) {
+            atomicAdd(destination[counter_word + 2u], 1u);
+            x = 0u;
+            y = 0u;
+            z = 0u;
+        }
+        destination[destination_word] = x;
+        destination[destination_word + 1u] = y;
+        destination[destination_word + 2u] = z;
+        return;
+    }
+    uint count = source[source_word];
+    const uint first = source[source_word + 1u];
+    if (first > MAX_VERTICES || count > MAX_VERTICES - first) {
+        atomicAdd(destination[counter_word], 1u);
+        count = 0u;
+    }
+    if (mode == 1u) {
+        if (count > limit_x) {
+            atomicAdd(destination[counter_word + 1u], 1u);
+            count = 0u;
+        }
+        destination[destination_word + 4u] = count;
+        return;
+    }
+    destination[destination_word] = count;
+    destination[destination_word + 2u] = first;
+}

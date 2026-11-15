@@ -6,6 +6,7 @@
 #pragma once
 
 #include "video_core/buffer_cache/uniform_cache_history.h"
+#include "video_core/nx2_draw_record.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1744,6 +1745,45 @@ u64 BufferCache<P>::KeptGraphicsBindingsHash(bool vertex, bool storage, bool tex
         }
     }
     return hash;
+}
+
+template <class P>
+void BufferCache<P>::RecordGraphicsBindingsHashes(std::array<u64, 5>& hashes) const {
+    using VideoCommon::Nx2DrawRecord::Mix;
+    const auto mix_binding = [](u64 hash, const Binding& binding) {
+        hash = Mix(hash, binding.device_addr);
+        hash = Mix(hash, (u64{binding.size} << 32) | binding.buffer_id.index);
+        // Not segment_first: an index into a pool refilled per resolve.
+        return Mix(hash, binding.segment_count);
+    };
+    u64 geometry = 1;
+    for (const Binding& binding : channel_state->vertex_buffers) {
+        geometry = mix_binding(geometry, binding);
+    }
+    const Binding& index = channel_state->index_buffer;
+    geometry = Mix(Mix(geometry, index.device_addr), index.buffer_id.index);
+    u64 uniform = 2;
+    u64 streamed = 5;
+    u64 storage = 3;
+    u64 texture = 4;
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        uniform = Mix(uniform, channel_state->enabled_uniform_buffer_masks[stage]);
+        streamed = Mix(streamed, channel_state->fast_bound_uniform_buffers[stage]);
+        ForEachEnabledBit(channel_state->enabled_uniform_buffer_masks[stage], [&](u32 slot) {
+            uniform = mix_binding(uniform, channel_state->uniform_buffers[stage][slot]);
+        });
+        storage = Mix(Mix(storage, channel_state->enabled_storage_buffers[stage]),
+                      channel_state->written_storage_buffers[stage]);
+        ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 slot) {
+            storage = mix_binding(storage, channel_state->storage_buffers[stage][slot]);
+        });
+        texture = Mix(texture, channel_state->enabled_texture_buffers[stage]);
+        ForEachEnabledBit(channel_state->enabled_texture_buffers[stage], [&](u32 slot) {
+            const TextureBufferBinding& binding = channel_state->texture_buffers[stage][slot];
+            texture = Mix(mix_binding(texture, binding), static_cast<u64>(binding.format));
+        });
+    }
+    hashes = {geometry, uniform, streamed, storage, texture};
 }
 
 template <class P>

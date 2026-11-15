@@ -63,6 +63,7 @@
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
+#include "video_core/renderer_vulkan/vk_draw_record.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -82,6 +83,8 @@
 #include "video_core/nx2_backx.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_fast_draw.h"
+#include "video_core/nx2_list_dispatch.h"
+#include "video_core/nx2_list_draw.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2_query_fast.h"
 
@@ -520,6 +523,10 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
       frame_dump(device, memory_allocator, scheduler) {
     scheduler.SetQueryCache(query_cache);
+    if (VideoCommon::Nx2DrawRecord::Enabled()) {
+        draw_record = std::make_unique<DrawRecorder>(device, buffer_cache, texture_cache,
+                                                     guest_descriptor_queue);
+    }
     VideoCommon::Nx2FastDraw::g_dynamic_strides.store(
         device.IsExtExtendedDynamicStateSupported() &&
             device.IsExtVertexInputDynamicStateSupported(),
@@ -577,8 +584,11 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
     FastDraw::TakeDelta(delta);
     const auto full = [&](FullDraw reason) -> GraphicsPipeline* {
         ++fast_draw_stats.full[static_cast<size_t>(reason)];
+        full_reason = static_cast<u8>(reason);
         return nullptr;
     };
+    full_reason = static_cast<u8>(FullDraw::Count);
+    full_break_method = FastDraw::g_last_break.load(std::memory_order_relaxed);
     if (draw.pipeline == nullptr) {
         return full(FullDraw::NoCandidate);
     }
@@ -650,6 +660,7 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
 bool RasterizerVulkan::DeltaStillHolds(u64 serial, u64 map_serial) {
     const auto full = [&](FullDraw reason) {
         ++fast_draw_stats.full[static_cast<size_t>(reason)];
+        full_reason = static_cast<u8>(reason);
         return false;
     };
     // TakeReusableDraw ran before the caches were locked, while other threads could still write,
@@ -722,8 +733,8 @@ void RasterizerVulkan::ReportFastDraws() {
     if (now - stats.window_start < 10'000'000'000ULL) {
         return;
     }
-    // Logged only with EDEN_NX2_GPU_PROFILE or EDEN_NX2_FAST_DRAW_VERIFY.
-    if (!VideoCommon::Nx2Profile::Enabled() && !fast_draw_verify) {
+    // Logged only with EDEN_NX2_GPU_PROFILE, EDEN_NX2_FAST_DRAW_VERIFY or EDEN_NX2_DRAW_RECORD.
+    if (!VideoCommon::Nx2Profile::Enabled() && !fast_draw_verify && !draw_record) {
         stats = FastDrawStats{.window_start = now};
         return;
     }
@@ -1299,7 +1310,24 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     // EDEN_NX2_FAST_DRAW_VERIFY compares only draws that would have taken the delta path.
     const bool verify_kept = verify_views && delta_holds;
     verify_vertex_input = verify_kept;
-    if (path == DrawPath::Delta) {
+    // EDEN_NX2_DRAW_RECORD: a full draw whose record stands takes the delta path with the
+    // record's bindings (=1); verify prepares the hit and resolves in full anyway.
+    bool record_used = false;
+    if (draw_record) [[unlikely]] {
+        draw_record->BeginDraw(*pipeline, *maxwell3d, *gpu_memory, is_indexed, is_indirect,
+                               buffer_cache_runtime.AnyVertexRepacked());
+        if (path == DrawPath::Full &&
+            draw_record->PrepareHit(*pipeline, *maxwell3d, *gpu_memory)) {
+            record_used = draw_record->UsesHits();
+        }
+    }
+    if (record_used) {
+        if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->ConfigureDelta(is_indexed)) {
+            report_failure("configure failed");
+            TraceRenderState(is_indexed, "configure-failed", nullptr);
+            return;
+        }
+    } else if (path == DrawPath::Delta) {
         if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->ConfigureDelta(is_indexed)) {
             report_failure("configure failed");
             TraceRenderState(is_indexed, "configure-failed", nullptr);
@@ -1313,6 +1341,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         if (fast_draw_on) {
             pipeline->CaptureNextDelta(verify_kept);
         }
+        if (draw_record) [[unlikely]] {
+            draw_record->BeforeFull(*pipeline);
+        }
         if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->Configure(is_indexed)) {
             report_failure("configure failed");
             TraceRenderState(is_indexed, "configure-failed", nullptr);
@@ -1325,6 +1356,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             kept_bindings != buffer_cache.KeptGraphicsBindingsHash(false, false, true)) {
             ++fast_draw_stats.binding_mismatches;
         }
+    }
+    if (draw_record) [[unlikely]] {
+        draw_record->EndDraw(*pipeline, *gpu_memory, path == DrawPath::Delta && !record_used,
+                             fast_draw_on ? full_reason : u8{0xff}, full_break_method, record_used);
     }
     if (reuse_start != 0) {
         const u64 probe_start = VideoCommon::Nx2Profile::Now();
@@ -1379,6 +1414,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         }
     }
 
+    if (draw_record) [[unlikely]] {
+        draw_record->NoteDynamicDirty(!dyn_state_mask_built ||
+                                      (maxwell3d->dirty.flags & dyn_state_mask).any());
+    }
     {
         Profile::Scope scope{Profile::Zone::DynamicState};
         UpdateOcarinaJitter();
@@ -1806,6 +1845,10 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
 void RasterizerVulkan::DrawIndirect() {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     const auto& params = maxwell3d->draw_manager.indirect_state;
+    if (params.list_words) {
+        DrawListWords();
+        return;
+    }
     if (Common::DkbFrameTrace::Enabled()) {
         ++trace_indirect;
     }
@@ -1893,6 +1936,106 @@ void RasterizerVulkan::DrawIndirect() {
         }
     }, true);
     buffer_cache.SetDrawIndirect(nullptr);
+}
+
+// List draws (nx2_list_draw.h): an array draw whose vertex count and first vertex are the two words at
+// indirect_state.indirect_start_address (Nx2ListDraw). The host GPU copies them into a draw
+// command and draws from it; draws that need the words on the CPU read them back, as the front
+// did before (a flush of the words, synchronous).
+bool RasterizerVulkan::Nx2ListDrawSupported() const {
+    // Task/mesh draws are drawn with vkCmdDrawMeshTasksIndirectEXT.
+    return Tegra::Nx2ListDraw::Mode() != 0 && device.IsExtMeshShaderSupported();
+}
+
+// List dispatches (nx2_list_dispatch.h): DispatchCompute's indirect path takes the grid from the buffer
+// cache's buffer at the list's address, which GPU work wrote: nothing is read back.
+bool RasterizerVulkan::Nx2ListDispatchSupported() const {
+    return Tegra::Nx2ListDispatch::Mode() != 0;
+}
+
+// List draws and list dispatches: a copy of the list words at their place in the stream, for the
+// front to read back if it needs their values after all.
+void RasterizerVulkan::Nx2KeepListWords(u64 keep_id, GPUVAddr address, u32 count) {
+    std::scoped_lock lock{buffer_cache.mutex};
+    const auto [buffer, offset] = buffer_cache.ObtainBuffer(
+        address, count * sizeof(u32), VideoCommon::ObtainBufferSynchronize::FullSynchronize,
+        VideoCommon::ObtainBufferOperation::DoNothing);
+    if (buffer == nullptr) {
+        return;
+    }
+    buffer_cache_runtime.KeepListWords(keep_id, buffer->Handle(), offset, count);
+}
+
+bool RasterizerVulkan::Nx2ReadKeptListWords(u64 keep_id, std::span<u32> words) {
+    return buffer_cache_runtime.ReadKeptListWords(keep_id, words);
+}
+
+void RasterizerVulkan::DrawListWords() {
+    namespace ListDraw = Tegra::Nx2ListDraw;
+    auto& draw_state = maxwell3d->draw_manager.draw_state;
+    const auto& params = maxwell3d->draw_manager.indirect_state;
+    // The draw command has one instance from instance 0 and counts vertices as they are drawn
+    // (a task/mesh pipeline ignores all three; the pipeline is not known yet).
+    const bool quads = draw_state.topology == Maxwell::PrimitiveTopology::Quads ||
+                       draw_state.topology == Maxwell::PrimitiveTopology::QuadStrip;
+    const bool on_cpu = ListDraw::Mode() != 1 || quads || draw_state.base_instance != 0 ||
+                        maxwell3d->regs.transform_feedback_enabled != 0;
+    if (on_cpu) {
+        const GPUVAddr address = params.indirect_start_address;
+        std::array<u32, 2> words{};
+        if (gpu_memory->IsMemoryDirty(address, sizeof(words),
+                                      VideoCommon::CacheType::BufferCache)) {
+            gpu_memory->FlushRegion(address, sizeof(words), VideoCommon::CacheType::BufferCache);
+        }
+        gpu_memory->ReadBlockUnsafe(address, words.data(), sizeof(words));
+        ListDraw::Count(ListDraw::g_stats.read_back);
+        if (words[0] == 0) {
+            ListDraw::Count(ListDraw::g_stats.read_zero);
+        }
+        if (words[1] != 0) {
+            ListDraw::Count(ListDraw::g_stats.read_first);
+        }
+        buffer_cache_runtime.KeepListWordsRead(params.list_keep_id, words);
+        draw_state.vertex_buffer.count = words[0];
+        draw_state.vertex_buffer.first = words[1];
+        draw_state.draw_element_count = words[0];
+        Draw(false, 1);
+        if (words[0] != 0 && mesh_draw) {
+            ListDraw::Count(ListDraw::g_stats.read_mesh);
+        }
+        return;
+    }
+    if (Common::DkbFrameTrace::Enabled()) {
+        ++trace_indirect;
+    }
+    buffer_cache.SetDrawIndirect(&params);
+    buffer_cache_runtime.RequestListDrawArgs(params.list_keep_id);
+    bool recorded = false;
+    bool mesh = false;
+    PrepareDraw(false, [this, &mesh, &recorded] {
+        const auto args = buffer_cache_runtime.TakeListDrawArgs();
+        if (args.buffer == VK_NULL_HANDLE) {
+            return;
+        }
+        recorded = true;
+        mesh = args.mesh;
+        scheduler.Record([this, args](vk::CommandBuffer cmdbuf) {
+            if (scheduler.GraphicsPipelineMissing()) {
+                return;
+            }
+            if (args.mesh) {
+                cmdbuf.DrawMeshTasksIndirectEXT(args.buffer, args.offset, 1, 0);
+            } else {
+                cmdbuf.DrawIndirect(args.buffer, args.offset, 1, 0);
+            }
+        });
+    }, true);
+    // A draw that was not prepared as far as its copy leaves the request behind.
+    (void)buffer_cache_runtime.TakeListDrawArgs();
+    buffer_cache.SetDrawIndirect(nullptr);
+    ListDraw::Count(!recorded ? ListDraw::g_stats.not_recorded
+                    : mesh    ? ListDraw::g_stats.indirect_mesh
+                              : ListDraw::g_stats.indirect);
 }
 
 VideoCommon::OotNetwork::BypassState* RasterizerVulkan::OotNetworkBypass() {
@@ -2470,6 +2613,16 @@ void RasterizerVulkan::DispatchCompute() {
         }
     };
     const auto indirect_address = kepler_compute->GetIndirectComputeAddress();
+    // List dispatches (nx2_list_dispatch.h): the grid is GPU-written list words, held to the
+    // compute limits as the direct path holds a QMD's grid. Recorded before the pipeline's own
+    // bind (the clamp pass binds its pipeline).
+    std::optional<BufferCacheRuntime::ListDrawArgs> list_grid;
+    if (indirect_address && kepler_compute->IsListIndirect()) {
+        const auto [grid_buffer, grid_offset] = buffer_cache.ObtainBuffer(
+            *indirect_address, 12, VideoCommon::ObtainBufferSynchronize::FullSynchronize,
+            VideoCommon::ObtainBufferOperation::DiscardWrite);
+        list_grid = buffer_cache_runtime.RecordListGrid(grid_buffer->Handle(), grid_offset);
+    }
     // The full-size 1080p pass is replaced only by FSR (native AA); DLAA through it is untested.
     const bool can_replace = OcarinaTemporalEnabled() && pipeline->CanReplaceOcarinaUpscale() &&
                              (pipeline->ShaderHash() != ComputePipeline::OcarinaFullSizeShader ||
@@ -2546,11 +2699,17 @@ void RasterizerVulkan::DispatchCompute() {
         // DispatchIndirect
         const auto [buffer, offset] =
             VideoCommon::ObtainIndirectBuffer(buffer_cache, *indirect_address);
+        VkBuffer indirect_handle = buffer->Handle();
+        VkDeviceSize indirect_at = offset;
+        if (list_grid) {
+            indirect_handle = list_grid->buffer;
+            indirect_at = list_grid->offset;
+        }
         scheduler.RequestOutsideRenderPassOperationContext();
         scheduler.NoteComputeWrites();
         scheduler.TraceComputePipeline(pipeline->ShaderHash());
-        scheduler.Record([this, pipeline, indirect_buffer = buffer->Handle(),
-                          indirect_offset = offset](vk::CommandBuffer cmdbuf) {
+        scheduler.Record([this, pipeline, indirect_buffer = indirect_handle,
+                          indirect_offset = indirect_at](vk::CommandBuffer cmdbuf) {
             RecordDispatchBarrier(cmdbuf);
             if (!pipeline->IsBound()) {
                 return;
@@ -3845,6 +4004,9 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
 }
 
 void RasterizerVulkan::TickFrame() {
+    if (draw_record) [[unlikely]] {
+        draw_record->EndFrame();
+    }
     // EDEN_NX2_GPU_PROFILE: where the frame tick's time goes, logged every 10 s. It runs in the
     // present's composite, inside the syncpoint increment that reaches the frame's fence (the
     // puller's syncpoint thunk), on the back only.

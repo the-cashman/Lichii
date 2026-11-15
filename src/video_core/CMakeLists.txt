@@ -141,6 +141,11 @@ add_library(video_core STATIC
     nx2_cmdpage_diag.h
     nx2_debug_control.cpp
     nx2_debug_control.h
+    nx2_draw_record.h
+    nx2_grid_taint.h
+    nx2_list_dispatch.h
+    nx2_list_draw.h
+    nx2_list_reader.h
     nx2_fast_draw.cpp
     nx2_fast_draw.h
     nx2_profile.h
@@ -252,6 +257,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_frame_dump.h
     renderer_vulkan/vk_gpl.cpp
     renderer_vulkan/vk_gpl.h
+    renderer_vulkan/vk_draw_record.cpp
+    renderer_vulkan/vk_draw_record.h
     renderer_vulkan/vk_gpl_pipeline.cpp
     renderer_vulkan/vk_scheduler_rendering.cpp
     renderer_vulkan/vk_shaderwarm.cpp

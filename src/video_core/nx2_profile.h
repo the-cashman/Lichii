@@ -367,7 +367,13 @@ inline bool Report(const char* thread_name = "GPU thread", bool report_all_conte
         return false;
     }
     const u64 window = now - data.window_start;
-    if (window < 10'000'000'000ULL) {
+    // EDEN_NX2_GPU_PROFILE_WINDOW_MS: the report window (default 10 s; short replays use less).
+    static const u64 report_window = [] {
+        const char* const value = std::getenv("EDEN_NX2_GPU_PROFILE_WINDOW_MS");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) * 1'000'000ULL
+                                : 10'000'000'000ULL;
+    }();
+    if (window < report_window) {
         return false;
     }
     const auto cpu_now = Common::CurrentThreadCpuTimeNs();

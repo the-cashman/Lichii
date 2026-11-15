@@ -44,6 +44,7 @@
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
 #include "video_core/nx2_bindcache.h"
+#include "video_core/nx2_draw_record.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
 
@@ -952,6 +953,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }
     ASSERT(views.size() == num_image_elements);
     ASSERT(samplers.size() == num_textures);
+    if (VideoCommon::Nx2DrawRecord::Enabled() && VideoCommon::Nx2DrawRecord::Stats()) [[unlikely]] {
+        VideoCommon::Nx2DrawRecord::CaptureBindings(record_bindings, views, samplers);
+    }
     // Resolved bindings leave their descriptors here to be remembered.
     boost::container::small_vector<DescriptorUpdateEntry, 32> record_descriptors;
     boost::container::small_vector<u8, 32> record_rescaled;
@@ -991,7 +995,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
     }
     const bool captured_delta =
-        std::exchange(capture_delta, false) && delta_blocker == DeltaBlocker::None;
+        (std::exchange(capture_delta, false) && delta_blocker == DeltaBlocker::None) ||
+        std::exchange(record_capture, false);
     if (captured_delta) {
         const auto same_view = [](const VideoCommon::ImageViewInOut& lhs,
                                   const VideoCommon::ImageViewInOut& rhs) {
@@ -1002,12 +1007,13 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                              !std::ranges::equal(views, delta_views, same_view) ||
                              !std::ranges::equal(samplers, delta_samplers);
         }
+        record_owner = nullptr;
         delta_views.assign(views.begin(), views.end());
         delta_samplers.assign(samplers.begin(), samplers.end());
         delta_computed_handles.assign(computed_handles.begin(), computed_handles.end());
         delta_computed_values.assign(computed_values.begin(), computed_values.end());
         configured_stages = Spec::enabled_stages;
-        delta_views_valid = true;
+        delta_views_valid = delta_blocker == DeltaBlocker::None;
         kept_images_valid = false;
         kept_image_entries.clear();
     }
@@ -1212,6 +1218,10 @@ bool GraphicsPipeline::ComputedHandlesChanged() const {
     return const_cast<GraphicsPipeline*>(this)->VisitComputedHandles(false);
 }
 
+void GraphicsPipeline::RecaptureComputedHandles() {
+    VisitComputedHandles(true);
+}
+
 bool GraphicsPipeline::VisitComputedHandles(bool store) {
     for (const ComputedHandle& handle : delta_computed_handles) {
         const Shader::Info& info{stage_infos[handle.stage]};
@@ -1258,6 +1268,17 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
     namespace Profile = VideoCommon::Nx2Profile;
     // ConfigureImpl without reading handles and resolving image views, samplers and texture
     // buffers: the buffers are resolved, synchronized and bound as it does.
+    if (VideoCommon::Nx2DrawRecord::Enabled() && VideoCommon::Nx2DrawRecord::Stats()) [[unlikely]] {
+        VideoCommon::Nx2DrawRecord::CaptureBindings(record_bindings, delta_views, delta_samplers);
+    }
+    // Draw records: sampled time stamps of the phases below (null: not sampled).
+    u64* const phase = std::exchange(record_phase_ticks, nullptr);
+    const auto mark = [phase](size_t index) {
+        if (phase != nullptr) [[unlikely]] {
+            phase[index] = VideoCommon::Nx2Profile::Ticks();
+        }
+    };
+    mark(0);
     buffer_cache.SetUniformBuffersState(enabled_uniform_buffer_masks, &uniform_buffer_sizes);
     {
         Profile::Scope scope{Profile::Zone::ReadHandles};
@@ -1276,11 +1297,13 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
             }
         }
     }
+    mark(1);
     {
         Profile::Scope scope{Profile::Zone::UpdateBuffers};
         buffer_cache.UpdateGraphicsBuffers(is_indexed);
         buffer_cache.BindHostGeometryBuffers(is_indexed);
     }
+    mark(2);
     {
         Profile::Scope scope{Profile::Zone::DescriptorAcquire};
         guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
@@ -1341,6 +1364,7 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
                                  static_cast<float>(clip_set ? clip_height : u32{regs.rt[0].height})};
         }
     }
+    mark(3);
     if (replay_images) {
         rescaling.Assign(kept_rescaling);
         ++delta_descriptor_stats.replayed;
@@ -1373,6 +1397,7 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
         buffer_cache.runtime.PostCopyBarrier();
         buffer_cache.any_buffer_uploaded = false;
     }
+    mark(4);
     {
         Profile::Scope scope{Profile::Zone::RenderTargets};
         texture_cache.UpdateRenderTargets(false);
@@ -1386,8 +1411,11 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
     if (IsBuilt() && (!pipeline || build->Failed())) {
         return false;
     }
+    mark(5);
     Profile::Scope scope{Profile::Zone::ConfigureDraw};
-    return ConfigureDraw(rescaling, render_area);
+    const bool configured = ConfigureDraw(rescaling, render_area);
+    mark(6);
+    return configured;
 }
 
 void GraphicsPipeline::KeepImageDescriptors(size_t stage, size_t first_entry) {
@@ -1570,6 +1598,12 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT);
         });
+    }
+    if (buffer_cache.runtime.ListDrawArgsRequested()) {
+        // List draws (nx2_list_draw.h): outside the render pass, before the draw's counters start.
+        const auto [list_buffer, list_offset] = buffer_cache.GetDrawIndirectBuffer();
+        buffer_cache.runtime.RecordListDrawArgs(list_buffer->Handle(), list_offset,
+                                                IsMeshPipeline());
     }
     scheduler.RequestRenderpass(texture_cache.GetFramebuffer(), device.IsGplEnabled());
     if (writes_storage) {

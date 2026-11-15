@@ -268,6 +268,10 @@ public:
         std::vector<Word> methods; ///< Ascending, each once
         bool methods_known{true};
         bool data_ram{};
+        /// The registers it can read (MME_READ), each a constant of the code unless
+        /// `registers_read_known` is false. Ascending, each once.
+        std::vector<Word> registers_read;
+        bool registers_read_known{true};
         std::vector<Word> instructions; ///< The PCs a call can run, ascending
     };
 
@@ -428,7 +432,11 @@ public:
                     case 17: case 18: case 19: case 20: case 21:
                         value = both ? known(taken(d.op[lane]) ? ~0U : 0) : unknown;
                         break;
-                    case 22: value = unknown; break; // A register
+                    case 22: // A register
+                        if (both) effects.registers_read.push_back((a + b) & 0xffff);
+                        else effects.registers_read_known = false;
+                        value = unknown;
+                        break;
                     case 23:
                         if (imm < 2) break;
                         // Entered, or skipped with a count of 0. Its last instruction may start
@@ -524,8 +532,12 @@ public:
         std::ranges::sort(effects.methods);
         effects.methods.erase(std::unique(effects.methods.begin(), effects.methods.end()),
                               effects.methods.end());
-        for (const auto& reached : states) {
-            effects.instructions.push_back(reached.first / 2);
+        std::ranges::sort(effects.registers_read);
+        effects.registers_read.erase(
+            std::unique(effects.registers_read.begin(), effects.registers_read.end()),
+            effects.registers_read.end());
+        for (const auto& entry : states) {
+            effects.instructions.push_back(entry.first / 2);
         }
         std::ranges::sort(effects.instructions);
         effects.instructions.erase(

@@ -427,6 +427,12 @@ public:
     /// views and samplers resolved from the old one.
     [[nodiscard]] bool ComputedHandlesChanged() const;
 
+    /// After a draw-record hit replaced delta_views (Nx2DrawRecord): the computed handles' current
+    /// values, which the record's views were resolved for, become the ones delta draws compare
+    /// with. Without it a handle going back to the last captured value would keep the record's
+    /// views (#1519 lets pipelines with computed handles take delta draws).
+    void RecaptureComputedHandles();
+
     /// Why TakesDeltaDraws is false (diagnostics).
     enum class DeltaBlocker : u8 {
         None,
@@ -488,7 +494,28 @@ public:
         gpu_memory = gpu_memory_;
     }
 
+    /// Draw records (vk_draw_record.h): a stage's shader info, and the texture and image
+    /// bindings the last Configure or ConfigureDelta used (filled only while records are on).
+    [[nodiscard]] const Shader::Info& StageInfo(size_t stage) const noexcept {
+        return stage_infos[stage];
+    }
+    std::vector<u64> record_bindings;
+    void* record_plan{}; ///< the recorder's plan of this pipeline object
+    /// Draw records (verify, on): the next Configure keeps its views, samplers and image
+    /// descriptors as a delta capture does, whatever the pipeline's delta blocker.
+    bool record_capture{};
+    /// Draw records: the record whose bindings delta_views & co. hold, and its version.
+    const void* record_owner{};
+    u64 record_owner_version{};
+    u64 record_owner_epoch{};
+    /// Draw records: when set, the next ConfigureDelta stores 7 time stamps of its phases here
+    /// (start, storage binds, buffer updates, descriptor acquire, stage buffers and images,
+    /// render targets, ConfigureDraw end).
+    u64* record_phase_ticks{};
+
 private:
+    friend class DrawRecorder;
+
     template <typename Spec>
     bool ConfigureImpl(bool is_indexed);
 

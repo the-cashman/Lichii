@@ -424,6 +424,8 @@ BufferCacheRuntime::BufferCacheRuntime(const Device& device_, MemoryAllocator& m
         uint8_pass = std::make_unique<Uint8Pass>(device, scheduler, descriptor_pool, staging_pool,
                                                  compute_pass_descriptor_queue);
     }
+    list_descriptor_pool = &descriptor_pool;
+    list_descriptor_queue = &compute_pass_descriptor_queue;
     quad_array_index_buffer = std::make_shared<QuadArrayIndexBuffer>(device_, memory_allocator_,
                                                                      scheduler_, staging_pool_);
     quad_strip_index_buffer = std::make_shared<QuadStripIndexBuffer>(device_, memory_allocator_,
@@ -633,6 +635,197 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
                                    vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, 0, WRITE_BARRIER);
         }
     });
+}
+
+void BufferCacheRuntime::EnsureListBuffer() {
+    if (list_draw_buffer) {
+        return;
+    }
+    const VkBufferCreateInfo create_info{
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .size = LIST_BUFFER_BYTES,
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0,
+        .pQueueFamilyIndices = nullptr,
+    };
+    list_draw_buffer = memory_allocator.CreateBuffer(create_info, MemoryUsage::Upload);
+    if (device.HasDebuggingToolAttached()) {
+        list_draw_buffer.SetObjectNameEXT("List draw arguments");
+    }
+    // Written once: the host GPU only ever writes words 0 and 2 of the vertex command and word 0
+    // of the task/mesh command, and the grid slots whole; the clamp counters start at 0.
+    const std::span<u8> mapped = list_draw_buffer.Mapped();
+    std::memset(mapped.data(), 0, LIST_BUFFER_BYTES);
+    constexpr std::array<u32, LIST_DRAW_SLOT_BYTES / sizeof(u32)> slot{0, 1, 0, 0, 0, 1, 1, 0};
+    for (u32 i = 0; i < LIST_DRAW_SLOTS; ++i) {
+        std::memcpy(mapped.data() + size_t{i} * LIST_DRAW_SLOT_BYTES, slot.data(),
+                    LIST_DRAW_SLOT_BYTES);
+    }
+    list_draw_buffer.Flush();
+    list_args_pass = std::make_unique<Nx2ListArgsPass>(device, scheduler, *list_descriptor_pool,
+                                                       *list_descriptor_queue);
+}
+
+void BufferCacheRuntime::LogListClamps() {
+    // The clamp counters the host GPU adds to (nx2_list_args.comp): logged once each time they
+    // grow, a handful of times in all.
+    if (!list_draw_buffer || list_clamp_logs >= 8) {
+        return;
+    }
+    list_draw_buffer.Invalidate();
+    std::array<u32, 3> counts{};
+    std::memcpy(counts.data(), list_draw_buffer.Mapped().data() + LIST_COUNTER_OFFSET,
+                sizeof(counts));
+    if (counts != list_clamps_seen) {
+        list_clamps_seen = counts;
+        ++list_clamp_logs;
+        LOG_WARNING(Render_Vulkan,
+                    "List draws/dispatches held back by the host GPU so far: {} past 2^24 "
+                    "vertices, {} past the task/mesh group limit, {} grids past the compute limits",
+                    counts[0], counts[1], counts[2]);
+    }
+}
+
+void BufferCacheRuntime::RecordListDrawArgs(VkBuffer source, VkDeviceSize offset, bool mesh) {
+    if (source == VK_NULL_HANDLE) {
+        return;
+    }
+    EnsureListBuffer();
+    LogListClamps();
+    // The arguments and the draws that read them run in the order they are recorded: a slot is
+    // free again as soon as the next write into it is recorded after its draw.
+    const VkDeviceSize slot = VkDeviceSize{list_draw_cursor} * LIST_DRAW_SLOT_BYTES;
+    list_draw_cursor = (list_draw_cursor + 1) % LIST_DRAW_SLOTS;
+    // (count, first) -> word 0 and, for vertex draws, word 2; task/mesh: word 4. Held to what
+    // RasterizerVulkan::Draw would draw and to the device's group limits.
+    list_args_pass->Run(*list_draw_buffer, LIST_BUFFER_BYTES, slot, LIST_COUNTER_OFFSET, source,
+                        offset, mesh ? Nx2ListArgsPass::Mode::Mesh : Nx2ListArgsPass::Mode::Vertex);
+    list_draw_args = {*list_draw_buffer, slot + (mesh ? 16 : 0), mesh};
+    // The front's copy of the words (Lichii #1336 24bd2237a), as they are at this place.
+    if (const u64 keep_id = list_draw_keep_id; keep_id != 0) {
+        EnsureListKeepBuffer();
+        const u32 keep_slot = static_cast<u32>(keep_id % LIST_KEEP_SLOTS);
+        const VkDeviceSize keep_offset = VkDeviceSize{keep_slot} * LIST_KEEP_SLOT_BYTES;
+        list_keeps[keep_slot] = {keep_id, scheduler.CurrentTick(), true, 2, {}};
+        scheduler.RequestOutsideRenderPassOperationContext();
+        scheduler.Record([source, offset, keep_buffer = *list_keep_buffer,
+                          keep_offset](vk::CommandBuffer cmdbuf) {
+            static constexpr VkMemoryBarrier READ_BARRIER{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            };
+            static constexpr VkMemoryBarrier WRITE_BARRIER{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+            };
+            cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, READ_BARRIER);
+            const VkBufferCopy keep{
+                .srcOffset = offset, .dstOffset = keep_offset, .size = 2 * sizeof(u32)};
+            cmdbuf.CopyBuffer(source, keep_buffer, keep);
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                                   WRITE_BARRIER);
+        });
+    }
+}
+
+BufferCacheRuntime::ListDrawArgs BufferCacheRuntime::RecordListGrid(VkBuffer source,
+                                                                    VkDeviceSize offset) {
+    EnsureListBuffer();
+    LogListClamps();
+    const VkDeviceSize slot =
+        LIST_GRID_OFFSET + VkDeviceSize{list_grid_cursor} * LIST_GRID_SLOT_BYTES;
+    list_grid_cursor = (list_grid_cursor + 1) % LIST_GRID_SLOTS;
+    list_args_pass->Run(*list_draw_buffer, LIST_BUFFER_BYTES, slot, LIST_COUNTER_OFFSET, source,
+                        offset, Nx2ListArgsPass::Mode::Grid);
+    return {*list_draw_buffer, slot, false};
+}
+
+void BufferCacheRuntime::EnsureListKeepBuffer() {
+    if (list_keep_buffer) {
+        return;
+    }
+    const VkBufferCreateInfo create_info{
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .size = VkDeviceSize{LIST_KEEP_SLOTS} * LIST_KEEP_SLOT_BYTES,
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0,
+        .pQueueFamilyIndices = nullptr,
+    };
+    list_keep_buffer = memory_allocator.CreateBuffer(create_info, MemoryUsage::Download);
+    if (device.HasDebuggingToolAttached()) {
+        list_keep_buffer.SetObjectNameEXT("Kept list words");
+    }
+}
+
+void BufferCacheRuntime::KeepListWords(u64 keep_id, VkBuffer source, VkDeviceSize offset,
+                                       u32 count) {
+    if (keep_id == 0 || source == VK_NULL_HANDLE || count == 0 || count > 3) {
+        return;
+    }
+    EnsureListKeepBuffer();
+    const u32 slot = static_cast<u32>(keep_id % LIST_KEEP_SLOTS);
+    const VkDeviceSize keep_offset = VkDeviceSize{slot} * LIST_KEEP_SLOT_BYTES;
+    scheduler.RequestOutsideRenderPassOperationContext();
+    list_keeps[slot] = {keep_id, scheduler.CurrentTick(), true, count, {}};
+    scheduler.Record([source, offset, destination = *list_keep_buffer, keep_offset,
+                      count](vk::CommandBuffer cmdbuf) {
+        static constexpr VkMemoryBarrier READ_BARRIER{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        };
+        static constexpr VkMemoryBarrier HOST_BARRIER{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+        };
+        cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, READ_BARRIER);
+        const VkBufferCopy copy{
+            .srcOffset = offset, .dstOffset = keep_offset, .size = VkDeviceSize{count} * 4};
+        cmdbuf.CopyBuffer(source, destination, copy);
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                               HOST_BARRIER);
+    });
+}
+
+void BufferCacheRuntime::KeepListWordsRead(u64 keep_id, std::span<const u32> words) {
+    if (keep_id == 0 || words.empty() || words.size() > 3) {
+        return;
+    }
+    ListKeep& keep = list_keeps[keep_id % LIST_KEEP_SLOTS];
+    keep = {keep_id, 0, false, static_cast<u32>(words.size()), {}};
+    std::ranges::copy(words, keep.words.begin());
+}
+
+bool BufferCacheRuntime::ReadKeptListWords(u64 keep_id, std::span<u32> words) {
+    const ListKeep& keep = list_keeps[keep_id % LIST_KEEP_SLOTS];
+    if (keep_id == 0 || keep.keep_id != keep_id || words.size() > keep.count) {
+        return false;
+    }
+    if (!keep.on_gpu) {
+        std::copy_n(keep.words.begin(), words.size(), words.begin());
+        return true;
+    }
+    scheduler.Wait(keep.tick);
+    list_keep_buffer.Invalidate();
+    const VkDeviceSize keep_offset = VkDeviceSize{keep_id % LIST_KEEP_SLOTS} * LIST_KEEP_SLOT_BYTES;
+    std::memcpy(words.data(), list_keep_buffer.Mapped().data() + keep_offset, words.size_bytes());
+    return true;
 }
 
 void BufferCacheRuntime::PreCopyBarrier() {

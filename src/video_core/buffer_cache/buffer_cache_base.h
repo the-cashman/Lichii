@@ -552,6 +552,35 @@ public:
     /// Fast draw verify (nx2_fast_draw.h): a hash of the bindings a delta draw keeps.
     [[nodiscard]] u64 KeptGraphicsBindingsHash(bool vertex, bool storage, bool texture) const;
 
+    /// Draw records (nx2_draw_record.h): hashes of the graphics bindings the last resolve left,
+    /// by group: 0 vertex and index buffers (without the index size, which follows the draw's
+    /// count), 1 uniform buffers, 2 which uniform buffers are streamed, 3 storage, 4 texture
+    /// buffers.
+    void RecordGraphicsBindingsHashes(std::array<u64, 5>& hashes) const;
+
+    /// Draw records: the graphics storage bindings, five words each (stage << 8 | slot,
+    /// device address, GPU address, size << 32 | buffer id, written << 32 | segment count).
+    void RecordGraphicsStorageBindings(std::vector<u64>& out) const {
+        out.clear();
+        for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+            ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 slot) {
+                const Binding& binding = channel_state->storage_buffers[stage][slot];
+                out.push_back((u64{stage} << 8) | slot);
+                out.push_back(binding.device_addr);
+                out.push_back(binding.gpu_addr);
+                out.push_back((u64{binding.size} << 32) | binding.buffer_id.index);
+                out.push_back(
+                    (u64{(channel_state->written_storage_buffers[stage] >> slot) & 1} << 32) |
+                    binding.segment_count);
+            });
+        }
+    }
+
+    /// Draw records: changes whenever a buffer is created, deleted or joined.
+    [[nodiscard]] u64 BindingEpoch() const noexcept {
+        return binding_epoch;
+    }
+
     template <typename Func>
     void BufferOperations(Func&& func) {
         do {

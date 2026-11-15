@@ -29,6 +29,8 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_cmdpage_diag.h"
 #include "video_core/nx2_fast_draw.h"
+#include "video_core/nx2_list_dispatch.h"
+#include "video_core/nx2_list_draw.h"
 #include "video_core/nx2_list_macro_trace.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
@@ -1610,6 +1612,22 @@ struct Maxwell3D::FrontState {
     std::array<u64, 0x80> oot_generation{};
     std::vector<u32> oot_writes; ///< EDEN_NX2_OOT_MACROS_DUMP: the logged call's writes
     bool oot_log_call{};
+    /// List draws (nx2_list_draw.h, #1336 port): by start in the macro code of
+    /// list_draw_generation, whether the macro is the array draw FrontTakeListDraw sends as an
+    /// address.
+    std::unordered_map<u32, bool> list_draw_macros;
+    u64 list_draw_generation{~u64{0}};
+    /// List guard (nx2_list_dispatch.h): the registers the last list draw left with their old
+    /// values (bit 0: vertex_buffer.count, bit 1: vertex_buffer.first), on the front and the back
+    /// alike, until they are written again; the list its words are in; whether an index count
+    /// was written since the last draw.end (the draw then uses neither register).
+    u32 list_draw_stale{};
+    Nx2ListDispatch::ListReader list_draw_list;
+    bool list_draw_indexed{};
+    bool in_list_draw{};
+    /// By start in the macro code of data_ram_generation, whether the macro uses the data RAM.
+    std::unordered_map<u32, bool> data_ram_macros;
+    u64 data_ram_generation{~u64{0}};
 };
 
 namespace {
@@ -1832,6 +1850,9 @@ void Maxwell3D::ReleaseFront() {
 
 void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
                            u32 argument, bool is_last_call, bool from_macro) {
+    if (fs.list_draw_stale != 0) [[unlikely]] {
+        FrontNoteListDrawWrite(split, fs, method);
+    }
     if (fs.plain[method]) [[likely]] {
         FrontStateWrite(split, fs, method, argument);
         return;
@@ -2054,6 +2075,12 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
                                      u32 method, const u32* base_start, u32 amount,
                                      u32 methods_pending) {
     auto& fs = Front(system, split);
+    if (fs.list_draw_stale != 0 && method < MacroRegistersStart) [[unlikely]] {
+        // The same register, `amount` times (non-incrementing).
+        for (u32 i = 0; i < amount && fs.list_draw_stale != 0; ++i) {
+            FrontNoteListDrawWrite(split, fs, method);
+        }
+    }
     if (method >= MacroRegistersStart) {
         if (fs.executing_macro == 0) {
             fs.executing_macro = method;
@@ -2194,6 +2221,9 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                                    method, engine.native_code, engine.native_code_generation, start,
                                    fs.parameters, native_data_ram, fs.regs)
             : nullptr;
+    if (grid_marker.In(native_data_ram)) [[unlikely]] {
+        FrontGuardMacro(fs, engine, start);
+    }
     {
         VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
         engine.native_interpreter.active_dram = &native_data_ram;
@@ -2223,6 +2253,17 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             !FrontRunOotMacro(split, fs, method, replacement)) {
             const auto parameter_count = fs.parameters.size();
             const auto read = [&](u32 address) {
+                if (fs.list_draw_stale != 0 && (address == Nx2ListDraw::VertexFirst ||
+                                                address == Nx2ListDraw::VertexCount)) [[unlikely]] {
+                    // List guard (nx2_list_dispatch.h): a register the last list draw left
+                    // unwritten.
+                    if (const int guard = Nx2ListDispatch::GuardMode(); guard != 0) {
+                        Nx2ListDispatch::Count(Nx2ListDispatch::g_guard.stale_reads);
+                        if (guard == 2) {
+                            FrontResolveListDraw(split, fs);
+                        }
+                    }
+                }
                 const u32 value = address < Regs::NUM_REGS ? fs.regs[address] : 0U;
                 ListTrace::NoteRead(trace, address, value);
                 return value;
@@ -3084,6 +3125,16 @@ struct Maxwell3D::OotContext {
         return engine.native_data_ram.data();
     }
     [[nodiscard]] u32 Read(u32 method) const {
+        if (fs.list_draw_stale != 0 && (method == Nx2ListDraw::VertexFirst ||
+                                        method == Nx2ListDraw::VertexCount)) [[unlikely]] {
+            // List guard (#1336 port): as the JIT's read in FrontRunMacro.
+            if (const int guard = Nx2ListDispatch::GuardMode(); guard != 0) {
+                Nx2ListDispatch::Count(Nx2ListDispatch::g_guard.stale_reads);
+                if (guard == 2) {
+                    engine.FrontResolveListDraw(split, fs);
+                }
+            }
+        }
         return fs.regs[method];
     }
     [[nodiscard]] bool OcclusionHle() const {
@@ -3164,6 +3215,156 @@ bool Maxwell3D::FrontBatchRepeats(VideoCommon::GpuSplit& split, FrontState& fs,
     if (VideoCommon::Nx2Profile::Enabled()) [[unlikely]] {
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::MethodWrites,
                                      u64{count} * more);
+    }
+    return true;
+}
+
+
+// List draws (nx2_list_draw.h, port of Lichii #1336 onto the #717 front): whether the macro at
+// `start` does nothing but begin a draw, write its first parameter to vertex_buffer.count and its
+// second to vertex_buffer.first, and end the draw.
+bool Maxwell3D::FrontIsListDrawMacro(FrontState& fs, const MacroEngine& engine, u32 start) {
+    if (fs.list_draw_generation != engine.native_code_generation) {
+        fs.list_draw_macros.clear();
+        fs.list_draw_generation = engine.native_code_generation;
+    }
+    const auto [it, inserted] = fs.list_draw_macros.try_emplace(start, false);
+    if (!inserted) {
+        return it->second;
+    }
+    static_assert(Nx2ListDraw::DrawBegin == MAXWELL3D_REG_INDEX(draw.begin) &&
+                  Nx2ListDraw::DrawEnd == MAXWELL3D_REG_INDEX(draw.end) &&
+                  Nx2ListDraw::VertexFirst == MAXWELL3D_REG_INDEX(vertex_buffer.first) &&
+                  Nx2ListDraw::VertexCount == MAXWELL3D_REG_INDEX(vertex_buffer.count));
+    if (!Nx2ListDraw::IsArrayDrawMacro(std::span<const u32>{engine.native_code}, start)) {
+        return false;
+    }
+    LOG_INFO(HW_GPU, "List draw: the macro at {:#x} is an array draw of (count, first)", start);
+    it->second = true;
+    return true;
+}
+
+bool Maxwell3D::FrontMacroUsesDataRam(FrontState& fs, const MacroEngine& engine, u32 start) {
+    if (fs.data_ram_generation != engine.native_code_generation) {
+        fs.data_ram_macros.clear();
+        fs.data_ram_generation = engine.native_code_generation;
+    }
+    const auto [it, inserted] = fs.data_ram_macros.try_emplace(start, true);
+    if (inserted) {
+        it->second = TuringMacroInterpreter::AnalyzeEffects(
+                         std::span<const u32>{engine.native_code}, start)
+                         .data_ram;
+    }
+    return it->second;
+}
+
+void Maxwell3D::FrontGuardMacro(FrontState& fs, const MacroEngine& engine, u32 start) {
+    // List guard (nx2_list_dispatch.h): the data RAM holds the marker of a grid the front did not
+    // read (the compute engine shares it). A 3D macro that uses the data RAM gets the real words,
+    // whether it runs as the native code or as its OoT replacement (both see the same RAM).
+    if (const int guard = Nx2ListDispatch::GuardMode();
+        guard != 0 && FrontMacroUsesDataRam(fs, engine, start)) {
+        Nx2ListDispatch::Count(Nx2ListDispatch::g_guard.dram_macros);
+        if (guard == 2) {
+            Nx2ListDispatch::ResolveGrid(grid_marker, native_data_ram);
+        }
+    }
+}
+
+void Maxwell3D::FrontNoteListDrawWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 method) {
+    switch (method) {
+    case MAXWELL3D_REG_INDEX(vertex_buffer.count):
+        fs.list_draw_stale &= ~1U;
+        break;
+    case MAXWELL3D_REG_INDEX(vertex_buffer.first):
+        fs.list_draw_stale &= ~2U;
+        break;
+    // The small index draws (index_buffer32_first and the like) draw at once, from their own
+    // words: the draw.end after them is still an array draw.
+    case MAXWELL3D_REG_INDEX(index_buffer.count):
+    case MAXWELL3D_REG_INDEX(draw_inline_index):
+    case MAXWELL3D_REG_INDEX(inline_index_2x16.even):
+    case MAXWELL3D_REG_INDEX(inline_index_4x8.index0):
+        fs.list_draw_indexed = true;
+        break;
+    case MAXWELL3D_REG_INDEX(draw.end):
+        if (fs.in_list_draw) {
+            break;
+        }
+        // An array draw takes its first vertex and its count from the two registers.
+        if (!fs.list_draw_indexed) {
+            if (const int guard = Nx2ListDispatch::GuardMode(); guard != 0) {
+                Nx2ListDispatch::Count(Nx2ListDispatch::g_guard.stale_draws);
+                if (guard == 2) {
+                    FrontResolveListDraw(split, fs);
+                }
+            }
+        }
+        fs.list_draw_indexed = false;
+        break;
+    default:
+        break;
+    }
+}
+
+void Maxwell3D::FrontResolveListDraw(VideoCommon::GpuSplit& split, FrontState& fs) {
+    const u32 stale = std::exchange(fs.list_draw_stale, 0);
+    std::array<u32, 2> words{};
+    if (!fs.list_draw_list.Read(words)) {
+        Nx2ListDispatch::Count(Nx2ListDispatch::g_guard.failed);
+        return;
+    }
+    // As the macro would have written them: the first vertex, then the count.
+    if ((stale & 2) != 0) {
+        FrontWrite(split, fs, MAXWELL3D_REG_INDEX(vertex_buffer.first), words[1], true, true);
+    }
+    if ((stale & 1) != 0) {
+        FrontWrite(split, fs, MAXWELL3D_REG_INDEX(vertex_buffer.count), words[0], true, true);
+    }
+    Nx2ListDispatch::Count(Nx2ListDispatch::g_guard.draw_resolves);
+}
+
+bool Maxwell3D::FrontTakeListDraw(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
+                                  GPUVAddr address, const Nx2ListDispatch::ListReader& reader) {
+    auto& fs = Front(system, split);
+    // The registers must take the words themselves (no shadow RAM replay), and the two words
+    // must be the whole call.
+    if (fs.executing_macro != 0 || !fs.parameters.empty() ||
+        fs.control == Regs::ShadowRamControl::Replay || rasterizer == nullptr ||
+        !rasterizer->Nx2ListDrawSupported()) {
+        return false;
+    }
+    const auto& engine = GetNativeMacroEngine();
+    const auto positions = GetNativeMacroPositions();
+    if (!engine.native_turing || positions.empty()) {
+        return false;
+    }
+    const u32 start = positions[((method - MacroRegistersStart) >> 1) & 0x7f];
+    if (!FrontIsListDrawMacro(fs, engine, start)) {
+        return false;
+    }
+    VideoCommon::Nx2Profile::CountMethod(method, false);
+    // As the writes of the macro, in its order. vertex_buffer.first and count keep the values of
+    // the last draw that was not one of these, here and on the back: only this draw reads the
+    // words.
+    fs.in_list_draw = true;
+    FrontWrite(split, fs, MAXWELL3D_REG_INDEX(draw.begin), 0, true, true);
+    // Writes no guest memory itself (the draw.end after it notes the draw's writes).
+    split.Defer([this, address, keep_id = reader.keep_id] {
+        draw_manager.draw_state.list_draw_address = address;
+        draw_manager.draw_state.list_keep_id = keep_id;
+    });
+    FrontWrite(split, fs, MAXWELL3D_REG_INDEX(draw.end), 0, true, true);
+    fs.in_list_draw = false;
+    // List guard (nx2_list_dispatch.h): the two registers keep their old values from here on.
+    fs.list_draw_stale = 3;
+    fs.list_draw_list = reader;
+    fs.list_draw_indexed = false;
+    if (fs.draw_pending) {
+        fs.draw_pending = false;
+        split.Defer([this, system_ptr = &system] { FinishFrontMacro(*system_ptr); },
+                    VideoCommon::GpuSplit::FastDrawNeutral);
+        split.NoteDraw();
     }
     return true;
 }

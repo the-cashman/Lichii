@@ -57,6 +57,8 @@ class Maxwell3D;
 
 namespace Vulkan {
 
+class DrawRecorder;
+
 struct FramebufferTextureInfo;
 
 class StateTracker;
@@ -98,6 +100,10 @@ public:
 
     void Draw(bool is_indexed, u32 instance_count) override;
     void DrawIndirect() override;
+    [[nodiscard]] bool Nx2ListDrawSupported() const override;
+    [[nodiscard]] bool Nx2ListDispatchSupported() const override;
+    void Nx2KeepListWords(u64 keep_id, GPUVAddr address, u32 count) override;
+    [[nodiscard]] bool Nx2ReadKeptListWords(u64 keep_id, std::span<u32> words) override;
     void DrawTexture() override;
     void Clear(u32 layer_count) override;
     void DispatchCompute() override;
@@ -410,6 +416,8 @@ private:
     u32 render_trace_clears = 0;
     bool pending_native_work{};
     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
+    /// List draws (nx2_list_draw.h): DrawIndirect for IndirectParams::list_words.
+    void DrawListWords();
     /// Fragment output components the dynamic color write mask was last recorded with
     u32 last_color_output_mask{};
     VideoCommon::OotNetwork::BypassState oot_network_bypass;
@@ -601,6 +609,10 @@ private:
     DrawReuseProbe draw_reuse;
 
     ReusableDraw reusable_draw;
+    /// Draw records: why the current draw resolves in full (FullDraw, Count: delta) and the
+    /// 3D method of the last break.
+    u8 full_reason{};
+    u32 full_break_method{};
     ReusableDraw taken_draw; ///< The draw TakeReusableDraw last returned the pipeline of
     /// Device memory of the constant buffers TakeReusableDraw checks for texture handle writes.
     std::array<std::array<VideoCommon::Nx2FastDraw::DeviceSpans, Maxwell::MaxConstBuffers>,
@@ -610,6 +622,8 @@ private:
     /// Nx2FastDraw::Enabled and VerifyEnabled as the drawing thread last read them.
     bool fast_draw_on{};
     bool fast_draw_verify{};
+    /// EDEN_NX2_DRAW_RECORD (nx2_draw_record.h); null while off.
+    std::unique_ptr<DrawRecorder> draw_record;
     /// EDEN_NX2_FAST_DRAW_VERIFY: this draw passed DeltaStillHolds (#1519's vertex input check
     /// isn't wired into the vertex input layout cache: vertex_input_mismatches stays 0).
     bool verify_vertex_input{};

@@ -119,6 +119,29 @@ private:
     ComputePassDescriptorQueue& compute_pass_descriptor_queue;
 };
 
+/// List draws and dispatches (nx2_list_draw.h, nx2_list_dispatch.h): builds an indirect draw's
+/// or dispatch's arguments from GPU-written list words, held to what the direct paths accept
+/// (host_shaders/nx2_list_args.comp).
+class Nx2ListArgsPass final : public ComputePass {
+public:
+    enum class Mode : u32 { Vertex = 0, Mesh = 1, Grid = 2 };
+
+    explicit Nx2ListArgsPass(const Device& device_, Scheduler& scheduler_,
+                             DescriptorPool& descriptor_pool_,
+                             ComputePassDescriptorQueue& compute_pass_descriptor_queue_);
+
+    /// Writes the arguments for `mode` into `destination` at `destination_offset` (a slot) from
+    /// the words at `source_offset`; skips (counts at `counter_offset`) what is out of range.
+    void Run(VkBuffer destination, VkDeviceSize destination_size, VkDeviceSize destination_offset,
+             VkDeviceSize counter_offset, VkBuffer source, VkDeviceSize source_offset, Mode mode);
+
+private:
+    Scheduler& scheduler;
+    ComputePassDescriptorQueue& compute_pass_descriptor_queue;
+    std::array<u32, 3> mesh_limit{};
+    std::array<u32, 3> grid_limit{};
+};
+
 class QueriesPrefixScanPass final : public ComputePass {
 public:
     explicit QueriesPrefixScanPass(const Device& device_, Scheduler& scheduler_,

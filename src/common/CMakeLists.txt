@@ -52,6 +52,8 @@ add_library(
     nx2_sampler.h
     nx2_address_wait.cpp
     nx2_address_wait.h
+    nx2_ab.cpp
+    nx2_ab.h
     nx2_huge_pages.cpp
     nx2_huge_pages.h
     dynamic_library.cpp

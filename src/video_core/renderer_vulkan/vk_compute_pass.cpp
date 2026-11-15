@@ -3,6 +3,7 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdlib>
@@ -23,6 +24,7 @@
 #include "video_core/host_shaders/queries_prefix_scan_sum_comp_spv.h"
 #include "video_core/host_shaders/queries_prefix_scan_sum_nosubgroups_comp_spv.h"
 #include "video_core/host_shaders/resolve_conditional_render_comp_spv.h"
+#include "video_core/host_shaders/nx2_list_args_comp_spv.h"
 #include "video_core/host_shaders/vulkan_quad_indexed_comp_spv.h"
 #include "video_core/host_shaders/vulkan_uint8_comp_spv.h"
 #include "video_core/host_shaders/vulkan_vertex_repack_comp_spv.h"
@@ -246,6 +248,16 @@ struct QueriesPrefixScanPushConstants {
 
 struct ConditionalRenderingResolvePushConstants {
     u32 compare_to_zero;
+};
+
+struct Nx2ListArgsPushConstants {
+    u32 source_word;
+    u32 destination_word;
+    u32 mode;
+    u32 counter_word;
+    u32 limit_x;
+    u32 limit_y;
+    u32 limit_z;
 };
 } // Anonymous namespace
 
@@ -535,6 +547,83 @@ void ConditionalRenderingResolvePass::Resolve(VkBuffer dst_buffer, VkBuffer src_
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                VK_PIPELINE_STAGE_CONDITIONAL_RENDERING_BIT_EXT, 0,
                                write_barrier);
+    });
+}
+
+Nx2ListArgsPass::Nx2ListArgsPass(const Device& device_, Scheduler& scheduler_,
+                                 DescriptorPool& descriptor_pool_,
+                                 ComputePassDescriptorQueue& compute_pass_descriptor_queue_)
+    : ComputePass(device_, scheduler_, descriptor_pool_, INPUT_OUTPUT_DESCRIPTOR_SET_BINDINGS,
+                  INPUT_OUTPUT_DESCRIPTOR_UPDATE_TEMPLATE, INPUT_OUTPUT_BANK_INFO,
+                  COMPUTE_PUSH_CONSTANT_RANGE<sizeof(Nx2ListArgsPushConstants)>,
+                  NX2_LIST_ARGS_COMP_SPV),
+      scheduler{scheduler_}, compute_pass_descriptor_queue{compute_pass_descriptor_queue_} {
+    grid_limit = device.GetMaxComputeWorkGroupCount();
+    // Task/mesh draws: the smaller of the task and mesh group limits on x (the pipeline may or
+    // may not have a task program), and their total counts.
+    mesh_limit = {0, 0, 0};
+    if (device.IsExtMeshShaderSupported()) {
+        VkPhysicalDeviceMeshShaderPropertiesEXT mesh{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT,
+        };
+        VkPhysicalDeviceProperties2 properties{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+            .pNext = &mesh,
+            .properties = {},
+        };
+        device.GetPhysical().GetProperties2(properties);
+        const u32 x = (std::min)({mesh.maxTaskWorkGroupCount[0], mesh.maxMeshWorkGroupCount[0],
+                                  mesh.maxTaskWorkGroupTotalCount,
+                                  mesh.maxMeshWorkGroupTotalCount});
+        mesh_limit = {x, 1, 1};
+        LOG_INFO(Render_Vulkan, "List draws: task/mesh group limit {}", x);
+    }
+}
+
+void Nx2ListArgsPass::Run(VkBuffer destination, VkDeviceSize destination_size,
+                          VkDeviceSize destination_offset, VkDeviceSize counter_offset,
+                          VkBuffer source, VkDeviceSize source_offset, Mode mode) {
+    const VkDeviceSize alignment = (std::max<VkDeviceSize>)(device.GetStorageBufferAlignment(), 4);
+    const VkDeviceSize source_base = source_offset / alignment * alignment;
+    compute_pass_descriptor_queue.Acquire(scheduler, 2);
+    compute_pass_descriptor_queue.AddBuffer(source, source_base,
+                                            source_offset - source_base + 3 * sizeof(u32));
+    compute_pass_descriptor_queue.AddBuffer(destination, 0, destination_size);
+    const void* const descriptor_data{compute_pass_descriptor_queue.UpdateData()};
+    const std::array<u32, 3> limit = mode == Mode::Grid ? grid_limit : mesh_limit;
+    const Nx2ListArgsPushConstants uniforms{
+        .source_word = static_cast<u32>((source_offset - source_base) / sizeof(u32)),
+        .destination_word = static_cast<u32>(destination_offset / sizeof(u32)),
+        .mode = static_cast<u32>(mode),
+        .counter_word = static_cast<u32>(counter_offset / sizeof(u32)),
+        .limit_x = limit[0],
+        .limit_y = limit[1],
+        .limit_z = limit[2],
+    };
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record([this, descriptor_data, uniforms](vk::CommandBuffer cmdbuf) {
+        static constexpr VkMemoryBarrier read_barrier{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+        };
+        static constexpr VkMemoryBarrier write_barrier{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
+        };
+        const VkDescriptorSet set = descriptor_allocator.Commit();
+        device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);
+        cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, read_barrier);
+        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
+        cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
+        cmdbuf.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, uniforms);
+        cmdbuf.Dispatch(1, 1, 1);
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                               VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, 0, write_barrier);
     });
 }
 
