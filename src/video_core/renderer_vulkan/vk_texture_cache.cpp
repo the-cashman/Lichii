@@ -3849,6 +3849,9 @@ void TextureCacheRuntime::ReleaseMsaaScratchImage(VkImage image) {
 }
 
 void TextureCacheRuntime::TickFrame() {
+    if (astc_decoder_pass) {
+        astc_decoder_pass->FlushPending();
+    }
     if (ImagePoolEnabled()) {
         GetImagePool().Maintain();
     }

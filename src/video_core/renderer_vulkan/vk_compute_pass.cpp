@@ -703,6 +703,53 @@ void QueriesPrefixScanPass::Run(VkBuffer accumulation_buffer, VkBuffer dst_buffe
     }
 }
 
+namespace {
+
+bool AstcFlushOnly() {
+    static const bool flush_only = [] {
+        const char* value = std::getenv("EDEN_NX2_ASTC_FLUSH");
+        return value == nullptr || value[0] != '0';
+    }();
+    return flush_only;
+}
+
+/// Textures recorded before one host submit. 1 restores a submit per texture.
+u32 AstcFlushBatch() {
+    static const u32 batch = [] {
+        const char* value = std::getenv("EDEN_NX2_ASTC_FLUSH_BATCH");
+        if (value != nullptr && value[0] == '1' && value[1] == '\0') {
+            return u32{1};
+        }
+        return u32{8};
+    }();
+    return batch;
+}
+
+/// One line every 5 s, same shape as the per-texture flush log. A queued decode counts
+/// even when its submit is still ahead; a submit only adds the host wait.
+void AccountQueuedDecode(bool count_decode, std::chrono::nanoseconds wait) {
+    static u32 decodes{};
+    static std::chrono::nanoseconds waited{};
+    static auto window_start = std::chrono::steady_clock::now();
+    if (count_decode) {
+        ++decodes;
+    }
+    waited += wait;
+    const auto end = std::chrono::steady_clock::now();
+    if (end - window_start < std::chrono::seconds{5}) {
+        return;
+    }
+    LOG_INFO(Render_Vulkan, "ASTC GPU decodes: {} in {} ms, {} ms waiting ({})", decodes,
+             std::chrono::duration_cast<std::chrono::milliseconds>(end - window_start).count(),
+             std::chrono::duration_cast<std::chrono::milliseconds>(waited).count(),
+             AstcFlushOnly() ? "flush" : "finish");
+    decodes = 0;
+    waited = {};
+    window_start = end;
+}
+
+} // namespace
+
 ASTCDecoderPass::ASTCDecoderPass(const Device& device_, Scheduler& scheduler_,
                                  DescriptorPool& descriptor_pool_,
                                  StagingBufferPool& staging_buffer_pool_,
@@ -899,36 +946,42 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                        vk::PIPELINE_STAGE_GRAPHICS_COMPUTE, 0, image_barrier);
     });
-    // Each decode ends with a submit to the host GPU. Measured here
-    // (count and time per 5 s); EDEN_NX2_ASTC_FLUSH=0 waits for the host GPU to go idle instead.
-    static const bool flush_only = [] {
-        const char* value = std::getenv("EDEN_NX2_ASTC_FLUSH");
-        return value == nullptr || value[0] != '0';
-    }();
+    // Decodes record into the current command buffer. Their staging maps stay owned until the
+    // GPU finishes that buffer's tick (IsFree), so several can share one submit. The input is
+    // not reused while the tick is still current. EDEN_NX2_ASTC_FLUSH=0 waits for the host GPU
+    // to go idle instead of only submitting. EDEN_NX2_ASTC_FLUSH_BATCH=1 submits every texture.
     if (!target.wait) {
         return;
     }
+    ++queued_decodes;
+    AccountQueuedDecode(true, std::chrono::nanoseconds::zero());
+    if (queued_decodes >= AstcFlushBatch()) {
+        SubmitQueuedDecodes();
+    }
+}
+
+void ASTCDecoderPass::FlushPending() {
+    if (queued_decodes == 0) {
+        return;
+    }
+    // Present already called Scheduler::Flush on this command buffer. Another submit here
+    // would be empty, or would ship whatever the present itself recorded after that flush.
+    if (!scheduler.RecordedSinceSubmit()) {
+        queued_decodes = 0;
+        return;
+    }
+    SubmitQueuedDecodes();
+}
+
+void ASTCDecoderPass::SubmitQueuedDecodes() {
+    queued_decodes = 0;
     const auto start = std::chrono::steady_clock::now();
-    if (flush_only) {
+    if (AstcFlushOnly()) {
         scheduler.Flush();
     } else {
         scheduler.Finish();
     }
-    const auto end = std::chrono::steady_clock::now();
-    static u32 decodes{};
-    static std::chrono::nanoseconds waited{};
-    static auto window_start = end;
-    ++decodes;
-    waited += end - start;
-    if (end - window_start >= std::chrono::seconds{5}) {
-        LOG_INFO(Render_Vulkan, "ASTC GPU decodes: {} in {} ms, {} ms waiting ({})", decodes,
-                 std::chrono::duration_cast<std::chrono::milliseconds>(end - window_start).count(),
-                 std::chrono::duration_cast<std::chrono::milliseconds>(waited).count(),
-                 flush_only ? "flush" : "finish");
-        decodes = 0;
-        waited = {};
-        window_start = end;
-    }
+    AccountQueuedDecode(false, std::chrono::steady_clock::now() - start);
 }
 
 BcEncoderPass::BcEncoderPass(const Device& device_, Scheduler& scheduler_,

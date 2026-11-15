@@ -193,11 +193,18 @@ public:
                       const Target& target, const StagingBufferRef& map,
                       std::span<const VideoCommon::SwizzleParameters> swizzles);
 
+    /// Submits decodes still sitting in the current command buffer. The present path already
+    /// submits that buffer, so this is a no-op once the frame has been flushed.
+    void FlushPending();
+
 private:
+    void SubmitQueuedDecodes();
+
     Scheduler& scheduler;
     StagingBufferPool& staging_buffer_pool;
     ComputePassDescriptorQueue& compute_pass_descriptor_queue;
     MemoryAllocator& memory_allocator;
+    u32 queued_decodes{};
 };
 
 /// Compresses an RGBA8 image level to BC1 or BC3 blocks in a buffer (bc_encoder.comp).
