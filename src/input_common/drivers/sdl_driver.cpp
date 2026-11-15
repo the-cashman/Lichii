@@ -921,12 +921,15 @@ void SDLDriver::PumpEvents() {
                 if (auto pad = joystick->GetRenHDrum()) {
                     pads.push_back(std::move(pad));
                 }
-                if (check_motion && joystick->IsMotionStalled(now)) {
+                if (!check_motion) {
+                    continue;
+                }
+                if (joystick->IsMotionStalled(now)) {
                     stalled.push_back(joystick);
                 }
-            }
-            if (const auto warning = joystick->CheckSilentConnection(now); !warning.empty()) {
-                LOG_WARNING(Input, "{}", warning);
+                if (const auto warning = joystick->CheckSilentConnection(now); !warning.empty()) {
+                    LOG_WARNING(Input, "{}", warning);
+                }
             }
         }
     }
