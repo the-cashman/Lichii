@@ -298,48 +298,38 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         runtime.Finish();
         // A guest CPU write into memory the buffer cache holds GPU-written bytes of is stored at
         // once and reaches this cache only later (OnCacheInvalidations, which waits for this
-        // lock). Those collected so far are pending; those collected from here on wait for the
-        // landing to end before they store (DownloadLanding::Await). An image under a pending
-        // one isn't written back and stays cached, as if the collector hadn't picked it: its
-        // bytes would land over the guest's newer ones. (A sparse image's device range isn't one
-        // range: it stays whenever any write is pending.)
-        DAddr landing_begin = ~DAddr{0};
-        DAddr landing_end = 0;
-        for (const PendingWriteBack& entry : pending_write_backs) {
-            const Image& image = slot_images[entry.image_id];
-            if (True(image.flags & ImageFlagBits::Sparse)) {
-                landing_begin = 0;
-                landing_end = ~DAddr{0};
-                break;
+        // lock). So each image is written back inside a DownloadLanding over its device range:
+        // writes there collected from then on store their bytes once it has ended
+        // (DownloadLanding::Await), and one collected before is still pending. An image under a
+        // pending one isn't written back and stays cached, as if the collector hadn't picked it:
+        // its bytes would land over the guest's newer ones. (A sparse image's device range isn't
+        // one range: its landing covers everything, and any pending write keeps it.)
+        const auto LandingFor = [](const Image& image) {
+            return True(image.flags & ImageFlagBits::Sparse)
+                       ? std::pair<DAddr, DAddr>{0, ~DAddr{0}}
+                       : std::pair<DAddr, DAddr>{image.cpu_addr, image.cpu_addr_end};
+        };
+        const auto IsWrittenByCpu = [this](DAddr begin, DAddr end) {
+            bool written = false;
+            if (pending_cpu_writes) {
+                pending_cpu_writes([&](DAddr addr, size_t size) {
+                    written |= addr < end && begin < addr + size;
+                });
             }
-            landing_begin = (std::min)(landing_begin, DAddr{image.cpu_addr});
-            landing_end = (std::max)(landing_end, DAddr{image.cpu_addr_end});
-        }
-        const VideoCore::DownloadLanding landing{landing_begin, landing_end,
-                                                 VideoCore::DownloadLanding::Source::TextureCache};
-        boost::container::small_vector<std::pair<DAddr, size_t>, 16> cpu_written;
-        if (pending_cpu_writes) {
-            pending_cpu_writes([&cpu_written](DAddr addr, size_t size) {
-                cpu_written.emplace_back(addr, size);
-            });
-        }
-        const auto IsWrittenByCpu = [&cpu_written](const Image& image) {
-            if (cpu_written.empty()) {
-                return false;
-            }
-            if (True(image.flags & ImageFlagBits::Sparse)) {
-                return true;
-            }
-            return std::ranges::any_of(cpu_written, [&image](const auto& write) {
-                return write.first < image.cpu_addr_end && image.cpu_addr < write.first + write.second;
-            });
+            return written;
         };
         for (PendingWriteBack& entry : pending_write_backs) {
             Image& image = slot_images[entry.image_id];
-            const bool written_by_cpu = IsWrittenByCpu(image);
-            if (!written_by_cpu) {
-                SwizzleImage(*gpu_memory, image.gpu_addr, image.info, entry.copies,
-                             entry.map.mapped_span, swizzle_data_buffer);
+            bool written_by_cpu;
+            {
+                const auto [landing_begin, landing_end] = LandingFor(image);
+                const VideoCore::DownloadLanding landing{
+                    landing_begin, landing_end, VideoCore::DownloadLanding::Source::TextureCache};
+                written_by_cpu = IsWrittenByCpu(landing_begin, landing_end);
+                if (!written_by_cpu) {
+                    SwizzleImage(*gpu_memory, image.gpu_addr, image.info, entry.copies,
+                                 entry.map.mapped_span, swizzle_data_buffer);
+                }
             }
             runtime.FreeDeferredStagingBuffer(entry.map);
             if (written_by_cpu) {
