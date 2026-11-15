@@ -10,6 +10,7 @@ add_executable(tests
     video_core/buffer_cache_ports.cpp
     video_core/unswizzle_workers.cpp
     video_core/block_linear_swizzle.cpp
+    video_core/download_landing_sources.cpp
     video_core/aftermath_dump.cpp
     video_core/frame_dump_schedule.cpp
     video_core/nx2_stutter_trace.cpp

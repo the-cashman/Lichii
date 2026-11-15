@@ -535,6 +535,10 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
         [this](const std::function<void(DAddr, size_t)>& callback) {
             gpu.ForEachPendingCpuWrite(callback);
         });
+    texture_cache.SetPendingCpuWrites(
+        [this](const std::function<void(DAddr, size_t)>& callback) {
+            gpu.ForEachPendingCpuWrite(callback);
+        });
     VideoCommon::GpuSplit::Get().SetIdleHook(
         [](void* argument) { static_cast<Scheduler*>(argument)->FlushDeferred(); },
         &scheduler);

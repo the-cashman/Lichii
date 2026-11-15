@@ -82,7 +82,12 @@ RasterizerOpenGL::RasterizerOpenGL(Core::Frontend::EmuWindow& emu_window_, Tegra
                    program_manager, state_tracker, gpu.ShaderNotify()),
       query_cache(*this, device_memory_), accelerate_dma(buffer_cache, texture_cache),
       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache),
-      blit_image(program_manager_) {}
+      blit_image(program_manager_) {
+    texture_cache.SetPendingCpuWrites(
+        [this](const std::function<void(DAddr, size_t)>& callback) {
+            gpu.ForEachPendingCpuWrite(callback);
+        });
+}
 
 RasterizerOpenGL::~RasterizerOpenGL() = default;
 

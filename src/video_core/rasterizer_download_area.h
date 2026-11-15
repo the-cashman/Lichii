@@ -64,10 +64,18 @@ struct DownloadLandingState {
 ///
 /// Each side fences between its store (the landing, the collected write) and its load (the
 /// collected writes, the landing): either the download finds the write, or the write finds the
-/// landing. Downloads land under the buffer cache's lock, so one landing is published at a time.
+/// landing. Each source publishes one landing at a time: the buffer cache's downloads land under
+/// its lock, the texture cache's write-backs (the garbage collector's) under its own.
 class DownloadLanding {
 public:
-    explicit DownloadLanding(DAddr begin, DAddr end) noexcept {
+    enum class Source : u32 {
+        BufferCache,
+        TextureCache,
+    };
+
+    explicit DownloadLanding(DAddr begin, DAddr end,
+                             Source source = Source::BufferCache) noexcept
+        : state{states[static_cast<u32>(source)]} {
         state.begin.store(begin, std::memory_order_relaxed);
         state.end.store(end, std::memory_order_relaxed);
         state.sequence.fetch_add(1, std::memory_order_seq_cst);
@@ -83,35 +91,42 @@ public:
     /// stored.
     static void Await(DAddr addr, u64 size) noexcept {
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        const u64 sequence = state.sequence.load(std::memory_order_acquire);
-        if ((sequence & 1) != 0) {
-            Wait(sequence, addr, size);
+        for (DownloadLandingState& source : states) {
+            const u64 sequence = source.sequence.load(std::memory_order_acquire);
+            if ((sequence & 1) != 0) {
+                Wait(source, sequence, addr, size);
+            }
         }
     }
 
     /// Writes that waited for a landing so far.
     [[nodiscard]] static u64 Waits() noexcept {
-        return state.waits.load(std::memory_order_relaxed);
+        u64 waits = 0;
+        for (const DownloadLandingState& source : states) {
+            waits += source.waits.load(std::memory_order_relaxed);
+        }
+        return waits;
     }
 
 private:
-    static void Wait(u64 sequence, DAddr addr, u64 size) noexcept {
-        const DAddr begin = state.begin.load(std::memory_order_relaxed);
-        const DAddr end = state.end.load(std::memory_order_relaxed);
+    static void Wait(DownloadLandingState& source, u64 sequence, DAddr addr, u64 size) noexcept {
+        const DAddr begin = source.begin.load(std::memory_order_relaxed);
+        const DAddr end = source.end.load(std::memory_order_relaxed);
         std::atomic_thread_fence(std::memory_order_acquire);
         // Ended (its writes come first, and the landings after it found this write), or it
         // writes elsewhere.
-        if (state.sequence.load(std::memory_order_acquire) != sequence || addr >= end ||
+        if (source.sequence.load(std::memory_order_acquire) != sequence || addr >= end ||
             addr + size <= begin) {
             return;
         }
-        state.waits.fetch_add(1, std::memory_order_relaxed);
-        while (state.sequence.load(std::memory_order_acquire) == sequence) {
+        source.waits.fetch_add(1, std::memory_order_relaxed);
+        while (source.sequence.load(std::memory_order_acquire) == sequence) {
             std::this_thread::yield();
         }
     }
 
-    static inline DownloadLandingState state;
+    DownloadLandingState& state;
+    static inline std::array<DownloadLandingState, 2> states;
 };
 
 /// EDEN_NX2_READ_CHECK: the latest writes from the GPU's side that ReadDownloadsMayCover
