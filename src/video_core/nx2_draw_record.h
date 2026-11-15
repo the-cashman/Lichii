@@ -47,10 +47,12 @@ enum class Mode : u8 { Off, Dry, Verify, On };
 /// EDEN_NX2_DRAW_RECORD as an in-session A/B switch (common/nx2_ab.h): "ab[:arm[:mode]]" runs
 /// the mode (default 1) in that arm and is off in the others.
 [[nodiscard]] inline const Common::Nx2Ab::Switch& ConfiguredSwitch() {
-    // On unless set (EDEN_NX2_DRAW_RECORD=0 turns the record path off).
+    // Off unless set (EDEN_NX2_DRAW_RECORD=1 turns the record path on). In-session A/B on the
+    // Ocarina village (launcher env, no PGO) it cost 0.56-0.62 fps (GPUBack +0.27-0.34 ms a
+    // frame) on this branch and on main-rumble; neutral in Mario Kart World.
     static const Common::Nx2Ab::Switch sw = [] {
         const char* const value = std::getenv("EDEN_NX2_DRAW_RECORD");
-        return Common::Nx2Ab::Parse(value != nullptr ? value : "1");
+        return Common::Nx2Ab::Parse(value != nullptr ? value : "0");
     }();
     return sw;
 }
