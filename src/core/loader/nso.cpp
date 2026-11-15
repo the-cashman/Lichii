@@ -4,11 +4,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <cstring>
 #include <span>
 #include <vector>
 
+#include "common/alignment.h"
 #include "common/common_funcs.h"
 #include "common/game_presets.h"
 #include "common/hex_util.h"
@@ -197,12 +199,19 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
     // the game's own wait for the second vblank, or every 2-step frame reads as 33 ms and the game
     // never leaves 30 FPS (found by SerkiGohan). Presents are then paced with interval 1.
     // Match the instruction sequences instead of relying on a title-version-specific address.
+    // 60 FPS forces mode 1 (one 1/60 s step a frame): a slow frame plays in slow motion. With the
+    // 30 FPS fallback, the mode load becomes a call to `ldr w8, <word>; ret` in the padding after
+    // .text, a word nx2:vi2 switches between 1 and 2 (one 1/30 s step a frame) at runtime: 60
+    // while frames make it, 30 at full speed while they don't.
     const bool mkw_dynamic = Settings::values.mkw_dynamic_fps.GetValue();
+    const bool mkw_60 = !mkw_dynamic && Settings::values.mkw_60fps.GetValue();
+    const bool mkw_60_switching = mkw_60 && Settings::values.mkw_60fps_fallback.GetValue();
     bool mkw_dynamic_fps_patch_applied = false;
-    if ((mkw_dynamic || Settings::values.mkw_30fps.GetValue()) && name == "main" &&
+    u64 mkw_mode_word_offset = 0;
+    if ((mkw_dynamic || mkw_60 || Settings::values.mkw_30fps.GetValue()) && name == "main" &&
         process.GetProgramId() == Settings::MarioKartWorldProgramId) {
         constexpr u32 ModeLoadInsn = 0xB9421268; // ldr w8, [x19, #0x210]
-        const u32 mode = mkw_dynamic ? 0U : 2U;
+        const u32 mode = mkw_dynamic ? 0U : mkw_60 ? 1U : 2U;
         const u32 mode_instruction = 0x52800008U | (mode << 5); // mov w8, #mode
         const auto& text = nso_header.segments[0];
         u8* const code = codeset.memory.data() + module_start + text.location;
@@ -254,8 +263,28 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
             }
         }
 
-        if (mode_matches == 1 &&
-            (!mkw_dynamic || (frame_time_matches == 1 && vblank_wait_matches == 1))) {
+        // The padding between .text and the next segment is mapped with .text and is zero.
+        const size_t cave = Common::AlignUp(text.location + text.size, sizeof(u32));
+        const bool cave_fits =
+            nso_header.segments.size() > 1 && cave + 12 <= nso_header.segments[1].location &&
+            std::all_of(code + (cave - text.location), code + (cave - text.location) + 12,
+                        [](u8 byte) { return byte == 0; });
+
+        if (mode_matches == 1 && mkw_60_switching && cave_fits) {
+            const std::array<u32, 3> stub{0x18000048U, // ldr w8, #8 (the mode word below)
+                                          0xD65F03C0U, // ret
+                                          1U};         // mode, switched by nx2:vi2
+            std::memcpy(code + (cave - text.location), stub.data(), sizeof(stub));
+            const s64 delta = (static_cast<s64>(cave) -
+                               static_cast<s64>(text.location + mode_site * sizeof(u32))) / 4;
+            const u32 call = 0x94000000U | (static_cast<u32>(delta) & 0x03FFFFFFU); // bl stub
+            std::memcpy(code + mode_site * sizeof(u32), &call, sizeof(call));
+            mkw_mode_word_offset = cave + 8;
+            LOG_INFO(Loader, "Mario Kart World: 60 FPS mode enabled, 30 at full speed when slow "
+                             "(main+{:#x}, mode word main+{:#x})",
+                     text.location + mode_site * sizeof(u32), cave + 8);
+        } else if (mode_matches == 1 && !mkw_60_switching &&
+                   (!mkw_dynamic || (frame_time_matches == 1 && vblank_wait_matches == 1))) {
             std::memcpy(code + mode_site * sizeof(u32), &mode_instruction,
                         sizeof(mode_instruction));
             if (mkw_dynamic) {
@@ -269,13 +298,13 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
                 mkw_dynamic_fps_patch_applied = true;
             }
             LOG_INFO(Loader, "Mario Kart World: {} FPS mode enabled (main+{:#x})",
-                     mkw_dynamic ? "dynamic" : "30",
+                     mkw_dynamic ? "dynamic" : mkw_60 ? "60" : "30",
                      text.location + mode_site * sizeof(u32));
         } else {
             LOG_WARNING(Loader,
                         "Mario Kart World FPS patch skipped (mode matches {}, frame-time matches "
-                        "{}, vblank-wait matches {})",
-                        mode_matches, frame_time_matches, vblank_wait_matches);
+                        "{}, vblank-wait matches {}, room after .text {})",
+                        mode_matches, frame_time_matches, vblank_wait_matches, cave_fits);
         }
     }
 
@@ -425,6 +454,8 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
     process.LoadModule(system.Kernel(), std::move(codeset), load_base);
     if (name == "main" && process.GetProgramId() == Settings::MarioKartWorldProgramId) {
         process.SetMkwDynamicFpsPatchApplied(mkw_dynamic_fps_patch_applied);
+        process.SetMkwFrameModeAddress(
+            mkw_mode_word_offset != 0 ? load_base + module_start + mkw_mode_word_offset : 0);
     }
     if (frame_interval_offset != 0) {
         process.SetFrameIntervalAddresses(load_base + module_start + frame_interval_offset,

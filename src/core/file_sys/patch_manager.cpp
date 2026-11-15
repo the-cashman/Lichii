@@ -330,6 +330,42 @@ constexpr std::array<u8, 40> TURN_SPEED_ROUTINE{
     0x28, 0x1E, 0x01, 0x40, 0x21, 0x1E, 0x33, 0x60, 0xA7, 0x17, 0xE1, 0x0F, 0x40, 0xBD,
     0x01, 0x08, 0x21, 0x1E, 0x00, 0x08, 0x28, 0x1E, 0x2F, 0x60, 0xA7, 0x17,
 };
+// A movie player counts its updates with a picture shown (+0x2F8, one more each), and a cutscene
+// that plays a movie takes that count as its timeline frame: its voices, overlays and its end are
+// placed by it. The picture and the sound follow the clock, so at any other frame rate than 60 the
+// cues drift from them (sages' lines over each other at 30 or 120 fps, #1474, #1572). The count
+// takes whole ticks of the step through the shared helper instead, keyed by the counter's address.
+// Same site as Hookshot's movie frame count (issue 1742).
+constexpr std::array<u8, 4> MOVIE_FRAMES_ORIGINAL{0x08, 0x05, 0x00, 0x11}; // add w8, w8, #1
+constexpr std::array<u8, 4> MOVIE_FRAMES_HOOK{0xAA, 0xA8, 0x03, 0x14};     // b main+0x3C46A70
+// add x13, x20, #0x2f8 ; load raw step ; bl helper ; add w8, w8, w13 ; b 0x3B5C7CC
+constexpr std::array<u8, 56> MOVIE_FRAMES_ROUTINE{
+    0xED, 0x3B, 0xBD, 0xA9, 0xEF, 0x43, 0x01, 0xA9, 0xFE, 0x13, 0x00, 0xF9, 0x8D, 0xE2,
+    0x0B, 0x91, 0xCE, 0x81, 0x00, 0x90, 0xCE, 0x49, 0x44, 0xF9, 0xCE, 0x01, 0x40, 0xF9,
+    0xC0, 0x11, 0x40, 0xBD, 0xBC, 0xFF, 0xFF, 0x97, 0x08, 0x01, 0x0D, 0x0B, 0xFE, 0x13,
+    0x40, 0xF9, 0xEF, 0x43, 0x41, 0xA9, 0xED, 0x3B, 0xC3, 0xA8, 0x4A, 0x57, 0xFC, 0x17,
+};
+// Scarecrow's Song recording keeps each note's and gap's length in the elapsed counter that
+// playback (0x3293410 above) advances, and adds trunc(step) to it in two more places: while a note
+// or gap is held (0x3296B08) and when the last note is timed (0x32926C8). With FPS Unlock the step
+// sits around 1.0 at 60 fps and below it above 60, so the cut is often 0: lengths come out short or
+// zero, and the song stops after its first note (#1730). Both take whole ticks for that counter
+// from the shared helper instead. Hookshot found the two sites (f_832b6840 and f_832b2690).
+constexpr std::array<u8, 4> SCARECROW_CUT_ORIGINAL{0x08, 0x00, 0x39, 0x1E}; // fcvtzu w8, s0
+constexpr std::array<u8, 4> SCARECROW_RECORD_HOOK{0xEA, 0xBF, 0x26, 0x14};  // b main+0x3C46AB0
+constexpr std::array<u8, 4> SCARECROW_LAST_HOOK{0x04, 0xD1, 0x26, 0x14};    // b main+0x3C46AD8
+// mov x13, x9 ; bl helper ; mov w8, w13 ; b 0x3296B0C
+constexpr std::array<u8, 40> SCARECROW_RECORD_ROUTINE{
+    0xED, 0x3B, 0xBD, 0xA9, 0xEF, 0x43, 0x01, 0xA9, 0xFE, 0x13, 0x00, 0xF9, 0xED, 0x03,
+    0x09, 0xAA, 0xB0, 0xFF, 0xFF, 0x97, 0xE8, 0x03, 0x0D, 0x2A, 0xFE, 0x13, 0x40, 0xF9,
+    0xEF, 0x43, 0x41, 0xA9, 0xED, 0x3B, 0xC3, 0xA8, 0x0E, 0x40, 0xD9, 0x17,
+};
+// add x13, x20, #0x5fc ; bl helper ; mov w8, w13 ; b 0x32926CC
+constexpr std::array<u8, 40> SCARECROW_LAST_ROUTINE{
+    0xED, 0x3B, 0xBD, 0xA9, 0xEF, 0x43, 0x01, 0xA9, 0xFE, 0x13, 0x00, 0xF9, 0x8D, 0xF2,
+    0x17, 0x91, 0xA6, 0xFF, 0xFF, 0x97, 0xE8, 0x03, 0x0D, 0x2A, 0xFE, 0x13, 0x40, 0xF9,
+    0xEF, 0x43, 0x41, 0xA9, 0xED, 0x3B, 0xC3, 0xA8, 0xF4, 0x2E, 0xD9, 0x17,
+};
 constexpr std::array FPS_UNLOCK_RECORDS{
     BuiltinPatchRecord{0x6E6CC4, DYNAMIC_FPS_CALL, DYNAMIC_FPS_ORIGINAL},
     BuiltinPatchRecord{0x3C46200, FPS_UNLOCK_ROUTINE, {}, true},
@@ -354,6 +390,12 @@ constexpr std::array FPS_UNLOCK_RECORDS{
     BuiltinPatchRecord{0x389AC2C, GROUND_VELOCITY_NOP, GROUND_VELOCITY_ORIGINAL_C},
     BuiltinPatchRecord{0x261EB18, TURN_SPEED_HOOK, TURN_SPEED_ORIGINAL},
     BuiltinPatchRecord{0x3C46A40, TURN_SPEED_ROUTINE, {}, true},
+    BuiltinPatchRecord{0x3B5C7C8, MOVIE_FRAMES_HOOK, MOVIE_FRAMES_ORIGINAL},
+    BuiltinPatchRecord{0x3C46A70, MOVIE_FRAMES_ROUTINE, {}, true},
+    BuiltinPatchRecord{0x3296B08, SCARECROW_RECORD_HOOK, SCARECROW_CUT_ORIGINAL},
+    BuiltinPatchRecord{0x3C46AB0, SCARECROW_RECORD_ROUTINE, {}, true},
+    BuiltinPatchRecord{0x32926C8, SCARECROW_LAST_HOOK, SCARECROW_CUT_ORIGINAL},
+    BuiltinPatchRecord{0x3C46AD8, SCARECROW_LAST_ROUTINE, {}, true},
 };
 
 // The render pipeline's settings are mirrored into nodes (main+0x11ac..., per setting: init, then

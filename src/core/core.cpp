@@ -4,6 +4,7 @@
 #include <optional>
 #include <array>
 #include <cstdlib>
+#include <chrono>
 #include <atomic>
 #include <memory>
 #include <new>
@@ -90,6 +91,15 @@ namespace Core {
 std::atomic<u64> g_nx2_present_count{};
 static_assert(std::atomic<u64>::is_always_lock_free);
 std::array<std::atomic<u64>, 4096> g_nx2_present_times_ns{};
+
+void RecordGuestPresent() {
+    const u64 present = g_nx2_present_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const u64 present_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+    g_nx2_present_times_ns[present % g_nx2_present_times_ns.size()].store(
+        present_ns, std::memory_order_relaxed);
+}
 
 FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
                                          const std::string& path) {

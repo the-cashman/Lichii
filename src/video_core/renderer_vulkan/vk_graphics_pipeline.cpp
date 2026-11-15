@@ -1474,7 +1474,11 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         // triangles the draw then reads; both use the descriptor set committed here.
         scheduler.RequestOutsideRenderPassOperationContext();
         if (!IsBuilt()) {
-            scheduler.Record([this](vk::CommandBuffer) { build->Wait(!worker_only_build); });
+            scheduler.Record([this](vk::CommandBuffer) {
+                const VideoCommon::Nx2Profile::Scope scope{
+                    VideoCommon::Nx2Profile::Zone::PipelineWait};
+                build->Wait(!worker_only_build);
+            });
         }
         scheduler.Record([this, descriptor_data, groups = mesh_groups, capacity = mesh_capacity,
                           task_buffers = mesh_task_buffers,
@@ -2200,7 +2204,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
                 : StageFlag(info, MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage)))};
         // Votes, ballots and shuffles span the guest's 32-thread warp. A driver free to pick a
         // narrower subgroup (Intel runs mesh shaders SIMD16) splits the warp and breaks them.
-        const bool uses_warp_ops = info.removed_conditional_barrier || info.uses_subgroup_vote ||
+        const bool uses_warp_ops = info.demoted_conditional_barrier || info.uses_subgroup_vote ||
                                    info.uses_subgroup_invocation_id ||
                                    info.uses_subgroup_shuffles || info.uses_subgroup_mask;
         const bool force_warp_size = !emulated_vertex && uses_warp_ops && device.IsExtSubgroupSizeControlSupported() &&

@@ -140,6 +140,9 @@ private:
     /// Update the available input devices.
     void UpdateInputDevices();
 
+    /// Shows why the selected or mapped controller does nothing, when its driver can tell.
+    void UpdateDeviceWarning();
+
     /// Hides and disables controller settings based on the current controller type.
     void UpdateControllerAvailableButtons();
 
@@ -179,6 +182,7 @@ private:
 
     std::unique_ptr<QTimer> timeout_timer;
     std::unique_ptr<QTimer> poll_timer;
+    std::unique_ptr<QTimer> device_warning_timer;
 
     /// Stores a pair of "Connected Controllers" combobox index and Controller Type enum.
     std::vector<std::pair<int, Core::HID::NpadStyleIndex>> index_controller_type_pairs;

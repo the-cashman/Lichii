@@ -133,6 +133,9 @@ constexpr std::array B10G11R11_UFLOAT_PACK32{
 
 } // namespace Alternatives
 
+// VK_ENABLE_BETA_EXTENSIONS is not defined, so vulkan_core.h leaves this value out.
+constexpr auto PORTABILITY_SUBSET_FEATURES_STYPE = static_cast<VkStructureType>(1000163000);
+
 template <typename T>
 void SetNext(void**& next, T& data) {
     *next = &data;
@@ -722,7 +725,8 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         IsFormatSupported(VK_FORMAT_D24_UNORM_S8_UINT,
                           VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT, FormatType::Optimal);
 
-    supports_conditional_barriers = !is_intel_windows;
+    supports_conditional_barriers =
+        !is_intel_windows && driver_id != VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
 
     CollectPhysicalMemoryInfo();
     CollectToolingInfo();
@@ -1555,6 +1559,11 @@ bool Device::GetSuitability(bool requires_swapchain) {
     FOR_EACH_VK_FEATURE_EXT(FEATURE_EXTENSION);
     FOR_EACH_VK_EXTENSION(EXTENSION);
 
+    // The spec requires enabling VK_KHR_portability_subset on devices that expose it.
+    if (supported_extensions.contains(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME)) {
+        loaded_extensions.insert(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
+    }
+
     extensions.depth_stencil_resolve =
         extensions.depth_stencil_resolve &&
         (instance_version >= VK_API_VERSION_1_2 || extensions.create_renderpass2);
@@ -1686,6 +1695,12 @@ bool Device::GetSuitability(bool requires_swapchain) {
     if (has_device_fault_extension) {
         device_fault_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT;
         SetNext(next, device_fault_features);
+    }
+
+    // The features the driver reports are enabled through the same chain at device creation.
+    if (loaded_extensions.contains(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME)) {
+        portability_subset_features.sType = PORTABILITY_SUBSET_FEATURES_STYPE;
+        SetNext(next, portability_subset_features);
     }
 
     // Perform the feature test.
@@ -2110,6 +2125,18 @@ void Device::RemoveUnsuitableExtensions() {
     // the compute fallback a device without it uses.
     if (extensions.mesh_shader && std::getenv("EDEN_NX2_FORCE_MESH_FALLBACK") != nullptr) {
         LOG_WARNING(Render_Vulkan, "EDEN_NX2_FORCE_MESH_FALLBACK: VK_EXT_mesh_shader disabled");
+        extensions.mesh_shader = false;
+    }
+    // RADV on RDNA2 (GFX10.3) faults on native task/mesh draws: TCP read faults at one fixed
+    // address per machine, then a ring timeout and often a MODE1 reset (#489, #1275, #1699), while
+    // the compute fallback ran for an hour. RADV exposes mesh shaders from GFX10.3 on and reports
+    // accelerated 16-bit dot products only before GFX11, which singles out GFX10.3 here.
+    const bool radv_rdna2_mesh =
+        extensions.mesh_shader && properties.driver.driverID == VK_DRIVER_ID_MESA_RADV &&
+        properties.integer_dot_product.integerDotProduct16BitUnsignedAccelerated;
+    if (radv_rdna2_mesh) {
+        LOG_INFO(Render_Vulkan, "RADV on RDNA2: task/mesh draws use the compute fallback, because "
+                                "native mesh draws fault the GPU there");
         extensions.mesh_shader = false;
     }
     RemoveExtensionFeatureIfUnsuitable(extensions.mesh_shader, features.mesh_shader,

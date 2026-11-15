@@ -80,6 +80,10 @@ public:
         return title_changed;
     }
 
+signals:
+    /// The custom artwork was saved or removed.
+    void CustomArtworkChanged(u64 program_id);
+
 private:
     void done(int result) override;
     void changeEvent(QEvent* event) override;

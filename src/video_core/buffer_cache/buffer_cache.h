@@ -1545,9 +1545,12 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
         gpu_modified_serial.fetch_add(1, std::memory_order_relaxed);
         if (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
             nx2_gpu_ranges_unmarked = true;
-        } else {
-            Nx2NoteListWrite(buffer_b, pair.first, pair.second);
         }
+    }
+    // The copy rewrites all of the destination, not only the bytes that came from GPU-written
+    // source data: a command list page's copy taken before it no longer holds the page.
+    if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+        Nx2NoteListWrite(buffer_b, *cpu_dest_address, amount);
     }
     const auto& copy = copies[0];
     src_buffer.MarkUsage(copy.src_offset, copy.size);
@@ -1587,11 +1590,17 @@ bool BufferCache<P>::DMAClear(GPUVAddr dst_address, u64 amount, u32 value) {
 
     const BufferId buffer = FindBuffer(*cpu_dst_address, static_cast<u32>(size), false);
     Buffer& dest_buffer = slot_buffers[buffer];
+    // As DMACopy: the CPU's bytes on these pages reach the buffer first. A command list page is
+    // copied from the buffer whole after the clear (Nx2CopyListPages).
+    SynchronizeBuffer(dest_buffer, *cpu_dst_address, static_cast<u32>(size));
     const u32 offset = dest_buffer.Offset(*cpu_dst_address);
     InvalidateBankShadows(*cpu_dst_address, size);
     InvalidateHotShadows(*cpu_dst_address, size);
     runtime.ClearBuffer(dest_buffer, offset, size, value);
     dest_buffer.MarkUsage(offset, size);
+    if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+        Nx2NoteListWrite(buffer, *cpu_dst_address, size);
+    }
     return true;
 }
 

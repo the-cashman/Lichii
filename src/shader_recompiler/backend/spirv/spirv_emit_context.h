@@ -190,6 +190,10 @@ public:
     /// Barrier semantics. Under the Vulkan memory model a barrier also makes the writes before it
     /// available and the writes it orders visible.
     [[nodiscard]] Id BarrierSemantics(spv::MemorySemanticsMask semantics);
+    /// Workgroup memory semantics of a guest barrier.
+    [[nodiscard]] Id GuestBarrierSemantics();
+    /// The shared word ConditionalBarrierPass counts branch conditions in.
+    [[nodiscard]] Id BarrierVoteWord(Id offset);
 
     [[nodiscard]] Id BitOffset8(const IR::Value& offset);
     [[nodiscard]] Id BitOffset16(const IR::Value& offset);
@@ -357,6 +361,8 @@ public:
     Id shared_store_u8_func{};
     Id shared_store_u16_func{};
     Id increment_cas_shared{};
+    Id barrier_vote_func{};
+    Id voted_barrier_func{};
     Id increment_cas_ssbo{};
     Id decrement_cas_shared{};
     Id decrement_cas_ssbo{};
@@ -489,6 +495,7 @@ private:
     void DefineLocalMemory(const IR::Program& program);
     void DefineSharedMemory(const IR::Program& program);
     void DefineSharedMemoryFunctions(const IR::Program& program);
+    void DefineBarrierVoteFunctions(const IR::Program& program);
     void DefineConstantBuffers(const Info& info, u32& binding);
     void DefineConstantBufferIndirectFunctions(const Info& info);
     void DefineStorageBuffers(const Info& info, u32& binding);

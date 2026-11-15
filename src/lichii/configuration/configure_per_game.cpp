@@ -933,6 +933,7 @@ bool ConfigurePerGame::SaveCustomMetadata(bool show_error) {
         has_custom_icon = false;
         UpdateRemoveIconButton();
         UISettings::values.is_game_list_reload_pending.exchange(true);
+        emit CustomArtworkChanged(title_id);
     }
     if (nup_icon_modified) {
         // Saved as the game's custom artwork: rewriting the whole archive to embed it took a full
@@ -952,6 +953,7 @@ bool ConfigurePerGame::SaveCustomMetadata(bool show_error) {
         has_custom_icon = true;
         UpdateRemoveIconButton();
         UISettings::values.is_game_list_reload_pending.exchange(true);
+        emit CustomArtworkChanged(title_id);
     }
     const std::string new_title = ui->display_name->text().simplified().toStdString();
     if (title_id == 0 || new_title == initial_title) {

@@ -118,11 +118,12 @@ class RenderdocAPI;
 
 namespace Core {
 
-/// Frames the guest has presented (Switch 2 vi2 present calls); input replay is locked to it.
+/// Guest frames (Switch 1 game composites or Switch 2 vi2 presents); input replay is locked to it.
 extern std::atomic<u64> g_nx2_present_count;
 /// Steady-clock time of each guest present, by present count, for the debug server's frame_times
 /// tool and bug reports.
 extern std::array<std::atomic<u64>, 4096> g_nx2_present_times_ns;
+void RecordGuestPresent();
 
 class CpuManager;
 class Debugger;

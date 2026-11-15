@@ -431,6 +431,15 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, mkw_30fps, tr("Mario Kart World: 30 FPS mode"),
            tr("Forces the game to use its native 30 FPS mode at normal game speed. "
               "Takes effect after restarting the game."));
+    INSERT(Settings, mkw_60fps, tr("Mario Kart World: 60 FPS mode"),
+           tr("Forces the game's 60 FPS mode everywhere, not only in cutscenes. The game "
+              "advances one 60 FPS step per frame, so it never runs fast. Takes effect after "
+              "restarting the game and takes precedence over the 30 FPS mode."));
+    INSERT(Settings, mkw_60fps_fallback, tr("Mario Kart World: drop to 30 FPS when slow"),
+           tr("Only applies with the 60 FPS mode. When your PC can't hold 60 FPS, the game "
+              "switches to its 30 FPS mode and keeps normal speed, then tries 60 again every few "
+              "seconds. Turn it off to stay at 60 FPS, where slow frames play in slow motion. "
+              "Takes effect after restarting the game."));
     INSERT(Settings, mkw_dynamic_fps, tr("Mario Kart World: dynamic FPS (experimental)"),
            tr("Lets the game adjust between 30 and 60 FPS using whole-frame timing to maintain "
               "normal game speed. Takes effect after restarting the game and takes precedence over "

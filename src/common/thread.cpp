@@ -1319,6 +1319,17 @@ bool WaitForFlag(const std::atomic<u32>& flag, std::chrono::steady_clock::time_p
     return WaitForFlagImpl(flag, deadline);
 }
 
+bool Event::SpinFor(const std::chrono::nanoseconds time) {
+    const auto deadline = std::chrono::steady_clock::now() + time;
+    while (WaitForFlag(is_set, deadline)) {
+        bool expected = true;
+        if (is_set.compare_exchange_strong(expected, false, std::memory_order_acquire)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 #ifdef _WIN32
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002

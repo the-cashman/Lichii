@@ -340,7 +340,10 @@ or setting, so it works with whatever the owner has mapped and leaves nothing be
 goes to player 1, or to the handheld controller when player 1 is not connected; the result names
 which. When no injector is installed, each getter costs one atomic load.
 
-Timing is by presents, not wall time. `RunInput` starts the script at `g_nx2_present_count + 1`,
+Timing is by presents, not wall time. Switch 1 advances the counter when a newly acquired,
+visible game buffer is composed; overlay-only updates and cached-buffer repeats do not count.
+Switch 2 advances it on vi2 present calls. Generated display frames do not count.
+`RunInput` starts the script at `g_nx2_present_count + 1`,
 the next present. The injector looks up the active step from the present count at every read
 (`InputAt`), so a step changes at the first npad update after its present: the npad updates
 every 1 ms (`src/hid_core/resource_manager.cpp:48`). A slow frame stretches the step in time but

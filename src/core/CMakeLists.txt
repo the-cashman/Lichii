@@ -20,6 +20,7 @@ add_library(core STATIC
     game_settings.h
     core_timing.cpp
     core_timing.h
+    host_wait_margin.h
     cpu_manager.cpp
     cpu_manager.h
     launch_params.cpp
@@ -34,6 +35,8 @@ add_library(core STATIC
     crypto/key_manager.h
     crypto/ncz_decompressor.cpp
     crypto/ncz_decompressor.h
+    crypto/ncz_cache.cpp
+    crypto/ncz_cache.h
     crypto/partition_data_manager.cpp
     crypto/partition_data_manager.h
     crypto/xts_encryption_layer.cpp

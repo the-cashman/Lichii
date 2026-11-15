@@ -726,6 +726,9 @@ struct Values {
 
     // Mario Kart World: select a fixed or dynamic in-game frame-rate mode (loader/nso.cpp).
     SwitchableSetting<bool> mkw_30fps{linkage, false, "mkw_30fps", Category::RendererAdvanced};
+    SwitchableSetting<bool> mkw_60fps{linkage, false, "mkw_60fps", Category::RendererAdvanced};
+    SwitchableSetting<bool> mkw_60fps_fallback{linkage, true, "mkw_60fps_fallback",
+                                               Category::RendererAdvanced};
     SwitchableSetting<bool> mkw_dynamic_fps{linkage, false, "mkw_dynamic_fps",
                                             Category::RendererAdvanced};
 
@@ -950,6 +953,10 @@ struct Values {
                                            "enable_dualsense_haptics", Category::Controls};
     Setting<bool> rumble_frequency_mapping{linkage, false, "rumble_frequency_mapping",
                                            Category::Controls};
+    // Percent of each side's light rumble also played on the trigger motors, where a controller
+    // has them; 0 is off
+    Setting<u8, true> trigger_rumble_strength{linkage, 0, 0, 100, "trigger_rumble_strength",
+                                              Category::Controls};
 
     // RenHDrum HD Rumble (Switch Pro Controller / Joy-Con) and DualSense haptics. Defaults are
     // Ryuhdr 0.2.6's recommended mode. Read by the SDL driver on every vibration, so a change in
