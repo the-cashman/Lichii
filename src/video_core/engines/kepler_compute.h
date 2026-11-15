@@ -281,14 +281,7 @@ private:
     FrontState& Front(VideoCommon::GpuSplit& split);
     void ReleaseFront();
     void FrontApply(FrontState& state, u32 method, u32 argument);
-    /// `last_call`: the method's last word (the back's is_last_call; macro writes are their own).
-    void FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
-                         bool last_call);
-    void FrontNoteUpload(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
-                         bool last_call);
     void FrontNoteReport(VideoCommon::GpuSplit& split, const FrontState& state, u32 control);
-    void FrontInlineQmd(VideoCommon::GpuSplit& split, const FrontState& state, u32 last_word);
-    void FrontQmdCheck(VideoCommon::GpuSplit& split);
     MacroEngine& FrontMacroEngine(FrontState& state);
     std::span<u32> FrontMacroPositions(FrontState& state);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);

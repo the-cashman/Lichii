@@ -102,7 +102,6 @@ add_library(video_core STATIC
     macro_turing.h
     fence_manager.h
     frame_gen_choice.h
-    front_qmd.h
     gpu.cpp
     gpu.h
     gpu_timestamp.h
@@ -147,7 +146,6 @@ add_library(video_core STATIC
     nx2_async_readback.h
     nx2_backx.h
     nx2_download_trace.h
-    nx2_drain_check.h
     pending_maps.h
     present.h
     pte_kind.h

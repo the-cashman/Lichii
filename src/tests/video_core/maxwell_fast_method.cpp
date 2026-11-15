@@ -8,7 +8,6 @@
 #include <exception>
 #include <functional>
 #include <memory>
-#include <optional>
 #include <random>
 #include <span>
 #include <thread>
@@ -19,26 +18,18 @@
 
 #include "common/page_table.h"
 #include "common/scope_exit.h"
-#include "common/settings.h"
 #include "core/core.h"
 #include "core/device_memory.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/memory.h"
 #include "tests/core/system_test_context.h"
-#include "video_core/control/channel_state.h"
 #include "video_core/dirty_flags.h"
-#include "video_core/dma_pusher.h"
-#include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
-#include "video_core/macro.h"
 #include "video_core/memory_manager.h"
-#include "video_core/native_qmd.h"
-#include "video_core/nx2.h"
 #include "video_core/nx2_async_readback.h"
-#include "video_core/nx2_drain_check.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_null/null_rasterizer.h"
@@ -61,7 +52,6 @@ struct GpuSplitTestAccess {
 
     static void Start(GpuSplit& split, Core::System& system) {
         Initialize(split, system);
-        ++split.starts;
         split.active = true;
         split.back_thread = std::jthread([&split](std::stop_token stop) { split.BackLoop(stop); });
     }
@@ -101,7 +91,6 @@ struct GpuSplitTestAccess {
 
     static u64 Execute(GpuSplit& split, u64 position, u64 available) {
         const size_t index = position & GpuSplit::RingMask;
-        split.back_entry_start = position;
         const size_t size = split.Execute(
             &split.ring[index], std::min<u64>(available - position, GpuSplit::RingWords - index));
         return position + (size != 0 ? size : GpuSplit::RingWords - index);
@@ -126,23 +115,6 @@ struct GpuSplitTestAccess {
     static bool ShareWriteSlot(DAddr a, DAddr b) {
         return GpuSplit::WriteSlot(a >> GpuSplit::WriteGranuleBits) ==
                GpuSplit::WriteSlot(b >> GpuSplit::WriteGranuleBits);
-    }
-
-    /// The front runs the engines' macros, as with EDEN_NX2_SPLIT=2.
-    static void SetFrontMacros(GpuSplit& split) {
-        split.front_macros = true;
-    }
-
-    /// Runs what was sent and not run yet on the calling thread, as the back does.
-    static void RunBack(GpuSplit& split) {
-        GpuSplit::on_back_thread = true;
-        u64 position = split.consumed.load();
-        while (position < split.write_position) {
-            position = Execute(split, position, split.write_position);
-        }
-        split.SealFencedEntries(position);
-        split.consumed.store(position);
-        GpuSplit::on_back_thread = false;
     }
 };
 
@@ -1067,178 +1039,6 @@ TEST_CASE("Split remembers the semaphore writes its back has not run yet",
     REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x2000).has_value());
 }
 
-TEST_CASE("Split counts a fenced semaphore write in memory once its fence ran, not before",
-          "[video_core][gpu_split_dependencies]") {
-    using Access = VideoCommon::GpuSplitTestAccess;
-    using Landing = VideoCommon::GpuSplit::Landing;
-    using Hold = VideoCommon::GpuSplit::FencedHold;
-    Fixture f;
-    f.system.Initialize();
-    VideoCommon::GpuSplit split;
-    Access::Start(split, f.system);
-    SCOPE_EXIT {
-        split.Stop();
-    };
-    // A fence-flagged report lands once the fence operation that writes it ran, which holds the
-    // back's entry until then (FenceManager::SignalFence).
-    split.Defer([] {});
-    Hold report;
-    Hold mirror;
-    split.Defer([&] {
-        report = split.TrackFencedWrite();
-        mirror = split.TrackFencedWrite();
-    });
-    split.NoteSemaphoreWrite(0x1000, 21, true, false, Landing::Fenced);
-    split.Drain(VideoCommon::DrainSite::Other);
-    REQUIRE(static_cast<bool>(report));
-    REQUIRE(split.Starts() > 0);
-    auto queued = split.QueuedSemaphoreWriteAt(0x1000);
-    REQUIRE(queued.has_value());
-    REQUIRE(queued->fenced);
-    REQUIRE(queued->payload == 21);
-    REQUIRE(split.Ran(queued->position));
-    // A write that lands as the back runs it, sent before that fence ran: the word holds either.
-    split.Defer([] {});
-    split.NoteSemaphoreWrite(0x1000, 22, true);
-    split.Drain(VideoCommon::DrainSite::Other);
-    queued = split.QueuedSemaphoreWriteAt(0x1000);
-    REQUIRE(queued.has_value());
-    REQUIRE(queued->fenced);
-    REQUIRE_FALSE(queued->known);
-    // Only once every hold on the entry was released.
-    report.Release();
-    REQUIRE(split.QueuedSemaphoreWriteAt(0x1000).has_value());
-    mirror.Release();
-    REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x1000).has_value());
-    // Once it landed, a write after it holds the word once the back ran it.
-    split.Defer([] {});
-    split.NoteSemaphoreWrite(0x1000, 23, true);
-    queued = split.QueuedSemaphoreWriteAt(0x1000);
-    REQUIRE(queued.has_value());
-    REQUIRE_FALSE(queued->fenced);
-    REQUIRE(queued->payload == 23);
-    split.Drain(VideoCommon::DrainSite::Other);
-    REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x1000).has_value());
-    // A later entry cannot retire an earlier one whose operation has yet to run.
-    Hold first;
-    Hold later;
-    split.Defer([&] { first = split.TrackFencedWrite(); });
-    split.NoteSemaphoreWrite(0x2000, 24, true, false, Landing::Fenced);
-    split.Defer([&] { later = split.TrackFencedWrite(); });
-    split.NoteSemaphoreWrite(0x2004, 25, true, false, Landing::Fenced);
-    split.Drain(VideoCommon::DrainSite::Other);
-    REQUIRE(split.QueuedSemaphoreWriteAt(0x2000).has_value());
-    REQUIRE(static_cast<bool>(later));
-    later.Release();
-    REQUIRE(split.QueuedSemaphoreWriteAt(0x2000).has_value());
-    REQUIRE(split.QueuedSemaphoreWriteAt(0x2004).has_value());
-    first.Release();
-    REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x2000).has_value());
-    REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x2004).has_value());
-}
-
-TEST_CASE("Split keeps a mirror pending until its own fenced report completes",
-          "[video_core][gpu_split_dependencies]") {
-    using Access = VideoCommon::GpuSplitTestAccess;
-    using Landing = VideoCommon::GpuSplit::Landing;
-    Fixture f;
-    f.system.Initialize();
-    VideoCommon::GpuSplit split;
-    Access::Start(split, f.system);
-    SCOPE_EXIT {
-        split.Stop();
-    };
-    // WriteLong sends the report and the mirror's as two fenced operations in one entry.
-    std::array<VideoCommon::GpuSplit::FencedHold, 2> fences;
-    split.Defer([&] {
-        for (auto& fence : fences) {
-            fence = split.TrackFencedWrite();
-        }
-    });
-    split.NoteSemaphoreWrite(0x1000, 10, true, false, Landing::Fenced);
-    split.NoteSemaphoreWrite(0x2000, 10, true, false, Landing::Fenced);
-    split.Drain(VideoCommon::DrainSite::Other);
-    REQUIRE(split.QueuedSemaphoreWriteAt(0x1000).has_value());
-    REQUIRE(split.QueuedSemaphoreWriteAt(0x2000).has_value());
-    fences[0].Release();
-    REQUIRE(split.QueuedSemaphoreWriteAt(0x2000).has_value());
-    fences[1].Release();
-    REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x1000).has_value());
-    REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x2000).has_value());
-}
-
-TEST_CASE("Split seals fenced reports and discards stale completions across starts",
-          "[video_core][gpu_split_dependencies]") {
-    using Access = VideoCommon::GpuSplitTestAccess;
-    using Landing = VideoCommon::GpuSplit::Landing;
-    Fixture f;
-    f.system.Initialize();
-    VideoCommon::GpuSplit split;
-    VideoCommon::GpuSplit::FencedHold old_completion;
-    VideoCommon::GpuSplit::FencedHold completion;
-    std::atomic<bool> first_done{};
-    std::atomic<bool> send_second{};
-    Access::Start(split, f.system);
-    SCOPE_EXIT {
-        split.Stop();
-    };
-    SCOPE_EXIT {
-        send_second = true;
-    };
-    REQUIRE_FALSE(static_cast<bool>(split.TrackFencedWrite()));
-    split.Defer([&] {
-        // Its first operation runs before Execute sends its second report.
-        auto first = split.TrackFencedWrite();
-        first.Release();
-        first_done = true;
-        while (!send_second.load()) {
-            std::this_thread::yield();
-        }
-        completion = split.TrackFencedWrite();
-    });
-    split.NoteSemaphoreWrite(0x3000, 1, true, false, Landing::Fenced);
-    split.NoteSemaphoreWrite(0x3004, 2, true, false, Landing::Fenced);
-    split.Publish();
-    while (!first_done.load()) {
-        std::this_thread::yield();
-    }
-    REQUIRE(split.QueuedSemaphoreWriteAt(0x3004).has_value());
-    send_second = true;
-    split.Drain(VideoCommon::DrainSite::Other);
-    REQUIRE(split.QueuedSemaphoreWriteAt(0x3000).has_value());
-    REQUIRE(split.QueuedSemaphoreWriteAt(0x3004).has_value());
-    // Dropping an operation releases its hold too: it cannot write later.
-    completion = {};
-    REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x3000).has_value());
-    REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x3004).has_value());
-    // A query dropped before queuing an operation still lands when Execute returns.
-    split.Defer([&] { auto dropped = split.TrackFencedWrite(); });
-    split.NoteSemaphoreWrite(0x3010, 3, true, false, Landing::Fenced);
-    split.Drain(VideoCommon::DrainSite::Other);
-    REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x3010).has_value());
-    split.Defer([&] { old_completion = split.TrackFencedWrite(); });
-    split.NoteSemaphoreWrite(0x3020, 4, true, false, Landing::Fenced);
-    split.Drain(VideoCommon::DrainSite::Other);
-    REQUIRE(split.QueuedSemaphoreWriteAt(0x3020).has_value());
-    split.Stop();
-    REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x3020).has_value());
-    const u32 old_start = split.Starts();
-    Access::Start(split, f.system);
-    REQUIRE(split.Starts() > old_start);
-    split.Defer([&] { completion = split.TrackFencedWrite(); });
-    split.NoteSemaphoreWrite(0x3020, 5, true, false, Landing::Fenced);
-    split.Drain(VideoCommon::DrainSite::Other);
-    old_completion.Release();
-    REQUIRE(split.QueuedSemaphoreWriteAt(0x3020).has_value());
-    completion.Release();
-    REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x3020).has_value());
-    // Stop also forgets writes whose entry was never published or executed.
-    split.Defer([] {});
-    split.NoteSemaphoreWrite(0x3030, 6, true, false, Landing::Fenced);
-    split.Stop();
-    REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x3030).has_value());
-}
-
 TEST_CASE("Split publishes to a back that waits for work after a few words",
           "[video_core][gpu_split_dependencies]") {
     using Access = VideoCommon::GpuSplitTestAccess;
@@ -1814,469 +1614,14 @@ TEST_CASE("Split macro DMA reads wait only for the queued work that can write th
     CHECK(engine.regs.reg_array[copy] == 0x88888888);
 }
 
-namespace {
-
-// Two pages of guest memory at gpu_address (device_address) for the tests below.
-struct MappedPages {
-    static constexpr VAddr cpu_address = 0x4000;
-    static constexpr DAddr device_address = 0x10000;
-    static constexpr GPUVAddr gpu_address = 0x100000;
-
-    explicit MappedPages(Fixture& f) : fixture{f}, process{f.system.Kernel()} {
-        auto& table = process.GetPageTable().GetImpl();
-        table.Resize(20, 12);
-        backing = f.physical.GetPointerFromRaw<u8>(0x10000);
-        for (u64 page = 0; page < 2; ++page) {
-            const VAddr address = cpu_address + page * 0x1000;
-            table.entries.GetAndFault(address >> 12)
-                .Store(false, Common::PageType::Memory, 1,
-                       reinterpret_cast<uintptr_t>(backing + page * 0x1000) - address);
-        }
-        process.GetMemory().SetCurrentPageTable(process);
-        asid = f.device_memory.RegisterProcess(&process.GetMemory());
-        f.device_memory.BindInterface(&f.rasterizer);
-        f.device_memory.Map(device_address, cpu_address, 0x2000, asid);
-        f.memory.BindRasterizer(&f.rasterizer);
-        f.memory.Map(gpu_address, device_address, 0x2000, Tegra::PTEKind::PITCH, false);
-        std::memset(backing, 0, 0x2000);
-    }
-    ~MappedPages() {
-        fixture.device_memory.Unmap(device_address, 0x2000);
-        fixture.device_memory.UnregisterProcess(asid);
-        fixture.system.Kernel().UnregisterKernelObject(&process);
-    }
-    MappedPages(const MappedPages&) = delete;
-    MappedPages& operator=(const MappedPages&) = delete;
-
-    Fixture& fixture;
-    Kernel::KProcess process;
-    u8* backing{};
-    Core::Asid asid{};
-};
-
-/// Writes fence-flagged reports only once the test runs their fence, as FenceManager::SignalFence
-/// does: each holds the split back's entry that sent it until then (GpuSplit::TrackFencedWrite).
-/// Other reports and fence operations land at once.
-class FencedReports final : public VideoCore::RasterizerInterface {
-public:
-    explicit FencedReports(Tegra::MemoryManager& memory_) : memory{memory_} {}
-
-    void Query(GPUVAddr address, VideoCommon::QueryType, VideoCommon::QueryPropertiesFlags flags,
-               u32 payload, u32) override {
-        if (False(flags & VideoCommon::QueryPropertiesFlags::IsAFence)) {
-            memory.Write<u32>(address, payload);
-            return;
-        }
-        reports.push_back({address, payload, VideoCommon::GpuSplit::Get().TrackFencedWrite()});
-    }
-    void SignalFence(std::function<void()>&& func) override {
-        func();
-    }
-    /// The fence after the reports passed.
-    void RunFence() {
-        for (Report& report : reports) {
-            memory.Write<u32>(report.address, report.payload);
-            report.hold.Release();
-        }
-        reports.clear();
-    }
-
-    void Draw(bool, u32) override {}
-    void DrawTexture() override {}
-    void Clear(u32) override {}
-    void DispatchCompute() override {}
-    void ResetCounter(VideoCommon::QueryType) override {}
-    void BindGraphicsUniformBuffer(size_t, u32, GPUVAddr, u32) override {}
-    void DisableGraphicsUniformBuffer(size_t, u32) override {}
-    void SyncOperation(std::function<void()>&& func) override {
-        func();
-    }
-    void SignalSyncPoint(u32) override {}
-    void SignalReference() override {}
-    void ReleaseFences(bool) override {}
-    void FlushAll() override {}
-    void FlushRegion(DAddr, u64, VideoCommon::CacheType) override {}
-    bool MustFlushRegion(DAddr, u64, VideoCommon::CacheType) override {
-        return false;
-    }
-    VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override {
-        return {addr, addr + size, false};
-    }
-    void InvalidateRegion(DAddr, u64, VideoCommon::CacheType) override {}
-    void OnCacheInvalidation(DAddr, u64) override {}
-    bool OnCPUWrite(DAddr, u64) override {
-        return false;
-    }
-    void InvalidateGPUCache() override {}
-    void UnmapMemory(DAddr, u64) override {}
-    void ModifyGPUMemory(size_t, GPUVAddr, u64) override {}
-    void FlushAndInvalidateRegion(DAddr, u64, VideoCommon::CacheType) override {}
-    void WaitForIdle() override {}
-    void FragmentBarrier() override {}
-    void TiledCacheBarrier() override {}
-    void FlushCommands() override {}
-    void TickFrame() override {}
-    Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() override {
-        std::terminate();
-    }
-    void AccelerateInlineToMemory(GPUVAddr, size_t, std::span<const u8>) override {}
-
-    struct Report {
-        GPUVAddr address;
-        u32 payload;
-        VideoCommon::GpuSplit::FencedHold hold;
-    };
-    Tegra::MemoryManager& memory;
-    std::vector<Report> reports;
-};
-
-} // Anonymous namespace
-
-TEST_CASE("Split tells guest memory writes from what only the GPU caches hold",
-          "[video_core][gpu_split_dependencies]") {
-    using Access = VideoCommon::GpuSplitTestAccess;
-    using Writes = VideoCommon::GpuSplit::Writes;
-    Fixture f;
-    f.system.Initialize();
-    MappedPages pages{f};
-    constexpr GPUVAddr word = MappedPages::gpu_address + 0x40;
-    constexpr GPUVAddr other = MappedPages::gpu_address + 0x140;
-    REQUIRE_FALSE(Access::ShareWriteSlot(MappedPages::device_address + 0x40,
-                                         MappedPages::device_address + 0x140));
-    VideoCommon::GpuSplit split;
-    Access::Initialize(split, f.system);
-    split.Defer([] {}, 0, Writes::Noted);
-    split.NoteWrite(f.memory, word, 4);
-    const u64 noted = Access::End(split);
-    // Shader stores: a read of the caches waits for them, a read of guest memory only for the
-    // writes noted there.
-    split.Defer([] {}, 0, Writes::Caches);
-    CHECK(Access::WritesTarget(split, f.memory, other, 4) == Access::End(split));
-    CHECK(split.MemoryWritesTarget(f.memory, word, 4) == noted);
-    CHECK(split.MemoryWritesTarget(f.memory, other, 4) == 0);
-    CHECK(split.LastUnplacedWrite() == 0);
-    // Placed late at an earlier position, a write never lowers what its granule waits for.
-    split.Defer([] {}, 0, Writes::Noted);
-    split.NoteWrite(f.memory, word, 4);
-    const u64 rewritten = Access::End(split);
-    split.NoteWriteAt(f.memory, word, 4, noted);
-    CHECK(split.MemoryWritesTarget(f.memory, word, 4) == rewritten);
-    // Work nobody noted the writes of writes guest memory anywhere.
-    split.Defer([] {});
-    CHECK(split.LastUnplacedWrite() == Access::End(split));
-    CHECK(split.MemoryWritesTarget(f.memory, other, 4) == Access::End(split));
-    // A maximum's lower bound.
-    split.NoteSemaphoreWrite(MappedPages::device_address + 0x40, 5, true, true);
-    const auto queued = split.QueuedSemaphoreWriteAt(MappedPages::device_address + 0x40);
-    REQUIRE(queued.has_value());
-    CHECK(queued->known);
-    CHECK(queued->at_least);
-    CHECK(queued->payload == 5);
-}
-
-TEST_CASE("Split front values the releases of the QMD launches it sends as the back runs them",
-          "[video_core][gpu_split_dependencies]") {
-    using Access = VideoCommon::GpuSplitTestAccess;
-    using Descriptor = Tegra::NativeQmdScheduler::Descriptor;
-    using Writes = VideoCommon::GpuSplit::Writes;
-    constexpr u32 Enable = 1U << 23;
-    constexpr u32 OneWord = 1U << 30;
-    constexpr u32 Maximum = 1U << 19;
-    constexpr u32 Reduction = 1U << 26; // ADD
-    constexpr GPUVAddr qmds = MappedPages::gpu_address;
-    constexpr GPUVAddr words = MappedPages::gpu_address + 0x1000;
-    constexpr DAddr word_devices = MappedPages::device_address + 0x1000;
-    // On the heap: the fixture, the engine and the split are large (Windows gives a thread 1 MiB
-    // of stack).
-    const auto fixture = std::make_unique<Fixture>();
-    Fixture& f = *fixture;
-    f.system.Initialize();
-    Tegra::Nx2ClearGpuWrittenPages();
-    MappedPages pages{f};
-    const auto compute_owner = std::make_unique<Tegra::Engines::KeplerCompute>(f.memory);
-    Tegra::Engines::KeplerCompute& compute = *compute_owner;
-    Tegra::MacroEngine macros{true};
-    std::array<u32, 128> positions{};
-    compute.SetNativeMacroMode(&macros, positions);
-    compute.BindRasterizer(&f.rasterizer);
-    const auto split_owner = std::make_unique<VideoCommon::GpuSplit>();
-    VideoCommon::GpuSplit& split = *split_owner;
-    Access::Initialize(split, f.system);
-    // The back compares what the front valued with what it ran (EDEN_NX2_DRAIN_CHECK).
-    namespace DrainCheck = VideoCommon::Nx2DrainCheck;
-    DrainCheck::g_enabled = true;
-    const u64 compared = DrainCheck::g_compared;
-    const u64 differences = DrainCheck::g_differences;
-    SCOPE_EXIT {
-        DrainCheck::g_enabled = false;
-    };
-    const auto send = [&](u32 method, u32 argument) {
-        compute.FrontCallMethod(f.system, split, method, argument, true, nullptr);
-    };
-    const auto make_qmd = [](u32 dependencies, u32 word_offset, u32 flags, u32 payload) {
-        Descriptor qmd{};
-        qmd[18] = 0x30;
-        qmd[4] = dependencies << 14;
-        qmd[24] = static_cast<u32>(words) + word_offset;
-        qmd[25] = flags;
-        qmd[26] = payload;
-        return qmd;
-    };
-    // An inline QMD, in memory already (the null rasterizer's inline writes write nothing): its
-    // words but the last, then, after the back ran them when `caught_up`, the last.
-    const auto inline_qmd = [&](GPUVAddr address, const Descriptor& qmd, bool caught_up) {
-        std::memcpy(pages.backing + (address - MappedPages::gpu_address), qmd.data(), sizeof(qmd));
-        send(0xc6, static_cast<u32>((address >> 8) >> 32));
-        send(0xc7, static_cast<u32>(address >> 8));
-        for (u32 i = 0; i < 63; ++i) {
-            send(0xc8 + i, qmd[i]);
-        }
-        if (caught_up) {
-            Access::RunBack(split);
-        }
-        send(0x107, qmd[63]);
-    };
-    const auto word = [&](u32 offset) { return f.memory.Read<u32>(words + offset); };
-    const auto queued = [&](u32 offset) {
-        return split.QueuedSemaphoreWriteAt(word_devices + offset);
-    };
-
-    // A QMD that runs at once: its release is the front's once its table is the back's, which it
-    // takes over when the back has run everything sent.
-    inline_qmd(qmds, make_qmd(0, 0, Enable | OneWord, 5), true);
-    auto release = queued(0);
-    REQUIRE(release.has_value());
-    CHECK(release->known);
-    CHECK_FALSE(release->at_least);
-    CHECK(release->payload == 5);
-    CHECK(release->fenced);
-    Access::RunBack(split);
-
-    // One that waits for a dependency runs at the decrement, a maximum with the word in memory:
-    // at least, as memory may hold an older value than the back finds.
-    f.memory.Write<u32>(words + 0x10, 9);
-    inline_qmd(qmds + 0x100, make_qmd(1, 0x10, Enable | OneWord | Maximum, 7), false);
-    CHECK_FALSE(queued(0x10).has_value());
-    send(0xad, static_cast<u32>((qmds + 0x100) >> 8));
-    Access::RunBack(split);
-    send(0xb0, 7);
-    release = queued(0x10);
-    REQUIRE(release.has_value());
-    CHECK(release->known);
-    CHECK(release->at_least);
-    CHECK(release->payload == 9);
-    Access::RunBack(split);
-    CHECK(word(0x10) == 9);
-
-    // Over a value the front can't tell, a maximum holds its payload at least.
-    split.Defer([] {}, 0, Writes::Noted);
-    split.NoteSemaphoreWrite(word_devices + 0x10, 0, false);
-    inline_qmd(qmds + 0x200, make_qmd(0, 0x10, Enable | OneWord | Maximum, 12), false);
-    release = queued(0x10);
-    REQUIRE(release.has_value());
-    CHECK(release->known);
-    CHECK(release->at_least);
-    CHECK(release->payload == 12);
-    Access::RunBack(split);
-    CHECK(word(0x10) == 12);
-
-    // A reduction over the release before it, still queued: an unsigned maximum keeps the lower
-    // bound, an ADD (which wraps) does not.
-    constexpr u32 ReduceMax = 2U << 20;
-    inline_qmd(qmds + 0x300, make_qmd(0, 0x20, Enable | OneWord | Maximum, 4), false);
-    inline_qmd(qmds + 0x400, make_qmd(0, 0x20, Enable | OneWord | Reduction | ReduceMax, 6), false);
-    release = queued(0x20);
-    REQUIRE(release.has_value());
-    CHECK(release->known);
-    CHECK(release->at_least);
-    CHECK(release->payload == 6);
-    inline_qmd(qmds + 0xb00, make_qmd(0, 0x20, Enable | OneWord | Reduction, 1), false);
-    release = queued(0x20);
-    REQUIRE(release.has_value());
-    CHECK_FALSE(release->known);
-    Access::RunBack(split);
-    CHECK(word(0x20) == 7);
-
-    // Work that may write guest memory anywhere and change the mappings, still queued: the front
-    // can't tell what the back reads yet, the launch waits for it.
-    split.Defer([] {});
-    inline_qmd(qmds + 0x500, make_qmd(0, 0x30, Enable | OneWord, 1), false);
-    CHECK_FALSE(queued(0x30).has_value());
-    Access::RunBack(split);
-    // The back ran everything: the front takes its table over, the waiting launch with it.
-    inline_qmd(qmds + 0x600, make_qmd(0, 0x30, Enable | OneWord, 2), true);
-    release = queued(0x30);
-    REQUIRE(release.has_value());
-    CHECK(release->payload == 2);
-    Access::RunBack(split);
-
-    // A write to a waiting QMD still queued when its decrement is sent: the launch waits, not
-    // valued then.
-    inline_qmd(qmds + 0x700, make_qmd(1, 0x40, Enable | OneWord | Maximum, 3), false);
-    Access::RunBack(split);
-    split.Defer([] {}, 0, Writes::Noted);
-    split.NoteWrite(f.memory, qmds + 0x700 + 26 * sizeof(u32), sizeof(u32));
-    send(0xad, static_cast<u32>((qmds + 0x700) >> 8));
-    send(0xb0, 7);
-    CHECK_FALSE(queued(0x40).has_value());
-    Access::RunBack(split);
-    CHECK(word(0x40) == 3);
-
-    // An inline upload still queued that rewrites a waiting QMD's release payload: the front
-    // reads the QMD from memory with the upload's words over it.
-    constexpr GPUVAddr patched = qmds + 0x800;
-    inline_qmd(patched, make_qmd(1, 0x50, Enable | OneWord | Maximum, 1), false);
-    Access::RunBack(split);
-    constexpr GPUVAddr payload_address = patched + 26 * sizeof(u32);
-    send(0x60, sizeof(u32));
-    send(0x61, 1);
-    send(0x62, static_cast<u32>(payload_address >> 32));
-    send(0x63, static_cast<u32>(payload_address));
-    send(0x6c, 1); // Linear
-    send(0x6d, 9);
-    send(0xad, static_cast<u32>(patched >> 8));
-    send(0xb0, 7);
-    release = queued(0x50);
-    REQUIRE(release.has_value());
-    CHECK(release->known);
-    CHECK(release->payload == 9);
-    // The back's upload (the null rasterizer's inline writes write nothing).
-    const u32 nine = 9;
-    std::memcpy(pages.backing + (payload_address - MappedPages::gpu_address), &nine, sizeof(nine));
-    Access::RunBack(split);
-    CHECK(word(0x50) == 9);
-
-    // Over the word in memory, which may be older than the back finds it (a fence-flagged
-    // release lands once the host GPU passed it): an ADD may wrap and an XOR could hold anything.
-    constexpr u32 Xor = 7U << 20;
-    f.memory.Write<u32>(words + 0x60, 5);
-    f.memory.Write<u32>(words + 0x200, 5);
-    inline_qmd(qmds + 0x900, make_qmd(0, 0x60, Enable | OneWord | Reduction, 3), false);
-    release = queued(0x60);
-    REQUIRE(release.has_value());
-    CHECK_FALSE(release->known);
-    inline_qmd(qmds + 0xa00, make_qmd(0, 0x200, Enable | OneWord | Reduction | Xor, 3), false);
-    release = queued(0x200);
-    REQUIRE(release.has_value());
-    CHECK_FALSE(release->known);
-    Access::RunBack(split);
-    CHECK(word(0x60) == 8);
-    CHECK(word(0x200) == 6);
-    CHECK(DrainCheck::g_compared > compared);
-    CHECK(DrainCheck::g_differences == differences);
-}
-
-TEST_CASE("Split front passes an acquire on a QMD release the back ran before its fence did",
-          "[video_core][gpu_split_dependencies]") {
-    using Access = VideoCommon::GpuSplitTestAccess;
-    using Descriptor = Tegra::NativeQmdScheduler::Descriptor;
-    using MethodCall = Tegra::Engines::Puller::MethodCall;
-    constexpr u32 Enable = 1U << 23;
-    constexpr u32 OneWord = 1U << 30;
-    constexpr GPUVAddr qmd_address = MappedPages::gpu_address;
-    constexpr GPUVAddr word = MappedPages::gpu_address + 0x1000;
-    constexpr DAddr word_device = MappedPages::device_address + 0x1000;
-    const auto fixture = std::make_unique<Fixture>();
-    Fixture& f = *fixture;
-    f.system.Initialize();
-    Tegra::Nx2ClearGpuWrittenPages();
-    MappedPages pages{f};
-    FencedReports fences{f.memory};
-    const auto compute_owner = std::make_unique<Tegra::Engines::KeplerCompute>(f.memory);
-    Tegra::Engines::KeplerCompute& compute = *compute_owner;
-    Tegra::MacroEngine macros{true};
-    std::array<u32, 128> positions{};
-    compute.SetNativeMacroMode(&macros, positions);
-    compute.BindRasterizer(&fences);
-    Tegra::Control::ChannelState channel_state{0};
-    Tegra::DmaPusher dma_pusher{f.system, f.memory, channel_state};
-    // The puller asks the split's own instance, and decides acquires without a drain below High
-    // GPU accuracy with fences that run their operations at once (CheckWithoutDrain).
-    const auto accuracy = Settings::values.current_gpu_accuracy;
-    Settings::values.current_gpu_accuracy = Settings::GpuAccuracy::Low;
-    const bool ampere = Tegra::g_nx2_ampere.exchange(true);
-    const bool counting = std::exchange(VideoCommon::g_acquire_counting, true);
-    auto& split = VideoCommon::GpuSplit::Get();
-    Access::Start(split, f.system);
-    Access::SetFrontMacros(split);
-    SCOPE_EXIT {
-        split.Stop();
-        VideoCommon::g_acquire_counting = counting;
-        Tegra::g_nx2_ampere = ampere;
-        Settings::values.current_gpu_accuracy = accuracy;
-    };
-    const auto send = [&](u32 method, u32 argument) {
-        compute.FrontCallMethod(f.system, split, method, argument, true, nullptr);
-    };
-    // Whether an acquire of the word reaching the value passes at once, or the channel waits.
-    const auto acquire = [&](u32 value) {
-        const std::array<std::pair<u32, u32>, 4> methods{{
-            {0x4, static_cast<u32>(word >> 32)},
-            {0x5, static_cast<u32>(word)},
-            {0x6, value},
-            {0x7, 4}, // AcquireGequal
-        }};
-        for (const auto& [method, argument] : methods) {
-            dma_pusher.puller.CallMethod(dma_pusher, MethodCall{method, argument});
-        }
-        return !dma_pusher.puller.HasPendingAcquire();
-    };
-
-    // An inline QMD with a plain one-word release of 5, sent once the back ran everything: the
-    // front values its release.
-    Descriptor qmd{};
-    qmd[18] = 0x30;
-    qmd[24] = static_cast<u32>(word);
-    qmd[25] = Enable | OneWord;
-    qmd[26] = 5;
-    std::memcpy(pages.backing, qmd.data(), sizeof(qmd));
-    send(0xc6, static_cast<u32>((qmd_address >> 8) >> 32));
-    send(0xc7, static_cast<u32>(qmd_address >> 8));
-    for (u32 i = 0; i < 63; ++i) {
-        send(0xc8 + i, qmd[i]);
-    }
-    split.Drain(VideoCommon::DrainSite::Other);
-    send(0x107, qmd[63]);
-    split.Drain(VideoCommon::DrainSite::Other);
-
-    // The back ran the release, a fence-flagged report whose fence has yet to run: memory holds
-    // the old value, the note the release's.
-    REQUIRE(fences.reports.size() == 1);
-    CHECK(f.memory.Read<u32>(word) == 0);
-    const auto release = split.QueuedSemaphoreWriteAt(word_device);
-    REQUIRE(release.has_value());
-    CHECK(split.Ran(release->position));
-    CHECK(release->fenced);
-    CHECK(release->known);
-    CHECK(release->payload == 5);
-    auto& stats = VideoCommon::g_acquire_stats;
-    const u64 by_queued = stats.by_queued.load();
-    const u64 drained = stats.drained.load();
-    CHECK(acquire(5));
-    CHECK(stats.by_queued.load() == by_queued + 1);
-    CHECK(stats.drained.load() == drained);
-
-    // Once the fence ran, memory holds the release and decides again.
-    fences.RunFence();
-    CHECK(f.memory.Read<u32>(word) == 5);
-    CHECK_FALSE(split.QueuedSemaphoreWriteAt(word_device).has_value());
-    CHECK(acquire(5));
-    CHECK(stats.by_queued.load() == by_queued + 1);
-    CHECK(stats.drained.load() == drained);
-}
-
 TEST_CASE("Split front sends state writes to the back as register blocks that match single writes",
           "[video_core][gpu_split_dependencies]") {
     using Access = VideoCommon::GpuSplitTestAccess;
     {
         // Changed state writes in a row are one entry: the writes, their dirty flags and the
         // last one that ends fast draw reuse.
-        // On the heap: fixtures and splits are large, and this test has two and three of them
-        // (Windows gives a thread 1 MiB of stack).
-        const auto fixture = std::make_unique<Fixture>();
-        Fixture& f = *fixture;
-        const auto split_owner = std::make_unique<VideoCommon::GpuSplit>();
-        VideoCommon::GpuSplit& split = *split_owner;
+        Fixture f;
+        VideoCommon::GpuSplit split;
         Access::Initialize(split, f.system);
         auto& engine = f.fast;
         const u32 first = f.state_methods[10];
@@ -2305,8 +1650,7 @@ TEST_CASE("Split front sends state writes to the back as register blocks that ma
     // as its own entry, each with its back: registers, shadow RAM, dirty
     // flags, draws and fast draw breaks agree. Macro 0 sends its three parameters to state
     // registers; instance loops leave deferred draws for state writes to issue.
-    const auto fixture = std::make_unique<Fixture>();
-    Fixture& f = *fixture;
+    Fixture f;
     const std::array<u32, 3> macro_registers{f.state_methods[30], f.state_methods[31],
                                              f.state_methods[200]};
     std::vector<u32> code;
@@ -2315,16 +1659,15 @@ TEST_CASE("Split front sends state writes to the back as register blocks that ma
           FifoInstruction(macro_registers[2], true), Encode(Mme{})}) {
         code.insert(code.end(), instruction.begin(), instruction.end());
     }
-    const std::array<std::unique_ptr<VideoCommon::GpuSplit>, 2> splits{
-        std::make_unique<VideoCommon::GpuSplit>(), std::make_unique<VideoCommon::GpuSplit>()};
+    std::array<VideoCommon::GpuSplit, 2> splits;
     std::array<Maxwell3D*, 2> engines{&f.fast, &f.slow};
     for (size_t i = 0; i < 2; ++i) {
-        Access::Start(*splits[i], f.system);
+        Access::Start(splits[i], f.system);
         engines[i]->SetNativeTuringMacroMode(true);
     }
     SCOPE_EXIT {
-        for (const auto& split : splits) {
-            split->Stop();
+        for (auto& split : splits) {
+            split.Stop();
         }
     };
     struct Step {
@@ -2340,7 +1683,7 @@ TEST_CASE("Split front sends state writes to the back as register blocks that ma
         u32 last_break;
     };
     const auto run = [&](size_t i, const std::vector<Step>& steps) {
-        auto& split = *splits[i];
+        auto& split = splits[i];
         auto& engine = *engines[i];
         const u64 serial = VideoCommon::Nx2FastDraw::Serial();
         for (const Step& step : steps) {
@@ -2445,12 +1788,9 @@ TEST_CASE("Unsplit draw reuse requires the sole GPU scheduler owner",
 TEST_CASE("Draw reuse remains eligible on the actual split worker",
           "[video_core][fast_draw][unsplit_fast_draw]") {
     using Access = VideoCommon::GpuSplitTestAccess;
-    // On the heap: a fixture and a split don't fit Windows' 1 MiB of stack together.
-    const auto fixture = std::make_unique<Fixture>();
-    Fixture& f = *fixture;
+    Fixture f;
     f.system.Initialize();
-    const auto split_owner = std::make_unique<VideoCommon::GpuSplit>();
-    VideoCommon::GpuSplit& split = *split_owner;
+    VideoCommon::GpuSplit split;
     bool on_back{};
     bool allowed{};
     Access::Start(split, f.system);

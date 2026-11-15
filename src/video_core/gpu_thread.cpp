@@ -19,7 +19,6 @@
 #include "core/frontend/graphics_context.h"
 #include "video_core/control/scheduler.h"
 #include "video_core/dma_pusher.h"
-#include "video_core/front_qmd.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_trace/recorder.h"
 #include "video_core/gpu_thread.h"
@@ -109,9 +108,6 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     Profile::Scope scope{Profile::Zone::ResumePending};
                     resumed = scheduler.ResumePending(system.GPU());
                 }
-                if (split.Active()) {
-                    VideoCommon::FrontQmdView::Get().MaybeTakeOver(split);
-                }
                 const bool popped = state.queue.TryPop(next);
                 if (popped) {
                     BackIdleTrace::SetFrontState(FrontState::Parse);
@@ -193,7 +189,6 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     submit ? submit->channel : -1, std::holds_alternative<GPUTickCommand>(next.data));
             }
             if (split.Active()) {
-                VideoCommon::FrontQmdView::Get().MaybeTakeOver(split);
                 // Only command lists are parsed here; everything else runs on the back thread
                 // in order, and so does the signal that the command ran.
                 auto* const rasterizer_ptr = renderer.ReadRasterizer();
@@ -203,18 +198,15 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 }
                 if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
                     // The guest may have written pages the caches don't watch since the lists
-                    // before it: uniform keeps end here, in order on the back. It writes no guest
-                    // memory.
+                    // before it: uniform keeps end here, in order on the back.
                     split.Defer([] { VideoCommon::Nx2FastDraw::NoteSync(); },
-                                VideoCommon::GpuSplit::FastDrawNeutral,
-                                VideoCommon::GpuSplit::Writes::Noted);
+                                VideoCommon::GpuSplit::FastDrawNeutral);
                     Profile::Scope scope{Profile::Zone::Push};
                     scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
                 } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
                     // TickWork ends fast draw reuse itself when it runs a request.
                     split.Defer([gpu = &system.GPU()] { gpu->TickWork(); },
-                                VideoCommon::GpuSplit::FastDrawNeutral,
-                                VideoCommon::GpuSplit::Writes::Caches);
+                                VideoCommon::GpuSplit::FastDrawNeutral);
                 } else if (auto* run = std::get_if<RunCommand>(&next.data)) {
                     if (run->before_later_reads) {
                         // GPU memory maps unmap caches (UnmapMemory downloads): the back's state.
@@ -224,22 +216,19 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                         split.DeferFunction(std::move(run->func));
                     }
                 } else if (const auto* flush = std::get_if<FlushRegionCommand>(&next.data)) {
-                    split.Defer([rasterizer_ptr, addr = flush->addr,
-                                 size = flush->size] { rasterizer_ptr->FlushRegion(addr, size); },
-                                0, VideoCommon::GpuSplit::Writes::Caches);
+                    split.Defer([rasterizer_ptr, addr = flush->addr, size = flush->size] {
+                        rasterizer_ptr->FlushRegion(addr, size);
+                    });
                 } else if (const auto* invalidate = std::get_if<InvalidateRegionCommand>(&next.data)) {
-                    split.Defer(
-                        [rasterizer_ptr, addr = invalidate->addr, size = invalidate->size] {
-                            rasterizer_ptr->OnCacheInvalidation(addr, size);
-                        },
-                        0, VideoCommon::GpuSplit::Writes::Noted);
+                    split.Defer([rasterizer_ptr, addr = invalidate->addr, size = invalidate->size] {
+                        rasterizer_ptr->OnCacheInvalidation(addr, size);
+                    });
                 } else {
                     ASSERT(false);
                 }
-                split.Defer([state_ptr = &state, fence = next.fence,
-                             block = next.block] { SignalCommand(*state_ptr, fence, block); },
-                            VideoCommon::GpuSplit::FastDrawNeutral,
-                            VideoCommon::GpuSplit::Writes::Noted);
+                split.Defer([state_ptr = &state, fence = next.fence, block = next.block] {
+                    SignalCommand(*state_ptr, fence, block);
+                }, VideoCommon::GpuSplit::FastDrawNeutral);
                 split.Publish();
                 last_progress = std::chrono::steady_clock::now();
                 continue;

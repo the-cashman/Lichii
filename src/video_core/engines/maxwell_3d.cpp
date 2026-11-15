@@ -1719,15 +1719,10 @@ void Maxwell3D::FrontNoteReport(VideoCommon::GpuSplit& split, const FrontState& 
         return;
     }
     const bool payload = report.query.report == Regs::ReportSemaphore::Report::Payload;
-    // A short release is fence-flagged; a counter lands once a fence ran.
-    const bool fence_flagged =
-        operation == Regs::ReportSemaphore::Operation::Release && report.query.short_query != 0;
-    const auto landing = payload ? VideoCommon::GpuSplit::ReportLanding(fence_flagged)
-                                 : VideoCommon::GpuSplit::Landing::Fenced;
-    split.NoteSemaphoreWrite(*device, report.payload, payload, false, landing);
+    split.NoteSemaphoreWrite(*device, report.payload, payload);
     if (report.query.short_query == 0) {
         // 64 bits (a timestamp follows).
-        split.NoteSemaphoreWrite(*device + 4, 0, payload, false, landing);
+        split.NoteSemaphoreWrite(*device + 4, 0, payload);
     }
 }
 
@@ -1916,7 +1911,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     if (fs.draw_pending) {
         fs.draw_pending = false;
         split.Defer([this, system_ptr = &system] { FinishFrontMacro(*system_ptr); },
-                    VideoCommon::GpuSplit::FastDrawNeutral, VideoCommon::GpuSplit::Writes::Caches);
+                    VideoCommon::GpuSplit::FastDrawNeutral);
     }
     if (FrontVerifyEnabled() && (++fs.calls & 4095) == 0) [[unlikely]] {
         FrontVerify(split, fs);
@@ -2039,7 +2034,7 @@ bool Maxwell3D::FrontRunOnBack(Core::System& system, VideoCommon::GpuSplit& spli
                 AsyncReadback::MaybeReport();
             }
         },
-        fs.parameters, VideoCommon::GpuSplit::Writes::Caches);
+        fs.parameters);
     const u64 position = split.Position();
     fs.back_last = position;
     const bool tracked = fs.control == Regs::ShadowRamControl::Track ||
@@ -2143,9 +2138,9 @@ void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, const FrontState& 
     };
     if (fs.draw_pending) {
         // A draw, or one an instance loop deferred to this entry (ProcessDirtyRegisters): where
-        // its shaders store, and what the caches download for it, only the back knows. Guest
-        // memory it writes through the caches only.
-        split.NoteCacheWrite();
+        // its shaders store, and what the caches download for it, only the back knows.
+        split.NoteAnyWrite();
+        return;
     }
     if (method >= cb_data && method < cb_data + 16) {
         // FrontWrite and FrontCallMultiMethod advanced the offset past these words already.
@@ -2162,15 +2157,18 @@ void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, const FrontState& 
                         16);
         break;
     case MAXWELL3D_REG_INDEX(inline_data): {
-        // Upload::State::ProcessData: lines of line_length_in bytes, pitch apart, or swizzled
-        // into the destination surface.
+        // Upload::State::ProcessData: lines of line_length_in bytes, pitch apart.
         const auto launch =
             std::bit_cast<Regs::LaunchDMA>(fs.regs[MAXWELL3D_REG_INDEX(launch_dma)]);
-        Upload::Registers upload;
-        std::memcpy(&upload, fs.regs.data() + MAXWELL3D_REG_INDEX(upload), sizeof(upload));
-        const auto range =
-            Upload::UploadedRange(upload, launch.memory_layout == Regs::LaunchDMA::Layout::Pitch);
-        split.NoteWrite(memory_manager, range.address, range.size);
+        const u32 lines = fs.regs[MAXWELL3D_REG_INDEX(upload.line_count)];
+        const u32 length = fs.regs[MAXWELL3D_REG_INDEX(upload.line_length_in)];
+        if (launch.memory_layout != Regs::LaunchDMA::Layout::Pitch) {
+            split.NoteAnyWrite(); // Swizzled into the destination surface
+        } else if (lines != 0 && length != 0) {
+            split.NoteWrite(memory_manager, address(MAXWELL3D_REG_INDEX(upload.dest.address_high)),
+                            u64{fs.regs[MAXWELL3D_REG_INDEX(upload.dest.pitch)]} * (lines - 1) +
+                                length);
+        }
         break;
     }
     case MAXWELL3D_REG_INDEX(render_enable.mode): {
@@ -2185,14 +2183,13 @@ void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, const FrontState& 
             (mode == Regs::RenderEnable::Mode::Conditional ||
              mode == Regs::RenderEnable::Mode::IfEqual ||
              mode == Regs::RenderEnable::Mode::IfNotEqual)) {
-            split.NoteCacheWrite();
+            split.NoteAnyWrite();
         }
         break;
     }
     case MAXWELL3D_REG_INDEX(sync_info):
-        // A syncpoint increment: macros read syncpoints through memory too (MemoryManager::Read
-        // of the syncpoint shim), guest memory holds nothing new.
-        split.NoteCacheWrite();
+        // A syncpoint increment: macros read syncpoints through memory too (MemoryManager::Read).
+        split.NoteAnyWrite();
         break;
     default:
         break;

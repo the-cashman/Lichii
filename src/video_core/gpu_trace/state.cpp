@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#include <algorithm>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -172,8 +171,7 @@ void StateAccess::CaptureChannel(Writer& writer, ChannelState& channel) {
                            : 0;
         }
         bytes.Put(types);
-        bytes.Put(pusher.dma_registers);
-        bytes.Put(pusher.inline_to_memory_registers);
+        bytes.Put(pusher.dma_semaphore);
         bytes.Put(pusher.puller.regs);
         bytes.Put(pusher.puller.bound_engines);
         Emit(writer, StateKind::Pusher, id, bytes);
@@ -231,7 +229,7 @@ void StateAccess::CaptureGlobals(Writer& writer, ChannelState* any_channel,
     }
     {
         Bytes bytes;
-        for (const auto& [address, state] : Tegra::NativeQmdScheduler::shared_states) {
+        for (const auto& [address, state] : Tegra::NativeQmdScheduler::states) {
             bytes.Put(address);
             bytes.Put(state);
         }
@@ -255,8 +253,8 @@ void StateAccess::CaptureGlobals(Writer& writer, ChannelState* any_channel,
     }
 }
 
-bool StateAccess::Restore(const Record& record, u32 version, ChannelState* channel,
-                          ChannelState* any_channel, Tegra::Host1x::SyncpointManager& syncpoints) {
+bool StateAccess::Restore(const Record& record, ChannelState* channel, ChannelState* any_channel,
+                          Tegra::Host1x::SyncpointManager& syncpoints) {
     if (!HasPayload(record, sizeof(StateRecord))) {
         return false;
     }
@@ -275,26 +273,9 @@ bool StateAccess::Restore(const Record& record, u32 version, ChannelState* chann
         auto& pusher = payload.dma_pusher;
         u32 increment_once{};
         std::array<u32, 8> types{};
-        if (!cursor.Get(pusher.dma_state) || !cursor.Get(increment_once) || !cursor.Get(types)) {
-            return false;
-        }
-        if (version == 1) {
-            // The copy engine's semaphore address (high, low) and payload, the only engine
-            // registers the pusher kept.
-            std::array<u32, 3> semaphore{};
-            if (!cursor.Get(semaphore)) {
-                return false;
-            }
-            pusher.dma_registers.fill(0);
-            pusher.inline_to_memory_registers.fill(0);
-            std::ranges::copy(semaphore, pusher.dma_registers.begin() +
-                                             Tegra::Engines::MaxwellDMA::SemaphoreMethod);
-        } else if (!cursor.Get(pusher.dma_registers) ||
-                   !cursor.Get(pusher.inline_to_memory_registers)) {
-            return false;
-        }
-        if (!cursor.Get(pusher.puller.regs) || !cursor.Get(pusher.puller.bound_engines) ||
-            !cursor.Done()) {
+        if (!cursor.Get(pusher.dma_state) || !cursor.Get(increment_once) || !cursor.Get(types) ||
+            !cursor.Get(pusher.dma_semaphore) || !cursor.Get(pusher.puller.regs) ||
+            !cursor.Get(pusher.puller.bound_engines) || !cursor.Done()) {
             return false;
         }
         pusher.dma_increment_once = increment_once != 0;
@@ -384,15 +365,12 @@ bool StateAccess::Restore(const Record& record, u32 version, ChannelState* chann
                cursor.Get(context->compute_positions) && cursor.Done();
     }
     case StateKind::QmdStates: {
-        auto& states = Tegra::NativeQmdScheduler::shared_states;
+        auto& states = Tegra::NativeQmdScheduler::states;
         states.clear();
         while (!cursor.Done()) {
             Tegra::NativeQmdScheduler::Address address{};
             Tegra::NativeQmdScheduler::State state{};
-            // Format 1 kept each QMD's descriptor before its state: the scheduler reads it again.
-            Tegra::NativeQmdScheduler::Descriptor descriptor{};
-            if (!cursor.Get(address) || (version == 1 && !cursor.Get(descriptor)) ||
-                !cursor.Get(state)) {
+            if (!cursor.Get(address) || !cursor.Get(state)) {
                 return false;
             }
             states.insert_or_assign(address, state);
