@@ -43,19 +43,19 @@ TEST_CASE("NX2 movie clock restarts after a pause, a loop or a long lag", "[nx2_
     s64 now = Start + Frame + Clock::PauseGap + 1;
     REQUIRE_FALSE(clock.Due(now, 0));
     clock.Acquired(now, 2 * Frame, 0);
-    REQUIRE(clock.Due(now + 1000, 0) == 2 * Frame + 1000);
+    REQUIRE(clock.Due(now + 1000, 0) == static_cast<u64>(2 * Frame + 1000));
 
     // Emulation paused and resumed since the last acquire.
     const s64 resumed = now + 2000;
     REQUIRE_FALSE(clock.Due(now + 3000, resumed));
     now += 4000;
     clock.Acquired(now, 3 * Frame, resumed);
-    REQUIRE(clock.Due(now, resumed) == 3 * Frame);
+    REQUIRE(clock.Due(now, resumed) == static_cast<u64>(3 * Frame));
 
     // The movie loops back to its start.
     now += Frame;
     clock.Acquired(now, 0, resumed);
-    REQUIRE(clock.Due(now, resumed) == 0);
+    REQUIRE(clock.Due(now, resumed) == 0U);
 
     // The client takes a frame every half second: once it lags by more than MaxCatchUp, the
     // clock restarts from its frame.

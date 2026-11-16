@@ -270,7 +270,8 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             return entry.image_id == image_id;
         });
     };
-    const auto RemoveImage = [this, &aggressive_mode, &high_priority_mode](ImageId image_id) {
+    const auto RemoveImage = [this, &aggressive_mode, &high_priority_mode,
+                              &evict_bad_overlaps](ImageId image_id, bool must_download) {
         auto& image = slot_images[image_id];
         if (True(image.flags & ImageFlagBits::Tracked)) {
             UntrackImage(image, image_id);
@@ -285,8 +286,11 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             }
         }
         ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
+        trace_delete_flags = static_cast<u32>(image.flags);
+        trace_delete_downloaded = must_download;
         UnregisterImage(image_id);
-        trace_delete_reason = aggressive_mode      ? "gc-aggressive"
+        trace_delete_reason = evict_bad_overlaps   ? "gc-bad-overlap"
+                              : aggressive_mode    ? "gc-aggressive"
                               : high_priority_mode ? "gc-high-priority"
                                                    : "gc";
         DeleteImage(image_id, image.scale_tick > frame_tick + 5);
@@ -337,7 +341,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             }
             ++gc_download_deletes;
             ClearStaleImage(image);
-            RemoveImage(entry.image_id);
+            RemoveImage(entry.image_id, true);
         }
         pending_write_backs.clear();
         pending_write_back_bytes = 0;
@@ -371,7 +375,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             QueueWriteBack(image, image_id);
         } else {
             MarkStale(image); // before UntrackImage (see MarkStale)
-            RemoveImage(image_id);
+            RemoveImage(image_id, false);
         }
         if (out_of_memory) {
             return false;
@@ -2947,6 +2951,13 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
                              ImageFlagBits::SparseTiles | ImageFlagBits::Unbacked)) &&
         stale_pages.IsAll(image.cpu_addr, image.guest_size_bytes)) {
         if (!Tegra::Nx2MayBeGpuWritten(image.cpu_addr, image.guest_size_bytes)) {
+            if (TextureCacheTrace()) {
+                LOG_WARNING(HW_GPU,
+                            "TCTRACE stale-skip gpu={:#x} fmt={} {}x{}x{} guest={}KiB frame={}",
+                            image.gpu_addr, static_cast<u32>(image.info.format),
+                            image.info.size.width, image.info.size.height, image.info.size.depth,
+                            image.guest_size_bytes / 1024, frame_tick);
+            }
             ++tc_stale_skips;
             tc_stale_skip_bytes += image.guest_size_bytes;
             runtime.TransitionImageLayout(image);
@@ -5021,13 +5032,16 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         if (TextureCacheTrace()) {
             LOG_WARNING(HW_GPU,
                         "TCTRACE delete id={} gpu={:#x} fmt={} {}x{}x{} guest={}KiB immediate={} "
-                        "reason={} frame={}",
+                        "reason={} flags={:#x} downloaded={} frame={}",
                         image_id.index, image.gpu_addr, static_cast<u32>(image.info.format),
                         image.info.size.width, image.info.size.height, image.info.size.depth,
                         image.guest_size_bytes / 1024, immediate_delete, trace_delete_reason,
-                        frame_tick);
+                        static_cast<u32>(image.flags) | trace_delete_flags,
+                        trace_delete_downloaded, frame_tick);
         }
         trace_delete_reason = "other";
+        trace_delete_flags = 0;
+        trace_delete_downloaded = false;
     }
     VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Invalidation);
     // Drop every decode still queued for it, whatever IsDecoding says: an image re-decoded while

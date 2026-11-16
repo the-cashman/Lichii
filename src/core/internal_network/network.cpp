@@ -15,6 +15,7 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <mswsock.h>
 #else
 #include <arpa/inet.h>
 #include <errno.h>
@@ -171,6 +172,8 @@ Errno TranslateNativeError(int e, CallType call_type = CallType::Other) {
         return Errno::INPROGRESS;
     case WSAEISCONN:
         return Errno::ISCONN;
+    case WSAEADDRINUSE:
+        return Errno::ADDRINUSE;
     default:
         UNIMPLEMENTED_MSG("Unimplemented errno={}", e);
         return Errno::OTHER;
@@ -320,6 +323,8 @@ Errno TranslateNativeError(int e, CallType call_type = CallType::Other) {
         return Errno::INPROGRESS;
     case EISCONN:
         return Errno::ISCONN;
+    case EADDRINUSE:
+        return Errno::ADDRINUSE;
     default:
         UNIMPLEMENTED_MSG("Unimplemented errno={} ({})", e, strerror(e));
         return Errno::OTHER;
@@ -912,6 +917,11 @@ Socket::~Socket() {
 Socket::Socket(Socket&& rhs) noexcept {
     fd = std::exchange(rhs.fd, INVALID_SOCKET);
     socket_type = rhs.socket_type;
+#ifdef _WIN32
+    std::scoped_lock lock{rhs.reuse_mutex};
+    reuse_addr = rhs.reuse_addr;
+    reuse_port = rhs.reuse_port;
+#endif
 }
 
 template <typename T>
@@ -938,14 +948,32 @@ Errno Socket::SetSockOpt(SOCKET fd_so, int level, int option, T value) {
     return GetAndLogLastError();
 }
 
+#ifdef _WIN32
+/// Whether a receive on UDP socket fd fails once a send drew ICMP port unreachable.
+static void ReportUdpResets(SOCKET fd, bool report) {
+    BOOL report_reset = report ? TRUE : FALSE;
+    DWORD bytes_returned = 0;
+    WSAIoctl(fd, SIO_UDP_CONNRESET, &report_reset, sizeof(report_reset), nullptr, 0,
+             &bytes_returned, nullptr, nullptr);
+}
+#endif
+
 Errno Socket::Initialize(Domain domain, Type type, Protocol protocol) {
     fd = socket(TranslateDomainToNative(domain), TranslateTypeToNative(type), TranslateProtocolToNative(protocol));
-    if (fd != INVALID_SOCKET) {
-        socket_type = type;
-        return Errno::SUCCESS;
+    if (fd == INVALID_SOCKET) {
+        return GetAndLogLastError();
     }
-
-    return GetAndLogLastError();
+    socket_type = type;
+#ifdef _WIN32
+    if (type == Type::DGRAM) {
+        // Windows fails the next receive with WSAECONNRESET once a peer answers a send with ICMP
+        // port unreachable. The console does not on an unconnected socket, which Pia shares
+        // among its peers, so one peer that left would read as the network failing. Connect
+        // turns the reports back on.
+        ReportUdpResets(fd, false);
+    }
+#endif
+    return Errno::SUCCESS;
 }
 
 std::pair<SocketBase::AcceptResult, Errno> Socket::Accept() {
@@ -978,8 +1006,17 @@ std::pair<SocketBase::AcceptResult, Errno> Socket::Accept() {
         return {AcceptResult{}, GetAndLogLastError()};
     }
 
+    auto accepted = std::make_unique<Socket>(new_socket);
+#ifdef _WIN32
+    // The accepted socket takes the listener's options, the host's SO_REUSEADDR among them.
+    {
+        std::scoped_lock lock{reuse_mutex};
+        accepted->reuse_addr = reuse_addr;
+        accepted->reuse_port = reuse_port;
+    }
+#endif
     AcceptResult result{
-        .socket = std::make_unique<Socket>(new_socket),
+        .socket = std::move(accepted),
         .sockaddr_in = TranslateToSockAddrIn(addr, addrlen),
     };
     if (!LocalRedirect::Allowed(result.sockaddr_in)) {
@@ -1005,6 +1042,13 @@ Errno Socket::Connect(SockAddrIn addr_in) {
     }
     const sockaddr host_addr_in = TranslateFromSockAddrIn(addr_in);
     if (connect(fd, &host_addr_in, sizeof(host_addr_in)) != SOCKET_ERROR) {
+#ifdef _WIN32
+        // As on the console, a connected UDP socket's receive fails once its peer's port is
+        // unreachable.
+        if (socket_type == Type::DGRAM) {
+            ReportUdpResets(fd, true);
+        }
+#endif
         return Errno::SUCCESS;
     }
 
@@ -1284,10 +1328,55 @@ std::pair<Errno, Errno> Socket::GetPendingError() {
     return {TranslateNativeError(pending_err), getsockopt_err};
 }
 
+#ifdef _WIN32
+std::pair<bool, Errno> Socket::GetReuseAddr() {
+    std::scoped_lock lock{reuse_mutex};
+    return {reuse_addr, Errno::SUCCESS};
+}
+
+std::pair<bool, Errno> Socket::GetReusePort() {
+    std::scoped_lock lock{reuse_mutex};
+    return {reuse_port, Errno::SUCCESS};
+}
+
+Errno Socket::SetReuseAddr(bool enable) {
+    std::scoped_lock lock{reuse_mutex};
+    const Errno result =
+        SetSockOpt<u32>(fd, SOL_SOCKET, SO_REUSEADDR, enable || reuse_port ? 1 : 0);
+    if (result == Errno::SUCCESS) {
+        reuse_addr = enable;
+    }
+    return result;
+}
+
+Errno Socket::SetReusePort(bool enable) {
+    std::scoped_lock lock{reuse_mutex};
+    const Errno result =
+        SetSockOpt<u32>(fd, SOL_SOCKET, SO_REUSEADDR, enable || reuse_addr ? 1 : 0);
+    if (result == Errno::SUCCESS) {
+        reuse_port = enable;
+    }
+    return result;
+}
+#else
 std::pair<bool, Errno> Socket::GetReuseAddr() {
     const auto [value, getsockopt_err] = GetSockOpt<u32>(fd, SOL_SOCKET, SO_REUSEADDR);
     return {value != 0, getsockopt_err};
 }
+
+std::pair<bool, Errno> Socket::GetReusePort() {
+    const auto [value, getsockopt_err] = GetSockOpt<u32>(fd, SOL_SOCKET, SO_REUSEPORT);
+    return {value != 0, getsockopt_err};
+}
+
+Errno Socket::SetReuseAddr(bool enable) {
+    return SetSockOpt<u32>(fd, SOL_SOCKET, SO_REUSEADDR, enable ? 1 : 0);
+}
+
+Errno Socket::SetReusePort(bool enable) {
+    return SetSockOpt<u32>(fd, SOL_SOCKET, SO_REUSEPORT, enable ? 1 : 0);
+}
+#endif
 
 std::pair<bool, Errno> Socket::GetNoDelay() {
     const auto [value, getsockopt_err] = GetSockOpt<u32>(fd, IPPROTO_TCP, TCP_NODELAY);
@@ -1296,10 +1385,6 @@ std::pair<bool, Errno> Socket::GetNoDelay() {
 
 Errno Socket::SetLinger(bool enable, u32 linger) {
     return SetSockOpt(fd, SOL_SOCKET, SO_LINGER, MakeLinger(enable, linger));
-}
-
-Errno Socket::SetReuseAddr(bool enable) {
-    return SetSockOpt<u32>(fd, SOL_SOCKET, SO_REUSEADDR, enable ? 1 : 0);
 }
 
 Errno Socket::SetKeepAlive(bool enable) {

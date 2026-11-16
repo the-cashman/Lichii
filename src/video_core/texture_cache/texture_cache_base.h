@@ -237,6 +237,10 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     /// Why the next DeleteImage happens, for EDEN_NX2_TC_TRACE: the collector (and its mode),
     /// an unmap or a join. Read and reset by DeleteImage.
     const char* trace_delete_reason = "other";
+    /// The collector's deleted image: its flags before UnregisterImage cleared BadOverlap, and
+    /// whether its contents were written back to guest memory. Read and reset by DeleteImage.
+    u32 trace_delete_flags{};
+    bool trace_delete_downloaded{};
     u64 scale_epoch{};
     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
     bool debug_stats{}; ///< Collect what only the debug statistics lines use

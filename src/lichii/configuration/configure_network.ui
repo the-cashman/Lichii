@@ -156,7 +156,7 @@
         <item row="1" column="0" colspan="2">
          <widget class="QLabel" name="nextendo_description">
           <property name="text">
-           <string>Nextendo Network is a community service that replaces Nintendo's online servers for Switch 1 games. When this is on, those games connect to Nextendo instead of Nintendo and send your Nextendo account token to it. Airplane mode is turned off.</string>
+           <string>Nextendo Network is a community service that replaces Nintendo's online servers. When this is on, the games it supports connect to Nextendo instead of Nintendo and send your Nextendo game token to it. Airplane mode is turned off. Online play needs a Nextendo account with a verified e-mail address and a linked Discord account.</string>
           </property>
           <property name="wordWrap">
            <bool>true</bool>

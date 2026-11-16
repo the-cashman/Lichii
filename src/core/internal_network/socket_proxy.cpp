@@ -309,6 +309,12 @@ Errno ProxySocket::SetReuseAddr(bool enable) {
     return SetSockOpt<u32>(fd, SO_REUSEADDR, enable ? 1 : 0);
 }
 
+Errno ProxySocket::SetReusePort(bool enable) {
+    std::lock_guard guard(packets_mutex);
+    reuse_port = enable;
+    return Errno::SUCCESS;
+}
+
 Errno ProxySocket::SetBroadcast(bool enable) {
     {
         std::lock_guard guard(packets_mutex);
@@ -363,6 +369,11 @@ std::pair<Errno, Errno> ProxySocket::GetPendingError() {
 std::pair<bool, Errno> ProxySocket::GetReuseAddr() {
     std::lock_guard guard(packets_mutex);
     return {reuse_addr, Errno::SUCCESS};
+}
+
+std::pair<bool, Errno> ProxySocket::GetReusePort() {
+    std::lock_guard guard(packets_mutex);
+    return {reuse_port, Errno::SUCCESS};
 }
 
 std::pair<bool, Errno> ProxySocket::GetNoDelay() {

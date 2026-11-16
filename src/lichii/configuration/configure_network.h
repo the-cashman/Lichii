@@ -22,6 +22,9 @@ public:
 
     void ApplyConfiguration();
 
+    // Why nextendo.network refuses online play, from GET /api/online-status's reason.
+    static QString OnlineRefusal(const std::string& reason);
+
 private:
     void changeEvent(QEvent*) override;
     void RetranslateUI();
