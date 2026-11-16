@@ -1997,7 +1997,13 @@ void EmitContext::DefineInputs(const IR::Program& program) {
         fswzadd_lut_b =
             ConstantComposite(F32[4], f32_minus_one, f32_minus_one, f32_one, f32_minus_one);
     }
-    if (loads[IR::Attribute::PrimitiveId]) {
+    if (loads[IR::Attribute::PrimitiveId] && stage == Stage::Fragment &&
+        runtime_info.primitive_id_location != ~0U) {
+        // Mesh emulation: the mesh program's PrimitiveId, from the vertex shader.
+        primitive_id = DefineInput(*this, U32[1], false);
+        Decorate(primitive_id, spv::Decoration::Location, runtime_info.primitive_id_location);
+        Decorate(primitive_id, spv::Decoration::Flat);
+    } else if (loads[IR::Attribute::PrimitiveId]) {
         primitive_id = DefineInput(*this, U32[1], false, spv::BuiltIn::PrimitiveId);
         if (stage == Stage::Fragment) {
             // A fragment PrimitiveId input requires Geometry (geometryShader is a required feature).
@@ -2109,6 +2115,10 @@ void EmitContext::DefineInputs(const IR::Program& program) {
         }
         const bool is_integer = input_type == AttributeType::SignedInt ||
                                 input_type == AttributeType::UnsignedInt;
+        if (runtime_info.per_primitive_generics.test(index) && runtime_info.per_primitive_flat) {
+            Decorate(id, spv::Decoration::Flat);
+            continue;
+        }
         if (runtime_info.per_primitive_generics.test(index)) {
             // Written per primitive by a mesh program: constant over the primitive.
             AddExtension("SPV_EXT_mesh_shader");

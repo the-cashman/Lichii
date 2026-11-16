@@ -629,6 +629,12 @@ struct System::Impl {
         // Reset per-game flags
         Settings::values.use_squashed_iterated_blend = false;
 
+        // The cheat VM runs on the timer thread, which keeps running through the teardown, and
+        // reads keys through the service manager and memory through the process. Freed below,
+        // they crashed it (a null ServiceManager at a stop, #1950). Its destructor waits for a
+        // run in progress.
+        cheat_engine.reset();
+
         // Once powered off, services stop writing replies, so a guest thread whose IPC call
         // completes would read its own request back and abort (2010-0212, a Userspace PANIC on
         // every stop). Keep guest threads from running again first; the wait for running ones
@@ -658,7 +664,6 @@ struct System::Impl {
         services.reset();
         service_manager.reset();
         fs_controller.Reset();
-        cheat_engine.reset();
         core_timing.ClearPendingEvents();
         app_loader.reset();
         Common::NoteShutdownProgress();

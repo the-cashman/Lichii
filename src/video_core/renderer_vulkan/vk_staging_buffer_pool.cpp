@@ -255,32 +255,11 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
     vk::Buffer buffer = memory_allocator.TryCreateBuffer(buffer_ci, usage);
     if (!buffer) {
         // No memory left for it (#262: Mario Kart World on an 8 GB laptop with Intel UHD, a
-        // 128 MiB upload). Free the idle staging buffers and try again, then wait for the GPU so
-        // the ones it was still reading are idle too. Those handed out in the current tick may
-        // feed commands not recorded yet (the caller's input while it asks for its output): they
-        // move to the tick after Finish, so they are neither freed nor handed out again.
+        // 128 MiB upload). Free the idle staging buffers and try again, then wait for the GPU.
         ReleaseIdleBuffers();
         buffer = memory_allocator.TryCreateBuffer(buffer_ci, usage);
         if (!buffer) {
-            const u64 current_tick = scheduler.CurrentTick();
-            scheduler.Finish();
-            const u64 next_tick = scheduler.CurrentTick();
-            for (StagingBuffersCache* const cache :
-                 {&device_local_cache, &upload_cache, &download_cache}) {
-                for (StagingBuffers& staging : *cache) {
-                    for (StagingBuffer& entry : staging.entries) {
-                        if (entry.tick >= current_tick) {
-                            entry.tick = next_tick;
-                        }
-                    }
-                }
-            }
-            for (u64& sync_tick : sync_ticks) {
-                if (sync_tick >= current_tick) {
-                    sync_tick = next_tick;
-                }
-            }
-            ReleaseIdleBuffers();
+            ReleaseMemory();
             buffer = memory_allocator.TryCreateBuffer(buffer_ci, usage);
         }
     }
@@ -365,6 +344,31 @@ u64 StagingBufferPool::CachedBytes(MemoryUsage usage) {
         }
     }
     return bytes;
+}
+
+void StagingBufferPool::ReleaseMemory() {
+    // Waits for the GPU so the buffers it was still reading are idle too. Those handed out in
+    // the current tick may feed commands not recorded yet (the caller's input while it asks for
+    // its output): they move to the tick after Finish, so they are neither freed nor handed out
+    // again.
+    const u64 current_tick = scheduler.CurrentTick();
+    scheduler.Finish();
+    const u64 next_tick = scheduler.CurrentTick();
+    for (StagingBuffersCache* const cache : {&device_local_cache, &upload_cache, &download_cache}) {
+        for (StagingBuffers& staging : *cache) {
+            for (StagingBuffer& entry : staging.entries) {
+                if (entry.tick >= current_tick) {
+                    entry.tick = next_tick;
+                }
+            }
+        }
+    }
+    for (u64& sync_tick : sync_ticks) {
+        if (sync_tick >= current_tick) {
+            sync_tick = next_tick;
+        }
+    }
+    ReleaseIdleBuffers();
 }
 
 void StagingBufferPool::ReleaseIdleBuffers() {

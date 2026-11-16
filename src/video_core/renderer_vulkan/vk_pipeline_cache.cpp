@@ -2316,20 +2316,24 @@ void ReportUnsupportedMeshPipeline(const GraphicsPipelineCacheKey& key, const Pr
             others += fmt::format(" {}", line);
         }
     }
+    std::string primitive_attributes;
+    for (const u32 line : info.primitive_lines) {
+        primitive_attributes += fmt::format(" {}", line);
+    }
     with_task += task != nullptr;
     per_primitive += !info.primitive_lines.empty();
     non_triangle += info.topology != 4;
     LOG_WARNING(Render_Vulkan,
                 "Mesh emulation survey #{}: task={} (payload {} words, wg {}x{}x{}) mesh wg "
                 "{}x{}x{} max_vertices={} max_primitives={} topology={} vertex_lines={} "
-                "(position {} generic {} other {}:{}) primitive_lines={} pixel={} | totals: "
+                "(position {} generic {} other {}:{}) primitive_lines={}:{} pixel={} | totals: "
                 "task {} per-primitive {} non-triangle {}",
                 total, task != nullptr, info.payload_words, task ? task->workgroup_size[0] : 0,
                 task ? task->workgroup_size[1] : 0, task ? task->workgroup_size[2] : 0,
                 mesh->workgroup_size[0], mesh->workgroup_size[1], mesh->workgroup_size[2],
                 info.max_vertices, info.max_primitives, info.topology, info.vertex_lines.size(),
-                position, generic, other, others, info.primitive_lines.size(), has_pixel,
-                with_task, per_primitive, non_triangle);
+                position, generic, other, others, info.primitive_lines.size(), primitive_attributes,
+                has_pixel, with_task, per_primitive, non_triangle);
 }
 } // Anonymous namespace
 
@@ -2761,7 +2765,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             std::span{stages.data(), num_stages}, host_info);
     }
     // Mesh emulation without VK_EXT_mesh_shader (prototype): a mesh program, after an optional
-    // task program, drawing triangles without per-primitive outputs, before a pixel program only.
+    // task program, before a pixel program only.
     std::optional<MeshEmulationSetup> mesh_emulation;
     size_t mesh_index{};
     if (mesh_unsupported) {
@@ -2780,7 +2784,6 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         // Points (0), lines (1) and triangles (4).
         const u32 topology{mesh.mesh.topology};
         eligible = eligible && (topology == 0 || topology == 1 || topology == 4) &&
-                   mesh.mesh.primitive_lines.empty() &&
                    !mesh.mesh.vertex_lines.empty() && mesh.mesh.max_vertices != 0 &&
                    mesh.mesh.max_primitives != 0;
         for (size_t index = 1; index < Maxwell::MaxShaderProgram && eligible; ++index) {
@@ -2789,6 +2792,56 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                        programs[index].stage == Shader::Stage::Fragment;
         }
         if (!eligible) {
+            return nullptr;
+        }
+        // Per-primitive outputs reach the pixel program flat through the vertex shader. A vertex
+        // shader writes Layer and ViewportIndex only with VK_EXT_shader_viewport_index_layer, and
+        // PrimitiveId goes through a generic location nothing else uses.
+        std::bitset<Shader::IR::NUM_GENERICS> vertex_generics, primitive_generics;
+        for (const u32 line : mesh.mesh.vertex_lines) {
+            const auto attribute{static_cast<Shader::IR::Attribute>(line)};
+            if (Shader::IR::IsGeneric(attribute)) {
+                vertex_generics.set(Shader::IR::GenericAttributeIndex(attribute));
+            }
+        }
+        bool writes_primitive_id{};
+        const char* primitive_reason{};
+        for (const u32 line : mesh.mesh.primitive_lines) {
+            const auto attribute{static_cast<Shader::IR::Attribute>(line)};
+            if (Shader::IR::IsGeneric(attribute)) {
+                primitive_generics.set(Shader::IR::GenericAttributeIndex(attribute));
+            } else if (attribute == Shader::IR::Attribute::PrimitiveId) {
+                writes_primitive_id = true;
+            } else if ((attribute == Shader::IR::Attribute::Layer ||
+                        attribute == Shader::IR::Attribute::ViewportIndex) &&
+                       !profile.support_viewport_index_layer_non_geometry) {
+                primitive_reason =
+                    "Layer or ViewportIndex without VK_EXT_shader_viewport_index_layer";
+            }
+        }
+        if ((vertex_generics & primitive_generics).any()) {
+            primitive_reason = "a generic written both per vertex and per primitive";
+        }
+        const size_t pixel_index{static_cast<size_t>(Maxwell::ShaderType::Pixel)};
+        const Shader::Info* const pixel{
+            key.unique_hashes[pixel_index] != 0 ? &programs[pixel_index].info : nullptr};
+        u32 primitive_id_location{~0U};
+        if (writes_primitive_id && pixel && pixel->loads[Shader::IR::Attribute::PrimitiveId]) {
+            const auto used{vertex_generics | primitive_generics};
+            for (u32 index = 0; index < Shader::IR::NUM_GENERICS && !pixel->loads.Legacy();
+                 ++index) {
+                if (!used[index] && !pixel->loads.Generic(index)) {
+                    primitive_id_location = index;
+                    break;
+                }
+            }
+            if (primitive_id_location == ~0U) {
+                primitive_reason = "no free generic location for PrimitiveId";
+            }
+        }
+        if (primitive_reason) {
+            LOG_WARNING(Render_Vulkan, "Mesh emulation skipped for pipeline {:016x}: {}", hash,
+                        primitive_reason);
             return nullptr;
         }
         // Task and mesh share the compute stage, including the fallback's storage buffers.
@@ -2843,6 +2896,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         mesh_emulation.emplace();
         mesh_emulation->output_binding = output_binding;
+        mesh_emulation->primitive_id_location = primitive_id_location;
         if (has_task) {
             // After the output: the task payload, offset and argument buffers.
             mesh_emulation->has_task = true;
@@ -3001,8 +3055,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                     profile, program.mesh, mesh_emulation->output_binding,
                     mesh_emulation->has_task ? mesh_emulation->args_binding : ~0U,
                     runtime_info.convert_depth_mode && !profile.support_native_ndc,
-                    runtime_info.fixed_state_point_size.value_or(1.0f));
+                    runtime_info.fixed_state_point_size.value_or(1.0f),
+                    mesh_emulation->primitive_id_location);
             }
+        }
+        if (mesh_emulation && program.stage == Shader::Stage::Fragment) {
+            runtime_info.per_primitive_flat = true;
+            runtime_info.primitive_id_location = mesh_emulation->primitive_id_location;
         }
         ConvertLegacyToGeneric(program, runtime_info);
         if (index == static_cast<size_t>(Maxwell::ShaderType::Geometry)) {
