@@ -150,6 +150,9 @@ namespace Vulkan {
 
         vk::Buffer CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage) const;
 
+        /// CreateBuffer, but a null buffer instead of an exception when there is no memory for it.
+        vk::Buffer TryCreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage) const;
+
         vk::Buffer CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage,
                                 VkDeviceSize min_alignment) const;
 
@@ -182,6 +185,11 @@ namespace Vulkan {
         /// may_fail: the caller handles VK_ERROR_OUT_OF_DEVICE_MEMORY (see UsesUnbackedFallback).
         VkResult AllocateImage(const VkImageCreateInfo &ci, bool dedicated, bool may_fail,
                                vk::Image &image) const;
+
+        /// CreateBuffer's fallbacks; the buffer is left null when the result is an error.
+        /// min_alignment over 1 aligns the allocation and skips the separate buffer pool.
+        VkResult AllocateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage,
+                                VkDeviceSize min_alignment, vk::Buffer &buffer) const;
 
         /// A device-local image or buffer that VMA quietly placed in host memory because the
         /// device heap was over its budget (VMA picks another memory type instead of failing).

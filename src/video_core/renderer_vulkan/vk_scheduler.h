@@ -495,6 +495,16 @@ private:
     void ReportSiteTimes(const std::vector<u64>& submission_begin,
                          const std::vector<u64>& submission_end);
     void TraceShader(u64 hash, u32 stage);
+    void TracePassShaders(u64 hash, u32 stage, u64 fragment_hash);
+    /// Worker thread, just before a render pass of a sampled submission ends: timestamps it and
+    /// keeps what was recorded since the previous pass ended.
+    void TracePassEnd(vk::CommandBuffer cmdbuf, VkExtent2D extent);
+    /// Logs the sampled frame's GPU time by render pass (the 16 most expensive). Each pass is
+    /// timed from the end of the one before it, so compute and copies between them count with it.
+    /// MoltenVK samples timestamps only at Metal encoder boundaries, so this is the finest split
+    /// it gives.
+    void ReportPassTimes(const std::vector<u64>& submission_begin,
+                         const std::vector<u64>& submission_end);
 
     u64 SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore);
 
@@ -557,6 +567,29 @@ private:
     vk::QueryPool trace_site_pool;
     std::vector<SiteTrace> trace_site_items;
     u32 trace_site_count{};
+    /// A Metal counter sample buffer holds at most 4096 timestamps; MoltenVK emulates larger
+    /// pools with timestamps that do not measure the GPU.
+    static constexpr u32 TraceMaxPasses = 4096;
+    struct PassTrace {
+        struct Shaders {
+            u64 hash{};
+            u64 fragment_hash{};
+            u32 stage{};
+        };
+        u32 submission{};
+        u32 draws{};
+        u32 dispatches{};
+        VkExtent2D extent{};
+        u32 num_shaders{};
+        u32 untracked_uses{};
+        std::array<Shaders, 4> shaders{};
+    };
+    vk::QueryPool trace_pass_pool;
+    std::vector<PassTrace> trace_pass_items;
+    /// What each sampled submission recorded after its last render pass ended.
+    std::vector<PassTrace> trace_pass_tails;
+    PassTrace trace_pass;
+    u32 trace_pass_count{};
     Common::DkbFrameTrace::RateLimit trace_gpu_rate;
     u64 trace_gpu_tick{};
     u64 trace_frame_end{};

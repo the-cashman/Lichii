@@ -416,8 +416,11 @@ BufferCacheRuntime::BufferCacheRuntime(const Device& device_, MemoryAllocator& m
     limit_dynamic_storage_buffers = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||
                                     driver_id == VK_DRIVER_ID_ARM_PROPRIETARY;
     if (limit_dynamic_storage_buffers) {
-        max_dynamic_storage_buffers = device.GetMaxDescriptorSetStorageBuffersDynamic();
-    }    
+        // Guest storage buffers are bound as plain VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, so the
+        // per-stage limit applies, not the much lower dynamic one (16 on Adreno 830, which left
+        // Ocarina of Time's compute shaders with half their buffers unbound).
+        max_dynamic_storage_buffers = device.GetMaxPerStageDescriptorStorageBuffers();
+    }
     if (device.SupportsUint8Indices()) {
         uint8_pass = std::make_unique<Uint8Pass>(device, scheduler, descriptor_pool, staging_pool,
                                                  compute_pass_descriptor_queue);
