@@ -32,6 +32,7 @@ output shaders use the same constant-buffer handle offsets as the update.
 
 - On 1.1.1, `ShaderCache::ComputeShader` calls `KeplerCompute::BypassOotNetwork`. The output
   pass uses a same-size point copy. The prepass and network are skipped while the replacement works.
+  The known intermediate program is also skipped between a skipped prepass and the output copy.
 - On 1.0.0, `KeplerCompute::BypassOotBaseNetwork` recognizes the known output programs from
   `DispatchNativeCompute` before translation, which can reject their per-tap gathers. The game
   selects different programs as the internal resolution changes. Match the full native key for
@@ -80,5 +81,4 @@ The game's constants (shader hashes, program keys, the cb0 offset) are in
   (`E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348`). A different revision needs its shaders checked.
 - B10G11R11 has little precision in dark tones: without the network's smoothing some banding
   shows in deep shadows.
-- The heavy dispatch between the prepass and the network still runs; its result goes unused.
 - Vulkan only: other backends offer no bypass state, so the setting has no effect there.

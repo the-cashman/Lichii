@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <array>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -48,6 +49,28 @@ FileSys::VirtualFile MakeNso(const std::vector<u8>& text, u32 text_size) {
     return std::make_shared<FileSys::VectorVfsFile>(std::move(bytes), "main");
 }
 
+struct Segment {
+    u32 location;
+    u32 size;
+    u32 stored; // bytes in the file
+};
+
+// An NSO with three stored (uncompressed) segments.
+FileSys::VirtualFile MakeStoredNso(const std::array<Segment, 3>& segments) {
+    std::vector<u8> bytes(0x100);
+    Put32(bytes, 0, Common::MakeMagic('N', 'S', 'O', '0'));
+    u32 offset = 0x100;
+    for (std::size_t i = 0; i < 3; ++i) {
+        Put32(bytes, 0x10 + i * 0x10, offset);
+        Put32(bytes, 0x14 + i * 0x10, segments[i].location);
+        Put32(bytes, 0x18 + i * 0x10, segments[i].size);
+        Put32(bytes, 0x60 + i * 4, segments[i].stored);
+        offset += segments[i].stored;
+    }
+    bytes.resize(offset, 0x5A);
+    return std::make_shared<FileSys::VectorVfsFile>(std::move(bytes), "main");
+}
+
 // Loads `nso` without mapping it into the process.
 std::optional<VAddr> Load(const FileSys::VirtualFile& nso) {
     ScopedSystemTestContext environment;
@@ -90,4 +113,28 @@ TEST_CASE("NSO rejects an LZ4 segment that does not decompress to its size", "[c
         const std::vector<u8> text{0x80, 'N', 'S', 'O', 't', 'e', 'x', 't', '!'};
         CHECK_FALSE(Load(MakeNso(text, 0x40)).has_value());
     }
+}
+
+TEST_CASE("NSO image covers a segment that ends after the last one", "[core][loader]") {
+    // The image used to be sized by the data segment, the last in the header, so the text segment
+    // placed after it was copied past the end of the image.
+    const auto end = Load(MakeStoredNso({{{0x3000, 0x10, 0x10}, {0x1000, 0x10, 0x10},
+                                          {0x2000, 0x10, 0x10}}}));
+    REQUIRE(end.has_value());
+    CHECK(*end - 0x8000000 >= 0x3010);
+}
+
+TEST_CASE("NSO rejects a stored segment larger than its data", "[core][loader]") {
+    // 0x40 bytes were copied from the 0x10 read for the text segment.
+    CHECK_FALSE(Load(MakeStoredNso({{{0, 0x40, 0x10}, {0x1000, 0x10, 0x10},
+                                     {0x2000, 0x10, 0x10}}}))
+                    .has_value());
+}
+
+TEST_CASE("NSO rejects segments that end past a 32-bit image", "[core][loader]") {
+    // The review of #1920: text at 0xfffffff0 with 0x20 bytes ends at 0x100000010, which the
+    // image's u32 size arithmetic wrapped to 0x10 after allocating over 4 GiB.
+    CHECK_FALSE(Load(MakeStoredNso({{{0xfffffff0, 0x20, 0x20}, {0x1000, 0x10, 0x10},
+                                     {0x2000, 0x10, 0x10}}}))
+                    .has_value());
 }
