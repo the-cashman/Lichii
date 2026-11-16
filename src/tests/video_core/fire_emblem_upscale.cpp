@@ -26,7 +26,9 @@ TICEntry Image(u32 address, u32 width, u32 height) {
 
 TEST_CASE("FE upscale substitute only selects the captured output pass", "[fe_upscale]") {
     REQUIRE(FE::UseReplacement(FE::ProgramId, FE::OutputProgramKey, nullptr));
-    REQUIRE(FE::UseReplacement(FE::ProgramId, FE::OutputProgramKey, "fsr"));
+    for (const char* option : {"fsr", "dlss", "spatial"}) {
+        REQUIRE(FE::UseReplacement(FE::ProgramId, FE::OutputProgramKey, option));
+    }
     for (const char* option : {"native", "standin", "0", "", "10", "invalid"}) {
         REQUIRE_FALSE(FE::UseReplacement(FE::ProgramId, FE::OutputProgramKey, option));
     }
@@ -194,7 +196,7 @@ TEST_CASE("Star Fox cutscene prepass opens the existing spatial replacement chai
     REQUIRE_FALSE(FE::CapturedPasses(FE::ProgramId)->IsPrepass(0));
 }
 
-TEST_CASE("Fire Emblem game version 1.1.1 prepass opens the replacement chain",
+TEST_CASE("Fire Emblem alternate prepass opens the replacement chain",
           "[starfox_upscale]") {
     const auto passes = FE::CapturedPasses(FE::ProgramId);
     REQUIRE(passes);

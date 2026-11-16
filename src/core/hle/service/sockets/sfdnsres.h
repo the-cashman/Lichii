@@ -23,6 +23,9 @@ namespace Service::Sockets {
 // getaddrinfo's reply as the guest reads it (libnx resolver.c).
 std::vector<u8> SerializeAddrInfo(const std::vector<Network::AddrInfo>& vec, std::string_view host);
 
+// The family serialized getaddrinfo hints ask for: INET6 for AF_INET6 hints, else INET.
+Network::Domain HintsFamily(std::span<const u8> hints);
+
 // The one entry getaddrinfo gives for a literal IPv4 host, typed by the serialized hints, or
 // nullopt when host isn't one or service isn't a port number.
 std::optional<Network::AddrInfo> LiteralAddrInfo(std::string_view host,
