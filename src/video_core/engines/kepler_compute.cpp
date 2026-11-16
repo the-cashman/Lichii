@@ -1115,8 +1115,12 @@ bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
     if (dlss_chain.output_pass) {
         return replacement && !recheck_after_dispatch && FinishDlssEvaluation();
     }
-    return DlssNetworkDroppedForGood() && !passes->IsPrepass(native_key) &&
-           dlss_chain.programs.contains(native_key);
+    // While the network can't be shown at all (turned off or replaced on request, resolution
+    // scaling, no support), its own passes are skipped like a network dropped for good: the
+    // replacement draws over their result anyway, and a pass that can't run (tensor operations
+    // unavailable) would drop the prepass's jitter, motion vectors and depth the replacement needs.
+    return (blocker != VideoCore::GameDlssReason::None || DlssNetworkDroppedForGood()) &&
+           !passes->IsPrepass(native_key) && dlss_chain.programs.contains(native_key);
 }
 
 // The game's own DLSS network (its translated programs) is shown once every pass of an
