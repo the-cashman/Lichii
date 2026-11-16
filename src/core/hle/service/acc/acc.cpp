@@ -804,7 +804,8 @@ private:
     // the same account its nx2 token names.
     u64 NetworkServiceAccountId() const {
         if (const auto account = Nextendo::LinkedAccount(); account && account->pid != 0) {
-            return account->pid;
+            return Common::Nextendo::NetworkServiceAccountId(
+                system.GetApplicationProcessProgramID(), *account);
         }
         return profile_manager->GetLastOpenedUser().Hash();
     }

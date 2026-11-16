@@ -26,29 +26,27 @@ std::string NextendoClientId(const QString& text) {
     return id.empty() ? Settings::values.nextendo_client_id.GetDefault() : id;
 }
 
-QString OnlineRefusal(const std::string& reason) {
+} // namespace
+
+QString ConfigureNetwork::OnlineRefusal(const std::string& reason) {
     if (reason == "unverified") {
-        return ConfigureNetwork::tr("Online play needs a verified e-mail address. Verify it on "
-                                    "nextendo.network.");
+        return tr("Online play needs a verified e-mail address. Verify it on nextendo.network.");
     }
     if (reason == "discord_unlinked") {
-        return ConfigureNetwork::tr("Online play needs a Discord account. Link one on "
-                                    "nextendo.network.");
+        return tr("Online play needs a Discord account. Link one on nextendo.network.");
     }
-    if (reason == "disabled") {
-        return ConfigureNetwork::tr("nextendo.network has suspended this account.");
+    if (reason == "disabled" || reason == "suspended") {
+        return tr("nextendo.network has suspended this account.");
     }
     if (reason == "elsewhere") {
-        return ConfigureNetwork::tr("This account is already playing online on another device.");
+        return tr("This account is already playing online on another device.");
     }
     if (reason == "unknown") {
-        return ConfigureNetwork::tr("nextendo.network doesn't recognise this account.");
+        return tr("nextendo.network doesn't recognise this account.");
     }
-    return ConfigureNetwork::tr("nextendo.network refuses online play for this account (%1).")
+    return tr("nextendo.network refuses online play for this account (%1).")
         .arg(QString::fromStdString(reason));
 }
-
-} // namespace
 
 ConfigureNetwork::ConfigureNetwork(const Core::System& system_, QWidget* parent, bool per_game_)
     : QWidget(parent), ui(std::make_unique<Ui::ConfigureNetwork>()), system{system_},
@@ -83,7 +81,14 @@ ConfigureNetwork::ConfigureNetwork(const Core::System& system_, QWidget* parent,
     });
     connect(ui->nextendo_sign_in, &QPushButton::clicked, this, &ConfigureNetwork::SignInToNextendo);
     connect(ui->nextendo_sign_out, &QPushButton::clicked, this, [this] {
+        const auto account = Common::Nextendo::LoadAccount();
         Common::Nextendo::ClearAccount();
+        if (account && !account->refresh_token.empty()) {
+            void(QtConcurrent::run([client_id = NextendoClientId(ui->nextendo_client_id->text()),
+                                    token = account->refresh_token] {
+                Common::Nextendo::RevokeToken(client_id, token);
+            }));
+        }
         nextendo_online.reset();
         UpdateNextendoStatus();
     });
@@ -119,12 +124,6 @@ void ConfigureNetwork::changeEvent(QEvent* event) {
 
 void ConfigureNetwork::RetranslateUI() {
     ui->retranslateUi(this);
-    if constexpr (!Common::Nextendo::OnlinePlayAvailable) {
-        ui->nextendo_enabled->setVisible(false);
-        ui->nextendo_description->setText(
-            tr("Sign in with your Nextendo Network account. Online play through Nextendo isn't "
-               "available in this build yet."));
-    }
     if (nextendo_signing_in) {
         ui->nextendo_sign_in->setText(tr("Cancel sign-in"));
     }
@@ -230,6 +229,9 @@ void ConfigureNetwork::UpdateNextendoStatus(const QString& error, bool signed_in
             break;
         case Common::Nextendo::SignOutReason::SessionRevoked:
             status = tr("Your session was ended on nextendo.network. Sign in again.");
+            break;
+        case Common::Nextendo::SignOutReason::MissingScope:
+            status = tr("The sign-in didn't allow online play. Sign in again and allow it.");
             break;
         case Common::Nextendo::SignOutReason::None:
             status = tr("Not signed in.");

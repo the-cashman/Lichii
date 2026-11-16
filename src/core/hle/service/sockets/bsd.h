@@ -6,6 +6,7 @@
 #pragma once
 
 #include <array>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -66,6 +67,9 @@ private:
     /// Counter behind a descriptor created by EventFd.
     struct EventFdState;
 
+    /// Values the guest set for options the host does not take, by level and option name.
+    using StoredSockOpts = std::map<std::pair<u32, u32>, std::vector<u8>>;
+
     /// A descriptor is open while it has a socket that no duplicate closed, or an eventfd.
     struct FileDescriptor {
         /// Shared with the descriptor's duplicates; null for an eventfd.
@@ -81,6 +85,8 @@ private:
         /// deferred receive or send waits. Set on every duplicate sharing the socket.
         u32 receive_timeout = 0;
         u32 send_timeout = 0;
+        /// Read back by getsockopt. Shared with the duplicates, and replaced rather than changed.
+        std::shared_ptr<const StoredSockOpts> stored_options;
     };
 
     /// What a deferred Select, Poll, RecvMMsg, SendMMsg, Read or Write goes on with when retried.
@@ -206,6 +212,10 @@ private:
     std::pair<s32, Errno> FcntlImpl(s32 fd, FcntlCmd cmd, s32 arg);
     Errno GetSockOptImpl(s32 fd, u32 level, OptName optname, std::vector<u8>& optval);
     Errno SetSockOptImpl(s32 fd, u32 level, OptName optname, std::span<const u8> optval);
+    /// Keeps optval as the value of an option the host does not take, for getsockopt to read back
+    /// on socket and its duplicates.
+    void StoreSockOpt(const std::shared_ptr<Network::SocketBase>& socket, u32 level,
+                      OptName optname, std::span<const u8> optval);
     Errno ShutdownImpl(s32 fd, s32 how);
     std::pair<s32, Errno> RecvImpl(s32 fd, u32 flags, std::vector<u8>& message);
     std::pair<s32, Errno> RecvFromImpl(s32 fd, u32 flags, std::vector<u8>& message,

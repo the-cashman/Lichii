@@ -32,6 +32,7 @@
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/server_manager.h"
 #include "core/hle/service/sockets/bsd.h"
+#include "core/hle/service/sockets/nextendo_redirect.h"
 #include "core/hle/service/sockets/sockets_translate.h"
 #include "core/internal_network/network.h"
 #include "core/internal_network/socket_proxy.h"
@@ -1771,9 +1772,16 @@ Errno BSD_USA::ConnectImpl(s32 fd, std::span<const u8> addr) {
 
     ASSERT(addr.size() >= 16);
 
-    auto addr_in = GetValue<SockAddrIn>(addr);
+    auto target = Translate(GetValue<SockAddrIn>(addr));
+    if (descriptor->is_connection_based) {
+        if (const auto routed =
+                Nextendo::RouteGamesync(system.GetApplicationProcessProgramID(), target)) {
+            LOG_INFO(Service, "Nextendo: Gamesync fd={} routed to port {}", fd, routed->portno);
+            target = *routed;
+        }
+    }
 
-    const Errno result = Translate(descriptor->socket->Connect(Translate(addr_in)));
+    const Errno result = Translate(descriptor->socket->Connect(target));
 
     if (result == Errno::ISCONN) {
         LOG_DEBUG(Service, "returned ISCONN - socket already connected");
@@ -1883,26 +1891,40 @@ Errno BSD_USA::GetSockOptImpl(s32 fd, u32 level, OptName optname, std::vector<u8
         put_value(u32{enabled ? 1U : 0U});
         return Errno::SUCCESS;
     };
+    // An option the host does not take reads back what the guest set, such as the 8 bytes
+    // Splatoon 3 sets for 0x80000001 after each connect.
+    const auto put_stored = [&] {
+        if (const auto& options = descriptor->stored_options) {
+            if (const auto stored = options->find({level, static_cast<u32>(optname)});
+                stored != options->end()) {
+                optval.resize((std::min)(optval.size(), stored->second.size()));
+                std::copy_n(stored->second.begin(), optval.size(), optval.begin());
+                return Errno::SUCCESS;
+            }
+        }
+        LOG_WARNING(Service, "(STUBBED) getsockopt level={:#x} optname={:#x} was never set", level,
+                    static_cast<u32>(optname));
+        return Errno::SUCCESS;
+    };
 
     if (level == static_cast<u32>(SocketLevel::TCP)) {
         switch (static_cast<TcpOptName>(optname)) {
         case TcpOptName::NODELAY:
             return put_flag(socket->GetNoDelay());
         default:
-            UNIMPLEMENTED_MSG("Unimplemented TCP getsockopt optname={:#x}",
-                              static_cast<u32>(optname));
-            return Errno::SUCCESS;
+            return put_stored();
         }
     }
 
     if (level != static_cast<u32>(SocketLevel::SOCKET)) {
-        UNIMPLEMENTED_MSG("Unknown getsockopt level");
-        return Errno::SUCCESS;
+        return put_stored();
     }
 
     switch (optname) {
     case OptName::REUSEADDR:
         return put_flag(socket->GetReuseAddr());
+    case OptName::REUSEPORT:
+        return put_flag(socket->GetReusePort());
     case OptName::ERROR_: {
         auto [pending_err, getsockopt_err] = socket->GetPendingError();
         if (getsockopt_err == Network::Errno::SUCCESS) {
@@ -1911,8 +1933,7 @@ Errno BSD_USA::GetSockOptImpl(s32 fd, u32 level, OptName optname, std::vector<u8
         return Translate(getsockopt_err);
     }
     default:
-        UNIMPLEMENTED_MSG("Unimplemented optname={}", optname);
-        return Errno::SUCCESS;
+        return put_stored();
     }
 }
 
@@ -1935,7 +1956,7 @@ Errno BSD_USA::SetSockOptImpl(s32 fd, u32 level, OptName optname, std::span<cons
     }
 
     if (level != static_cast<u32>(SocketLevel::SOCKET)) {
-        LOG_WARNING(Service, "(STUBBED) setsockopt with level={}, optname={}", level, optname);
+        StoreSockOpt(descriptor->socket, level, optname, optval);
         return Errno::SUCCESS;
     }
 
@@ -1958,6 +1979,8 @@ Errno BSD_USA::SetSockOptImpl(s32 fd, u32 level, OptName optname, std::span<cons
     case OptName::REUSEADDR:
         ASSERT(value == 0 || value == 1);
         return Translate(socket->SetReuseAddr(value != 0));
+    case OptName::REUSEPORT:
+        return Translate(socket->SetReusePort(value != 0));
     case OptName::KEEPALIVE:
         ASSERT(value == 0 || value == 1);
         return Translate(socket->SetKeepAlive(value != 0));
@@ -2003,10 +2026,32 @@ Errno BSD_USA::SetSockOptImpl(s32 fd, u32 level, OptName optname, std::span<cons
     }
     case OptName::NOSIGPIPE:
         LOG_WARNING(Service, "(STUBBED) setting NOSIGPIPE to {}", value);
+        StoreSockOpt(descriptor->socket, level, optname, optval);
         return Errno::SUCCESS;
     default:
-        UNIMPLEMENTED_MSG("Unimplemented optname={}", optname);
+        StoreSockOpt(descriptor->socket, level, optname, optval);
         return Errno::SUCCESS;
+    }
+}
+
+void BSD_USA::StoreSockOpt(const std::shared_ptr<Network::SocketBase>& socket, u32 level,
+                           OptName optname, std::span<const u8> optval) {
+    LOG_DEBUG(Service, "Storing setsockopt level={:#x} optname={:#x} len={} without applying it",
+              level, static_cast<u32>(optname), optval.size());
+    std::scoped_lock lock{file_descriptors_mutex};
+    std::shared_ptr<const StoredSockOpts> updated;
+    for (std::optional<FileDescriptor>& entry : file_descriptors) {
+        if (!entry || entry->socket != socket) {
+            continue;
+        }
+        if (!updated) {
+            auto options = entry->stored_options
+                               ? std::make_shared<StoredSockOpts>(*entry->stored_options)
+                               : std::make_shared<StoredSockOpts>();
+            (*options)[{level, static_cast<u32>(optname)}].assign(optval.begin(), optval.end());
+            updated = std::move(options);
+        }
+        entry->stored_options = updated;
     }
 }
 

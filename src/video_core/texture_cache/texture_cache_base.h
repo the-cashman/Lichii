@@ -204,6 +204,10 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     /// Why the next DeleteImage happens, for EDEN_NX2_TC_TRACE: the collector (and its mode),
     /// an unmap or a join. Read and reset by DeleteImage.
     const char* trace_delete_reason = "other";
+    /// The collector's deleted image: its flags before UnregisterImage cleared BadOverlap, and
+    /// whether its contents were written back to guest memory. Read and reset by DeleteImage.
+    u32 trace_delete_flags{};
+    bool trace_delete_downloaded{};
     u64 scale_epoch{};
     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
     bool debug_stats{}; ///< Collect what only the debug statistics lines use
@@ -710,6 +714,8 @@ private:
     /// skip the upload of a new target the clear overwrites whole.
     bool clearing_render_targets = false;
     bool is_rescaling = false;
+    /// The bound depth target is wider than tall by padding only (see FindDepthBuffer).
+    bool depth_target_padded = false;
     u64 total_used_memory = 0;
     u64 minimum_memory;
     u64 expected_memory;

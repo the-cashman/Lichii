@@ -3,6 +3,8 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+#include <charconv>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -207,15 +209,15 @@ static std::pair<u32, GetAddrInfoError> GetHostByNameRequestImpl(HLERequestConte
     IPC::RequestParser rp{ctx};
     const auto parameters = rp.PopRaw<InputParameters>();
 
-    LOG_WARNING(
-        Service,
-        "called with ignored parameters: use_nsd_resolve={}, cancel_handle={}, process_id={}",
-        parameters.use_nsd_resolve, parameters.cancel_handle, parameters.process_id);
+    LOG_WARNING(Service, "called with ignored parameters: cancel_handle={}, process_id={}",
+                parameters.cancel_handle, parameters.process_id);
 
     const auto host_buffer = ctx.ReadBuffer(0);
     std::string host = Common::StringFromBuffer(host_buffer);
-    if (Common::Nextendo::OnlinePlayActive()) {
-        host = Nextendo::ExpandNsdHost(std::move(host));
+    // Nextendo needs the names NSD gives even when a title asks for plain DNS (its /integration
+    // page: the system rewrites the Nintendo Account names before DNS).
+    if (parameters.use_nsd_resolve || Common::Nextendo::OnlinePlayActive()) {
+        host = Nextendo::ResolveFqdn(std::move(host));
     }
     // For now, ignore options, which are in input buffer 1 for GetHostByNameRequestWithOptions.
     const auto redirect = Nextendo::RedirectAddress(host, program_id);
@@ -280,8 +282,8 @@ void SFDNSRES::GetHostByNameRequestWithOptions(HLERequestContext& ctx) {
     });
 }
 
-static std::vector<u8> SerializeAddrInfo(const std::vector<Network::AddrInfo>& vec,
-                                         std::string_view host) {
+std::vector<u8> SerializeAddrInfo(const std::vector<Network::AddrInfo>& vec,
+                                  std::string_view host) {
     // Adapted from
     // https://github.com/switchbrew/libnx/blob/c5a9a909a91657a9818a3b7e18c9b91ff0cbb6e3/nx/source/runtime/resolver.c#L190
     std::vector<u8> data;
@@ -296,8 +298,9 @@ static std::vector<u8> SerializeAddrInfo(const std::vector<Network::AddrInfo>& v
         Append<u32_be>(data, 16); // ai_addrlen
         // ^ *not* sizeof(SerializedSockAddrIn), not that it matters since they're the same size
 
-        // ai_addr:
-        Append<u16_be>(data, static_cast<u16>(Translate(addrinfo.addr.family))); // sin_family
+        // ai_addr, a BSD sockaddr_in:
+        Append<u8>(data, 16);                                               // sin_len
+        Append<u8>(data, static_cast<u8>(Translate(addrinfo.addr.family))); // sin_family
         // On the Switch, the following fields are passed through htonl despite
         // already being big-endian, so they end up as little-endian.
         Append<u16_le>(data, addrinfo.addr.portno);                            // sin_port
@@ -319,6 +322,37 @@ static std::vector<u8> SerializeAddrInfo(const std::vector<Network::AddrInfo>& v
     return data;
 }
 
+std::optional<Network::AddrInfo> LiteralAddrInfo(std::string_view host,
+                                                 const std::optional<std::string>& service,
+                                                 std::span<const u8> hints) {
+    const auto ip = Nextendo::ParseIPv4(host);
+    if (!ip) {
+        return std::nullopt;
+    }
+    u16 port = 0;
+    if (service && !service->empty()) {
+        const char* const end = service->data() + service->size();
+        const auto [last, ec] = std::from_chars(service->data(), end, port);
+        if (ec != std::errc{} || last != end) {
+            return std::nullopt;
+        }
+    }
+    // A serialized addrinfo: magic, ai_flags, ai_family, ai_socktype, ai_protocol, big-endian.
+    std::array<u32_be, 5> header{};
+    if (hints.size() >= sizeof(header)) {
+        std::memcpy(header.data(), hints.data(), sizeof(header));
+    }
+    const bool udp = header[0] == 0xBEEFCAFE && (header[3] == static_cast<u32>(Type::DGRAM) ||
+                                                 header[4] == static_cast<u32>(Protocol::UDP));
+    return Network::AddrInfo{
+        .family = Network::Domain::INET,
+        .socket_type = udp ? Network::Type::DGRAM : Network::Type::STREAM,
+        .protocol = udp ? Network::Protocol::UDP : Network::Protocol::TCP,
+        .addr = {.family = Network::Domain::INET, .ip = *ip, .portno = port},
+        .canon_name = std::string{host},
+    };
+}
+
 static std::pair<u32, GetAddrInfoError> GetAddrInfoRequestImpl(HLERequestContext& ctx,
                                                                 u64 program_id) {
     struct InputParameters {
@@ -331,25 +365,13 @@ static std::pair<u32, GetAddrInfoError> GetAddrInfoRequestImpl(HLERequestContext
     IPC::RequestParser rp{ctx};
     const auto parameters = rp.PopRaw<InputParameters>();
 
-    LOG_WARNING(
-        Service,
-        "called with ignored parameters: use_nsd_resolve={}, cancel_handle={}, process_id={}",
-        parameters.use_nsd_resolve, parameters.cancel_handle, parameters.process_id);
-
-    // TODO: If use_nsd_resolve is true, pass the name through NSD::Resolve
-    // before looking up.
+    LOG_WARNING(Service, "called with ignored parameters: cancel_handle={}, process_id={}",
+                parameters.cancel_handle, parameters.process_id);
 
     const auto host_buffer = ctx.ReadBuffer(0);
     std::string host = Common::StringFromBuffer(host_buffer);
-    if (Common::Nextendo::OnlinePlayActive()) {
-        host = Nextendo::ExpandNsdHost(std::move(host));
-    }
-    const auto redirect = Nextendo::RedirectAddress(host, program_id);
-
-    // Prevent resolution of Nintendo servers
-    if (!redirect && IsBlockedHost(host)) {
-        LOG_WARNING(Network, "Resolution of hostname {} requested, returning EAI_AGAIN", host);
-        return {0, GetAddrInfoError::AGAIN};
+    if (parameters.use_nsd_resolve || Common::Nextendo::OnlinePlayActive()) {
+        host = Nextendo::ResolveFqdn(std::move(host));
     }
 
     std::optional<std::string> service = std::nullopt;
@@ -358,7 +380,25 @@ static std::pair<u32, GetAddrInfoError> GetAddrInfoRequestImpl(HLERequestContext
         service = Common::StringFromBuffer(service_buffer);
     }
 
-    // Serialized hints are also passed in a buffer, but are ignored for now.
+    if (Common::Nextendo::OnlinePlayActive()) {
+        const std::span<const u8> hints =
+            ctx.CanReadBuffer(2) ? ctx.ReadBuffer(2) : std::span<const u8>{};
+        if (const auto literal = LiteralAddrInfo(host, service, hints)) {
+            const std::vector<u8> data = SerializeAddrInfo({*literal}, host);
+            ctx.WriteBuffer(data, 0);
+            return {u32(data.size()), GetAddrInfoError::SUCCESS};
+        }
+    }
+
+    const auto redirect = Nextendo::RedirectAddress(host, program_id);
+
+    // Prevent resolution of Nintendo servers
+    if (!redirect && IsBlockedHost(host)) {
+        LOG_WARNING(Network, "Resolution of hostname {} requested, returning EAI_AGAIN", host);
+        return {0, GetAddrInfoError::AGAIN};
+    }
+
+    // Serialized hints are otherwise ignored for now.
 
     auto res_v = Network::GetAddressInfo(redirect.value_or(host), service);
     if (auto* res = std::get_if<std::vector<Network::AddrInfo>>(&res_v)) {

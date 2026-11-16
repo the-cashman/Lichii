@@ -213,7 +213,7 @@ public:
         // address itself; Nextendo needs the real name for SNI (citron-nextendo).
         std::string host = hostname_in;
         if (Common::Nextendo::OnlinePlayActive()) {
-            host = Sockets::Nextendo::ExpandNsdHost(std::move(host));
+            host = Sockets::Nextendo::ResolveFqdn(std::move(host));
         }
         if (Common::Nextendo::OnlinePlayActive() && socket) {
             const auto [peer, err] = socket->GetPeerName();
@@ -265,7 +265,7 @@ public:
         }
     }
 
-    Result DoHandshake() override {
+    Result DoHandshake(std::span<const u8> alpn) override {
         // A guest that connects to a redirected Nextendo address without a host name still
         // needs SNI, because Nextendo routes its :443 servers by name (citron-nextendo).
         if (socket && !SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name)) {
@@ -277,6 +277,13 @@ public:
                     SSL_set_tlsext_host_name(ssl, host.c_str());
                 }
             }
+        }
+
+        const char* const servername = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+        if (const auto wire = Sockets::Nextendo::AlpnProtocols(servername ? servername : "", alpn);
+            !wire.empty()) {
+            LOG_INFO(Service_SSL, "Nextendo: offering the guest's ALPN to NPLN host {}", servername);
+            SSL_set_alpn_protos(ssl, wire.data(), static_cast<unsigned>(wire.size()));
         }
 
         SSL_set_verify_result(ssl, X509_V_OK);

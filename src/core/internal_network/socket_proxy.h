@@ -66,6 +66,8 @@ public:
 
     Errno SetReuseAddr(bool enable) override;
 
+    Errno SetReusePort(bool enable) override;
+
     Errno SetBroadcast(bool enable) override;
 
     Errno SetKeepAlive(bool enable) override;
@@ -89,6 +91,8 @@ public:
 
     std::pair<bool, Errno> GetReuseAddr() override;
 
+    std::pair<bool, Errno> GetReusePort() override;
+
     std::pair<bool, Errno> GetNoDelay() override;
 
     bool IsOpened() const override;
@@ -104,6 +108,7 @@ private:
 
     bool broadcast = false;
     bool reuse_addr = false;
+    bool reuse_port = false;
     bool no_delay = false;
     bool closed = false;
     u32 send_timeout = 0;

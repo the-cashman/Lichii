@@ -3,8 +3,12 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <condition_variable>
 #include <future>
 #include <limits>
+#include <mutex>
+#include <thread>
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
 #define ZSTD_STATIC_LINKING_ONLY
@@ -281,14 +285,10 @@ TEST_CASE("Solid NCZ cache IO faults invalidate cached prefixes", "[ncz]") {
     struct Control {
         bool fail_read{};
         bool fail_write{};
-        bool destroyed{};
     };
     class FaultCache final : public Core::Crypto::NczCache {
     public:
         explicit FaultCache(std::shared_ptr<Control> control_) : control(std::move(control_)) {}
-        ~FaultCache() override {
-            control->destroyed = true;
-        }
         bool Write(std::span<const u8> bytes, u64 offset) override {
             if (control->fail_write) {
                 Core::Crypto::NczCache::Write(bytes.first(bytes.size() / 2), offset);
@@ -306,8 +306,9 @@ TEST_CASE("Solid NCZ cache IO faults invalidate cached prefixes", "[ncz]") {
     };
     auto control = std::make_shared<Control>();
     auto fixture = MakeSolid(0x300007);
-    auto file = Core::Crypto::DecompressNCZ(fixture.source, "synthetic.nca",
-                                            std::make_unique<FaultCache>(control));
+    auto owned = std::make_unique<FaultCache>(control);
+    const auto* cache = owned.get();
+    auto file = Core::Crypto::DecompressNCZ(fixture.source, "synthetic.nca", std::move(owned));
     REQUIRE(file);
     std::array<u8, 7> out{};
     REQUIRE(file->Read(out.data(), out.size(), Header) == out.size());
@@ -318,8 +319,8 @@ TEST_CASE("Solid NCZ cache IO faults invalidate cached prefixes", "[ncz]") {
         control->fail_read = true;
     }
     REQUIRE(file->Read(out.data(), out.size(), Header + 0x200000) == 0);
-    CHECK(control->destroyed);
-    CHECK_FALSE(file->IsReadable());
+    CHECK_FALSE(cache->IsOpen());
+    CHECK(file->IsReadable());
     CHECK(file->Read(out.data(), out.size(), 0) == 0);
     CHECK(file->Read(out.data(), out.size(), Header) == 0);
 }
@@ -450,6 +451,113 @@ TEST_CASE("A released solid NCZ reader resumes with identical bytes", "[ncz][res
     CheckRead(file, fixture.expected, Header + split - 9, 0x100);
     CHECK(counted->starts == opened + 2);
     CheckRead(file, fixture.expected, fixture.expected.size() - 7, 7);
+}
+
+TEST_CASE("A solid NCZ reader recovers once a full disk or the decoder budget clears",
+          "[ncz][resource]") {
+    struct Gate {
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool full{};
+        bool hold{};
+        std::size_t held{};
+        std::size_t writes{};
+    };
+    // Fails every write while the disk is full, and holds payload writes (and so the decoder
+    // of the reader that makes them) while hold is set.
+    class GateCache final : public Core::Crypto::NczCache {
+    public:
+        explicit GateCache(std::shared_ptr<Gate> gate_) : gate(std::move(gate_)) {}
+        bool Write(std::span<const u8> bytes, u64 offset) override {
+            {
+                std::unique_lock lock{gate->mutex};
+                ++gate->writes;
+                if (offset >= Header && gate->hold) {
+                    ++gate->held;
+                    gate->changed.notify_all();
+                    gate->changed.wait(lock, [this] { return !gate->hold; });
+                }
+                if (gate->full)
+                    return false;
+            }
+            return Core::Crypto::NczCache::Write(bytes, offset);
+        }
+
+    private:
+        std::shared_ptr<Gate> gate;
+    };
+    auto gate = std::make_shared<Gate>();
+
+    SECTION("full disk") {
+        auto fixture = MakeSolid(0x300007);
+        auto file = Core::Crypto::DecompressNCZ(fixture.source, "synthetic.nca",
+                                                std::make_unique<GateCache>(gate));
+        REQUIRE(file);
+        CheckRead(file, fixture.expected, Header, 7);
+        gate->full = true;
+        std::array<u8, 7> out{};
+        REQUIRE(file->Read(out.data(), out.size(), Header + 0x200000) == 0);
+        // The first read after the failure tries again at once, later ones wait.
+        auto writes = gate->writes;
+        CHECK(file->Read(out.data(), out.size(), Header) == 0);
+        CHECK(gate->writes > writes);
+        writes = gate->writes;
+        CHECK(file->Read(out.data(), out.size(), Header) == 0);
+        CHECK(gate->writes == writes);
+        gate->full = false;
+        std::this_thread::sleep_for(std::chrono::milliseconds{300});
+        CHECK(file->IsReadable());
+        CheckRead(file, fixture.expected, Header + 0x200000, 7);
+        CheckRead(file, fixture.expected, Header, 7);
+    }
+
+    SECTION("decoder budget held by decoding readers") {
+        auto fixture = MakeSolid(2 * 1024 * 1024);
+        auto source =
+            std::make_shared<FileSys::VectorVfsFile>(WideWindow(fixture.source->ReadAllBytes()));
+        // The budget holds three 128 MiB windows; these three hold them while they decode.
+        std::vector<FileSys::VirtualFile> busy;
+        for (std::size_t i = 0; i < 3; ++i) {
+            busy.push_back(Core::Crypto::DecompressNCZ(source, "synthetic.nca",
+                                                       std::make_unique<GateCache>(gate)));
+            REQUIRE(busy.back());
+        }
+        auto file = Core::Crypto::DecompressNCZ(source, "synthetic.nca");
+        REQUIRE(file);
+        gate->hold = true;
+        std::vector<std::future<std::size_t>> decoding;
+        struct Release {
+            Gate& gate;
+            void operator()() const {
+                std::scoped_lock lock{gate.mutex};
+                gate.hold = false;
+                gate.changed.notify_all();
+            }
+            ~Release() {
+                (*this)();
+            }
+        } release{*gate};
+        for (const auto& reader : busy) {
+            decoding.push_back(std::async(std::launch::async, [reader] {
+                std::array<u8, 1> out{};
+                return reader->Read(out.data(), out.size(), Header);
+            }));
+        }
+        {
+            std::unique_lock lock{gate->mutex};
+            REQUIRE(gate->changed.wait_for(lock, std::chrono::seconds{10},
+                                           [&] { return gate->held == busy.size(); }));
+        }
+        std::array<u8, 1> out{};
+        REQUIRE(file->Read(out.data(), out.size(), Header) == 0);
+        release();
+        for (auto& reader : decoding) {
+            CHECK(reader.get() == out.size());
+        }
+        CHECK(file->IsReadable());
+        CheckRead(file, fixture.expected, Header, 1);
+        CheckRead(file, fixture.expected, fixture.expected.size() - 1000, 1000);
+    }
 }
 
 #ifdef _WIN32

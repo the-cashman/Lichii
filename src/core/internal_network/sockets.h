@@ -85,6 +85,8 @@ public:
 
     virtual Errno SetReuseAddr(bool enable) = 0;
 
+    virtual Errno SetReusePort(bool enable) = 0;
+
     virtual Errno SetKeepAlive(bool enable) = 0;
 
     virtual Errno SetBroadcast(bool enable) = 0;
@@ -104,6 +106,8 @@ public:
     virtual std::pair<Errno, Errno> GetPendingError() = 0;
 
     virtual std::pair<bool, Errno> GetReuseAddr() = 0;
+
+    virtual std::pair<bool, Errno> GetReusePort() = 0;
 
     virtual std::pair<bool, Errno> GetNoDelay() = 0;
 
@@ -170,6 +174,8 @@ public:
 
     Errno SetReuseAddr(bool enable) override;
 
+    Errno SetReusePort(bool enable) override;
+
     Errno SetKeepAlive(bool enable) override;
 
     Errno SetBroadcast(bool enable) override;
@@ -192,6 +198,8 @@ public:
     std::pair<Errno, Errno> GetPendingError() override;
 
     std::pair<bool, Errno> GetReuseAddr() override;
+
+    std::pair<bool, Errno> GetReusePort() override;
 
     std::pair<bool, Errno> GetNoDelay() override;
 
@@ -237,6 +245,14 @@ private:
     /// Bumped each time the host socket starts or stops being nonblocking only for calls given
     /// FLAG_MSG_DONTWAIT, the socket's mode being blocking; odd while it is.
     std::atomic<u64> dont_wait_epoch{0};
+
+    // Winsock has no SO_REUSEPORT. Its SO_REUSEADDR lets sockets share a port as the guest's
+    // SO_REUSEPORT does, so the host option is set while the guest has either option set.
+
+    /// Guards reuse_addr, reuse_port and the host's SO_REUSEADDR.
+    std::mutex reuse_mutex;
+    bool reuse_addr = false;
+    bool reuse_port = false;
 #endif
 
     /// The mode SetNonBlock gave the socket.
