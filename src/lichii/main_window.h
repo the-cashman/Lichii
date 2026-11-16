@@ -471,6 +471,8 @@ private slots:
     bool EmulationShutdownProgressing();
 
 #ifdef ENABLE_UPDATE_CHECKER
+    // A manual check reports every outcome and ignores the skipped release and remind-later time.
+    void CheckForUpdates(bool manual);
     void OnEmulatorUpdateAvailable();
 #endif
     void KeepNextendoSessionAlive();
@@ -535,6 +537,8 @@ private:
 #ifdef ENABLE_UPDATE_CHECKER
     QFuture<UpdateChecker::CheckResult> update_future;
     QFutureWatcher<UpdateChecker::CheckResult> update_watcher;
+    bool update_check_running{};
+    bool update_check_manual{};
 #endif
 
     MultiplayerState* multiplayer_state = nullptr;

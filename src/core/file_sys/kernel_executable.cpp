@@ -28,13 +28,28 @@ bool DecompressBLZ(std::vector<u8>& data) {
     std::memcpy(&init_index, data.data() + data_size + 0x4, sizeof(u32));
     std::memcpy(&additional_size, data.data() + data_size + 0x8, sizeof(u32));
 
+    // The footer's sizes come from the file: keep every index inside the section.
+    if (compressed_size > data.size() || init_index > compressed_size) {
+        return false;
+    }
+
+    // Added in 64 bits: two u32s from the file can wrap. BLZ turns at most 17 input bytes into
+    // 144 output bytes, so a valid stream never asks for more than nine times its size.
+    const u64 out_size = u64{compressed_size} + additional_size;
+    if (out_size > u64{compressed_size} * 9 + 144) {
+        return false;
+    }
+
     const auto start_offset = data.size() - compressed_size;
-    data.resize(compressed_size + additional_size + start_offset);
+    data.resize(out_size + start_offset);
 
     std::size_t index = compressed_size - init_index;
-    std::size_t out_index = compressed_size + additional_size;
+    std::size_t out_index = out_size;
 
     while (out_index > 0) {
+        if (index < 1) {
+            return false;
+        }
         --index;
         auto control = data[index + start_offset];
         for (size_t i = 0; i < 8; ++i) {
@@ -66,7 +81,7 @@ bool DecompressBLZ(std::vector<u8>& data) {
                         data[out_index + j + segment_offset + start_offset];
                 }
             } else {
-                if (out_index < 1) {
+                if (out_index < 1 || index < 1) {
                     return false;
                 }
                 --out_index;
@@ -103,6 +118,12 @@ KIP::KIP(const VirtualFile& file) : status(Loader::ResultStatus::Success) {
     for (std::size_t i = 0; i < header.sections.size(); ++i) {
         auto compressed = file->ReadBytes(header.sections[i].compressed_size, offset);
         offset += header.sections[i].compressed_size;
+        // A section the file does not hold in full is a truncated KIP: ReadBytes stops at the end
+        // of the file, which used to leave a stored section shorter than its header says.
+        if (compressed.size() != header.sections[i].compressed_size) {
+            status = Loader::ResultStatus::ErrorBadKIPHeader;
+            return;
+        }
 
         if (header.sections[i].compressed_size == 0 && header.sections[i].decompressed_size != 0) {
             // Sections 3 to 5 (.bss and two unused ones) hold no file data and nothing reads

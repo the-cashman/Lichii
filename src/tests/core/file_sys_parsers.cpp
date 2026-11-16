@@ -30,6 +30,7 @@
 #include "core/file_sys/fssystem/fssystem_nca_header.h"
 #include "core/file_sys/ips_layer.h"
 #include "core/file_sys/partition_filesystem.h"
+#include "core/file_sys/program_metadata.h"
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/vfs/vfs_vector.h"
 #include "core/loader/loader.h"
@@ -621,6 +622,40 @@ TEST_CASE("IPSwitch offset shift without a value does not read the next lines",
     const auto out = ApplyIPSwitch(compiler, 0x40);
     REQUIRE(out[0] == 0xAB);
     REQUIRE(out[0x20] == 0);
+}
+
+
+// A 0x480-byte NPDM with its ACID at 0x100 and its ACI0 at `aci_offset`.
+VirtualFile MakeNpdm(u32 aci_offset) {
+    std::vector<u8> bytes(0x480);
+    std::memcpy(bytes.data(), "META", 4);
+    Put(bytes, 0x70, aci_offset);
+    Put(bytes, 0x74, u32{0x40});
+    Put(bytes, 0x78, u32{0x100});
+    Put(bytes, 0x7C, u32{0x240});
+    std::memcpy(bytes.data() + 0x300, "ACID", 4);
+    Put(bytes, 0x320, u32{0x240}); // file access control, ACID-relative
+    Put(bytes, 0x324, u32{0x2C});
+    std::memcpy(bytes.data() + 0x400, "ACI0", 4);
+    Put(bytes, 0x420, u32{0x40}); // file access header, ACI0-relative
+    Put(bytes, 0x424, u32{0x1C});
+    Put(bytes, 0x430, u32{0x60}); // kernel capabilities, ACI0-relative
+    Put(bytes, 0x434, u32{8});
+    return MakeFile(std::move(bytes));
+}
+
+TEST_CASE("NPDM with an ACI0 block loads", "[core][file_sys]") {
+    ProgramMetadata npdm;
+    REQUIRE(npdm.Load(MakeNpdm(0x400)) == Loader::ResultStatus::Success);
+}
+
+TEST_CASE("NPDM rejects an ACI0 offset that does not point at an ACI0 block",
+          "[core][file_sys]") {
+    // Offsets 0 and 1 used to load, with the ACI0 fields read from the NPDM header.
+    for (const u32 offset : {0u, 1u, 0x100u}) {
+        ProgramMetadata npdm;
+        CHECK(npdm.Load(MakeNpdm(offset)) == Loader::ResultStatus::ErrorBadACIHeader);
+    }
 }
 
 } // namespace

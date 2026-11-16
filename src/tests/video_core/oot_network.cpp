@@ -7,14 +7,6 @@
 
 using namespace VideoCommon::OotNetwork;
 
-TEST_CASE("Ocarina of Time tonemap shaders are recognized", "[video_core][oot_network]") {
-    STATIC_REQUIRE(IsTonemapShader(0xbded5ce917183214ULL));
-    STATIC_REQUIRE(IsTonemapShader(0x6cb06edf14be1d79ULL));
-    STATIC_REQUIRE(IsTonemapShader(0x3ac011bd2d772994ULL));
-    STATIC_REQUIRE_FALSE(IsTonemapShader(0));
-    STATIC_REQUIRE_FALSE(IsTonemapShader(PrepassProgramKey));
-}
-
 TEST_CASE("Ocarina of Time network bypass follows the setting and the game",
           "[video_core][oot_network]") {
     auto& setting = Settings::values.oot_anti_aliasing;
