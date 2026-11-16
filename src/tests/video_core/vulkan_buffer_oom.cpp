@@ -113,3 +113,50 @@ TEST_CASE("Vulkan buffers: aligned CreateBuffer keeps its alignment on the share
         CHECK(buffers.back().Location().offset % alignment == 0);
     }
 }
+
+// #262 again: a guest buffer the buffer cache had no memory for after a scene change.
+TEST_CASE("Vulkan buffers: CreateAfterRecovery retries once after freeing memory",
+          "[vulkan_buffer_oom]") {
+    int creates = 0;
+    int recoveries = 0;
+    const auto recover = [&] { ++recoveries; };
+
+    SECTION("a create that succeeds recovers nothing") {
+        REQUIRE(Vulkan::CreateAfterRecovery([&] { return ++creates; }, recover) == 1);
+        REQUIRE(recoveries == 0);
+    }
+    SECTION("out of memory once: recovered, then created") {
+        const int result = Vulkan::CreateAfterRecovery(
+            [&] {
+                if (++creates == 1) {
+                    throw Vulkan::vk::Exception(VK_ERROR_OUT_OF_DEVICE_MEMORY);
+                }
+                return creates;
+            },
+            recover);
+        REQUIRE(result == 2);
+        REQUIRE(recoveries == 1);
+    }
+    SECTION("out of memory twice: the second failure throws") {
+        REQUIRE_THROWS_AS(Vulkan::CreateAfterRecovery(
+                              [&]() -> int {
+                                  ++creates;
+                                  throw Vulkan::vk::Exception(VK_ERROR_OUT_OF_HOST_MEMORY);
+                              },
+                              recover),
+                          Vulkan::vk::Exception);
+        REQUIRE(creates == 2);
+        REQUIRE(recoveries == 1);
+    }
+    SECTION("another error is not retried") {
+        REQUIRE_THROWS_AS(Vulkan::CreateAfterRecovery(
+                              [&]() -> int {
+                                  ++creates;
+                                  throw Vulkan::vk::Exception(VK_ERROR_DEVICE_LOST);
+                              },
+                              recover),
+                          Vulkan::vk::Exception);
+        REQUIRE(creates == 1);
+        REQUIRE(recoveries == 0);
+    }
+}
