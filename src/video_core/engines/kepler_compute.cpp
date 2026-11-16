@@ -1447,7 +1447,7 @@ bool KeplerCompute::BypassOotBaseNetwork() {
 }
 
 /// Replace a known output pass with a copy of the tonemapped image it samples, using scaling for
-/// the base game. The update's prepass and network may be skipped after a successful replacement.
+/// the base game. The update's network passes may be skipped after a successful replacement.
 bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     using namespace VideoCommon::OotNetwork;
     if (!BypassEnabled(program_id)) {
@@ -1475,6 +1475,16 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
         const bool skip = bypass->output_replaced.load(std::memory_order_relaxed);
         bypass->output_pending.store(skip, std::memory_order_relaxed);
         return skip;
+    }
+    if (ShouldSkipUnusedDispatch(native_key,
+                                 bypass->output_replaced.load(std::memory_order_relaxed),
+                                 bypass->output_pending.load(std::memory_order_relaxed))) {
+        static bool logged = false;
+        if (!std::exchange(logged, true)) {
+            LOG_INFO(HW_GPU, "Skipping unused AA dispatch {:016x} after output replacement",
+                     native_key);
+        }
+        return true;
     }
     if (native_key == NetworkProgramKey) {
         bypass->after_network.store(0, std::memory_order_relaxed);

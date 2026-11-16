@@ -7,6 +7,22 @@
 
 using namespace VideoCommon::OotNetwork;
 
+TEST_CASE("Unused AA dispatch requires confirmed output replacement and a skipped prepass",
+          "[video_core][oot_network]") {
+    CHECK_FALSE(ShouldSkipUnusedDispatch(UnusedDispatchProgramKey, false, false));
+    CHECK_FALSE(ShouldSkipUnusedDispatch(UnusedDispatchProgramKey, false, true));
+    CHECK_FALSE(ShouldSkipUnusedDispatch(UnusedDispatchProgramKey, true, false));
+    CHECK(ShouldSkipUnusedDispatch(UnusedDispatchProgramKey, true, true));
+    CHECK_FALSE(ShouldSkipUnusedDispatch(UnusedDispatchProgramKey ^ 1, true, true));
+    CHECK_FALSE(ShouldSkipUnusedDispatch(0xd9ee412f00ce399aULL, true, true));
+    CHECK_FALSE(ShouldSkipUnusedDispatch(PrepassProgramKey, true, true));
+    CHECK_FALSE(ShouldSkipUnusedDispatch(NetworkProgramKey, true, true));
+    CHECK_FALSE(ShouldSkipUnusedDispatch(OutputProgramKey, true, true));
+    for (const auto& output : BaseOutputPrograms) {
+        CHECK_FALSE(ShouldSkipUnusedDispatch(output.key, true, true));
+    }
+}
+
 TEST_CASE("Ocarina of Time network bypass follows the setting and the game",
           "[video_core][oot_network]") {
     auto& setting = Settings::values.oot_anti_aliasing;

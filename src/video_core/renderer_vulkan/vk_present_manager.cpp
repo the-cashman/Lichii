@@ -768,7 +768,6 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
             break;
         case VK_ERROR_DEVICE_LOST:
             device.ReportLoss();
-            [[fallthrough]];
         default:
             vk::Check(result);
             break;

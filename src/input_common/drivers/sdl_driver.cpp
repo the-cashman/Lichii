@@ -74,6 +74,66 @@ SDL_GamepadBinding FindBinding(const GamepadBindings& bindings, Predicate matche
     return it != bindings.end() ? *it : EmptyBinding();
 }
 
+/// Bit mask of the joystick axes the gamepad mapping reads reversed for a stick. Apple's
+/// GameController backend reports stick Y up-positive and reverses it in the mapping it
+/// generates, while Lichii reads joystick axes in SDL's down-positive convention (#1399).
+u64 GetReversedStickAxes([[maybe_unused]] const GamepadBindings& bindings) {
+#ifdef __APPLE__
+    u64 reversed = 0;
+    for (const auto& binding : bindings) {
+        if (binding.input_type != SDL_GAMEPAD_BINDTYPE_AXIS ||
+            binding.output_type != SDL_GAMEPAD_BINDTYPE_AXIS) {
+            continue;
+        }
+        const auto& input = binding.input.axis;
+        const auto& output = binding.output.axis;
+        if (output.axis_min == SDL_JOYSTICK_AXIS_MIN && output.axis_max == SDL_JOYSTICK_AXIS_MAX &&
+            input.axis_min == SDL_JOYSTICK_AXIS_MAX && input.axis_max == SDL_JOYSTICK_AXIS_MIN &&
+            input.axis >= 0 && input.axis < 64) {
+            reversed |= u64{1} << input.axis;
+        }
+    }
+    return reversed;
+#else
+    return 0;
+#endif
+}
+
+std::string_view GetJoystickBackend(const SDL_GUID& guid) {
+    switch (guid.data[14]) {
+    case 'h':
+        return "HIDAPI";
+    case 'm':
+        return "GameController";
+    case 'r':
+        return "RawInput";
+    case 'w':
+        return "WGI";
+    case 'x':
+        return "XInput";
+    case 'v':
+        return "virtual";
+    default:
+        return "native";
+    }
+}
+
+void LogJoystickDetails(SDL_Joystick* joystick, SDL_Gamepad* gamepad, u64 reversed_axes) {
+    const SDL_GUID guid = SDL_GetJoystickGUID(joystick);
+    std::array<char, 33> guid_string{};
+    SDL_GUIDToString(guid, guid_string.data(), static_cast<int>(guid_string.size()));
+    std::string axes;
+    const int axis_count = SDL_GetNumJoystickAxes(joystick);
+    for (int axis = 0; axis < axis_count; ++axis) {
+        axes += fmt::format("{}{}", axis == 0 ? "" : " ", SDL_GetJoystickAxis(joystick, axis));
+    }
+    char* const mapping = gamepad != nullptr ? SDL_GetGamepadMapping(gamepad) : nullptr;
+    LOG_INFO(Input, "SDL GUID {}, backend {}, axes [{}], reversed stick axes {:#x}, mapping: {}",
+             guid_string.data(), GetJoystickBackend(guid), axes, reversed_axes,
+             mapping != nullptr ? mapping : "none");
+    SDL_free(mapping);
+}
+
 SDL_GamepadBinding GetBindingForButton(const GamepadBindings& bindings, SDL_GamepadButton button) {
     return FindBinding(bindings, [button](const SDL_GamepadBinding& current) {
         return current.output_type == SDL_GAMEPAD_BINDTYPE_BUTTON &&
@@ -167,15 +227,27 @@ public:
     // for the map lock (raw input).
     SDLJoystick(Common::UUID guid_, int port_, SDL_Joystick* joystick,
                                 SDL_Gamepad* game_controller,
-                                std::shared_ptr<RenHDrumPad> renhdrum_pad = nullptr)
+                                std::shared_ptr<RenHDrumPad> renhdrum_pad = nullptr,
+                                u64 reversed_axes_ = 0)
                 : guid{guid_}, port{port_}, sdl_joystick{joystick, &SDL_CloseJoystick},
                     sdl_controller{game_controller, &SDL_CloseGamepad},
+                    reversed_axes{reversed_axes_},
                     renhdrum{std::move(renhdrum_pad)} {}
 
     ~SDLJoystick() {
         if (renhdrum) {
             renhdrum->Shutdown();
         }
+    }
+
+    f32 GetAxisValue(int axis, s16 value) const {
+        const f32 axis_value = value / 32767.0f;
+        const bool reversed = axis >= 0 && axis < 64 && ((reversed_axes >> axis) & 1) != 0;
+        return reversed ? -axis_value : axis_value;
+    }
+
+    u64 GetReversedAxes() const {
+        return reversed_axes;
     }
 
     void EnableMotion() {
@@ -506,8 +578,11 @@ public:
         return sdl_controller.get();
     }
 
+    /// `new_reversed_axes`: GetReversedStickAxes of the controller's bindings, read by the caller
+    /// outside the joystick map lock (it calls into SDL).
     void SetSDLJoystick(SDL_Joystick* joystick, SDL_Gamepad* controller,
-                        std::shared_ptr<RenHDrumPad> new_pad = nullptr) {
+                        std::shared_ptr<RenHDrumPad> new_pad = nullptr,
+                        u64 new_reversed_axes = 0) {
         {
             std::scoped_lock lock{haptics_mutex};
             haptics.Close();
@@ -533,6 +608,7 @@ public:
         }
         sdl_joystick.reset(joystick);
         sdl_controller.reset(controller);
+        reversed_axes = new_reversed_axes;
         std::scoped_lock lock{renhdrum_mutex};
         renhdrum = std::move(new_pad);
     }
@@ -680,6 +756,7 @@ private:
     int port;
     std::unique_ptr<SDL_Joystick, decltype(&SDL_CloseJoystick)> sdl_joystick;
     std::unique_ptr<SDL_Gamepad, decltype(&SDL_CloseGamepad)> sdl_controller;
+    std::atomic<u64> reversed_axes;
     mutable std::mutex mutex;
 
     mutable std::mutex renhdrum_mutex;
@@ -845,8 +922,9 @@ void SDLDriver::InitJoystick(SDL_JoystickID joystick_id) {
     const char* const path = SDL_GetJoystickPath(sdl_joystick);
     std::string joystick_path = path != nullptr ? path : "";
 
-    // Outside the map lock, see SDLJoystick
+    // Outside the map lock, see SDLJoystick (reading the bindings calls into SDL too)
     auto renhdrum_pad = RenHDrumPad::Create(sdl_joystick, sdl_gamecontroller);
+    const u64 reversed_axes = GetReversedStickAxes(GetBindings(sdl_gamecontroller));
 
     // Motion sensors are switched on after the map lock is released, for the same reason
     std::shared_ptr<SDLJoystick> added;
@@ -854,7 +932,7 @@ void SDLDriver::InitJoystick(SDL_JoystickID joystick_id) {
         std::scoped_lock lock{joystick_map_mutex};
         if (joystick_map.find(guid) == joystick_map.end()) {
             added = std::make_shared<SDLJoystick>(guid, 0, sdl_joystick, sdl_gamecontroller,
-                                                  std::move(renhdrum_pad));
+                                                  std::move(renhdrum_pad), reversed_axes);
             PreSetController(added->GetPadIdentifier());
             SetBattery(added->GetPadIdentifier(),
                        added->GetBatteryLevel(battery_state, battery_percent));
@@ -866,11 +944,13 @@ void SDLDriver::InitJoystick(SDL_JoystickID joystick_id) {
                              [](const auto& joystick) { return !joystick->GetSDLJoystick(); });
             if (joystick_it != joystick_guid_list.end()) {
                 added = *joystick_it;
-                added->SetSDLJoystick(sdl_joystick, sdl_gamecontroller, std::move(renhdrum_pad));
+                added->SetSDLJoystick(sdl_joystick, sdl_gamecontroller, std::move(renhdrum_pad),
+                                      reversed_axes);
             } else {
                 const int port = static_cast<int>(joystick_guid_list.size());
                 added = std::make_shared<SDLJoystick>(guid, port, sdl_joystick,
-                                                      sdl_gamecontroller, std::move(renhdrum_pad));
+                                                      sdl_gamecontroller, std::move(renhdrum_pad),
+                                                      reversed_axes);
                 PreSetController(added->GetPadIdentifier());
                 joystick_guid_list.emplace_back(added);
             }
@@ -881,6 +961,7 @@ void SDLDriver::InitJoystick(SDL_JoystickID joystick_id) {
     added->EnableMotion();
     LOG_INFO(Input, "{} connected on port {} (instance {}, {})", added->GetControllerName(),
              added->GetPort(), joystick_id, joystick_path);
+    LogJoystickDetails(sdl_joystick, sdl_gamecontroller, added->GetReversedAxes());
     added->StartSilenceCheck(std::move(joystick_path));
 }
 
@@ -984,7 +1065,8 @@ void SDLDriver::HandleGameControllerEvent(const SDL_Event& event) {
         if (const auto joystick = GetSDLJoystickBySDLID(event.jaxis.which)) {
             joystick->MarkInput();
             const PadIdentifier identifier = joystick->GetPadIdentifier();
-            SetAxis(identifier, event.jaxis.axis, event.jaxis.value / 32767.0f);
+            SetAxis(identifier, event.jaxis.axis,
+                    joystick->GetAxisValue(event.jaxis.axis, event.jaxis.value));
         }
         break;
     }

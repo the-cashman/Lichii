@@ -21,6 +21,8 @@ constexpr u64 ProgramId = 0x0400486024DEC000ULL;
 
 // Native program keys of the network's compute passes.
 constexpr u64 PrepassProgramKey = 0x8475d671e6967428ULL;
+// Match the native key, not this pass's lowered shader hash (d9ee412f00ce399a).
+constexpr u64 UnusedDispatchProgramKey = 0x9387db798781f081ULL;
 constexpr u64 NetworkProgramKey = 0x42593194bb0b2b32ULL;
 constexpr u64 OutputProgramKey = 0xda6df3e54c716df2ULL;
 
@@ -57,6 +59,11 @@ struct BypassState {
     /// The first native program dispatched after the network, 0 until one is seen.
     std::atomic<u64> after_network{};
 };
+
+/// This program feeds only the bypassed network. Do not skip it outside its prepass window.
+inline bool ShouldSkipUnusedDispatch(u64 native_key, bool output_replaced, bool output_pending) {
+    return native_key == UnusedDispatchProgramKey && output_replaced && output_pending;
+}
 
 inline bool BypassEnabled(u64 program_id) {
     return program_id == ProgramId &&
