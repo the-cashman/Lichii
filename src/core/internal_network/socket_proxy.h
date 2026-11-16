@@ -84,6 +84,10 @@ public:
 
     Errno SetNonBlock(bool enable) override;
 
+    Errno SetIpv6Option(Ipv6Option option, s32 value) override;
+
+    std::pair<s32, Errno> GetIpv6Option(Ipv6Option option) override;
+
     template <typename T>
     Errno SetSockOpt(SOCKET fd, int option, T value);
 

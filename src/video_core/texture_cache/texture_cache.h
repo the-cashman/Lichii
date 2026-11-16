@@ -602,8 +602,10 @@ void TextureCache<P>::TickFrame() {
                             ? HostCriticalMemory(runtime.GetDeviceMemoryUsage(), *commit_room)
                             : (std::numeric_limits<u64>::max)();
                     critical_memory = (std::min)(critical_memory, host_critical);
-                    const u64 room_margin = (std::min)(fit_margin + slack_margin, budget / 2);
-                    retention_limit = (std::min)(budget - room_margin, host_critical);
+                    retention_budget = RetentionBudget(retention_budget, budget);
+                    const u64 room_margin =
+                        (std::min)(fit_margin + slack_margin, retention_budget / 2);
+                    retention_limit = (std::min)(retention_budget - room_margin, host_critical);
                     expected_memory = critical_memory - (std::min)(margin, critical_memory / 2);
                     ApplyThresholdOverrides(false);
                     u64 other_memory = 0;
@@ -643,6 +645,14 @@ void TextureCache<P>::TickFrame() {
                             critical_memory = (std::max)(critical_memory, raised);
                             expected_memory =
                                 critical_memory - (std::min)(gap, critical_memory / 2);
+                            // The retention floor is compared with the same usage, so it gets the
+                            // same raise: without it the usage stayed past the floor, and images
+                            // went after the mode's age instead of MinEvictionAge.
+                            const u64 heap_room =
+                                heap_budget - (std::min)(room_margin, heap_budget / 2);
+                            retention_limit = (std::min)(
+                                (std::min)(retention_limit + other_memory, heap_room),
+                                host_critical);
                         }
                     }
                     // Log the first values and real changes (the budget moves by a few MiB all
@@ -659,9 +669,11 @@ void TextureCache<P>::TickFrame() {
                         LogThresholds();
                         LOG_INFO(HW_GPU,
                                  "Memory margins: base {} MiB, out of memory {} MiB, host spill {} "
-                                 "MiB, block slack {} MiB, not textures {} MiB",
+                                 "MiB, block slack {} MiB, not textures {} MiB; budget {} MiB, "
+                                 "retention limit {} MiB (lowest budget lately {} MiB)",
                                  margin >> 20, pressure_margin >> 20, spill_margin >> 20,
-                                 slack_margin >> 20, other_memory >> 20);
+                                 slack_margin >> 20, other_memory >> 20, budget >> 20,
+                                 retention_limit >> 20, retention_budget >> 20);
                         if (commit_room) {
                             LOG_INFO(HW_GPU, "Host memory: {} MiB of commit left, {}",
                                      *commit_room >> 20,
@@ -2925,6 +2937,15 @@ template <class P>
 bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
     if (!image.info.rescaleable) {
         return false;
+    }
+    if constexpr (requires { runtime.GetMaxScaledExtent(); }) {
+        // Past the device's limits the scaled image is invalid. Ocarina of Time's 12288x12288
+        // sun shadow map is 18432 wide at 1.5x and 24576 at 2x, over AMD's 16384, and drawing
+        // into it hangs the GPU (#1885).
+        if (!ScaledImageFits(image.info, Settings::values.resolution_info,
+                             runtime.GetMaxScaledExtent())) {
+            return false;
+        }
     }
     if (Settings::values.resolution_info.downscale && !image.info.downscaleable) {
         return false;

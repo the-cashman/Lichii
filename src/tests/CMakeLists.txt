@@ -12,6 +12,8 @@ add_executable(tests
     video_core/block_linear_swizzle.cpp
     video_core/aftermath_dump.cpp
     video_core/frame_dump_schedule.cpp
+    video_core/frame_gen_generations.cpp
+    video_core/frame_pacer.cpp
     video_core/nx2_stutter_trace.cpp
     video_core/back_idle_trace.cpp
     video_core/list_macro_trace.cpp
@@ -39,6 +41,7 @@ add_executable(tests
     core/keyblob_cmac.cpp
     core/aes_xts.cpp
     common/display_hdr.cpp
+    common/restore_eden_path.cpp
     common/dkb_cpu_trace.cpp
     common/dkb_frame_trace.cpp
     audio_core/nx2_sysmix.cpp
@@ -49,6 +52,7 @@ add_executable(tests
     video_core/ampere_starfox_test10.cpp
     video_core/ampere_yoshi_title.cpp
     video_core/ampere_yoshi_compute.cpp
+    video_core/scaled_image_fits.cpp
     video_core/texture_rect_descriptor.cpp
     video_core/join_whole_copy.cpp
     video_core/padded_square.cpp
@@ -76,13 +80,16 @@ add_executable(tests
     video_core/storage_write_extent.cpp
     video_core/storage_buffer_control_flow.cpp
     video_core/conditional_barrier.cpp
+    video_core/far_plane_position.cpp
     video_core/storage_buffer_shared_tracking.cpp
     core/nup_validation.cpp
+    core/fs_read_throttle.cpp
     core/npdm_kac.cpp
     core/nx_archive.cpp
     frontend_common/nx_archive.cpp
     core/vfs_vector.cpp
     core/kip_ini.cpp
+    core/add_on_application_id.cpp
     core/ncz_cache.cpp
     core/kip_truncated.cpp
     core/ncz_decompressor.cpp
@@ -128,6 +135,7 @@ add_executable(tests
     video_core/spirv_storage_alignment.cpp
     video_core/spirv_fragment_shuffle.cpp
     video_core/mesh_fallback.cpp
+    video_core/mesh_vertex_input.cpp
     video_core/multi_range_refresh.cpp
     video_core/command_fetch_order.cpp
     video_core/gpu_trace.cpp
@@ -142,6 +150,7 @@ add_executable(tests
     video_core/maxwell_fast_method.cpp
     hid_core/emulated_controller_config.cpp
     hid_core/sensor_info.cpp
+    common/flat_allocator.cpp
     common/paged_scalar.cpp
     common/queue_lifetime.cpp
     common/queue_timed_wait.cpp
@@ -173,6 +182,7 @@ add_executable(tests
     video_core/fast_draw.cpp
     video_core/gpu_command_safety.cpp
     video_core/syncpoint_actions.cpp
+    video_core/due_composites.cpp
     video_core/nx2_video_av1.cpp
     video_core/nx2_video_render.cpp
     video_core/ampere_matrix.cpp
@@ -236,6 +246,8 @@ add_executable(tests
     core/priority_queue.cpp
     core/internal_network/network.cpp
     core/bsd_sockopt_ipc.cpp
+    core/bsd_ipv6_ipc.cpp
+    core/ipv6_sockets.cpp
     core/numeric_name_info.cpp
     core/numeric_name_info_ipc.cpp
     core/nifm_request.cpp

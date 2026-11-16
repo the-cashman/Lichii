@@ -14,6 +14,7 @@
 #include "common/settings.h"
 #include "core/hle/service/sockets/nextendo_redirect.h"
 #include "core/hle/service/sockets/sfdnsres.h"
+#include "tests/common/restore_eden_path.h"
 
 namespace Nextendo = Service::Sockets::Nextendo;
 
@@ -109,7 +110,7 @@ TEST_CASE("Nextendo: the hosts file and built-in rules resolve in the wiki's ord
     Settings::values.nextendo_enabled = false;
     REQUIRE_FALSE(Nextendo::RedirectAddress("dauth-lp1.ndas.srv.nintendo.net").has_value());
     Settings::values.nextendo_server_ip.SetValue(Settings::values.nextendo_server_ip.GetDefault());
-    Common::FS::SetEdenPath(Common::FS::EdenPath::SDMCDir, previous_sdmc);
+    Tests::RestoreEdenPath(Common::FS::EdenPath::SDMCDir, previous_sdmc);
     std::error_code ec;
     std::filesystem::remove_all(sdmc, ec);
 }

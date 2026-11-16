@@ -485,6 +485,11 @@ private slots:
     // When a game boots with online play on: says when the signed game catalogue doesn't accept
     // its version.
     void CheckNextendoGameVersion(u64 title_id, std::string version);
+    // While a game runs: refreshes the friend list the friend service reads and sends presence.
+    void UpdateNextendoSocial();
+    // Pulls the Nextendo nickname and picture into the current user. Not while a game runs, as
+    // the guest reads the profile.
+    void SyncNextendoProfile(bool force);
 
 private:
     void OnGameListNxTool(const std::string& game_path, void (NxTools::*tool)(const std::string&));
@@ -572,8 +577,16 @@ private:
     QTimer nextendo_session_timer;
     QFutureWatcher<Common::Nextendo::SignOutReason> nextendo_session_watcher;
     QFutureWatcher<std::optional<Common::Nextendo::OnlineStatus>> nextendo_status_watcher;
+    // The profile nextendo_status_watcher checks.
+    Common::UUID nextendo_status_profile;
     QFutureWatcher<std::optional<Common::Nextendo::GameCatalog>> nextendo_catalog_watcher;
     std::optional<std::pair<u64, std::string>> nextendo_version_check;
+    QTimer nextendo_social_timer;
+    QFutureWatcher<void> nextendo_social_watcher;
+    QFutureWatcher<std::optional<Common::Nextendo::ProfilePull>> nextendo_profile_watcher;
+    Common::UUID nextendo_profile_user;
+    // A forced pull that has to wait for the game to stop or for the running pull.
+    bool nextendo_profile_force{};
     OverlayDialog* shutdown_dialog{};
     BugReportDialog* bug_report_dialog{};
     PerformanceOverlay* perf_overlay = nullptr;

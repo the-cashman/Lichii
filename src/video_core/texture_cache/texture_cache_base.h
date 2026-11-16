@@ -180,6 +180,7 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     /// (6.48 GB) and the collector deleted ~40 recently used images a frame again; images that
     /// do not fit add to the out-of-memory margin.
     u64 retention_limit{};
+    u64 retention_budget{}; ///< The lowest driver budget read lately (RetentionBudget)
     u64 logged_critical_memory{}; ///< The critical threshold of the last thresholds line logged
     u32 seen_pressure_events{};   ///< Allocator pressure events already answered
     u32 seen_failed_images{};     ///< Images the allocator could not make, already collected for
@@ -374,6 +375,10 @@ public:
 
     [[nodiscard]] const RenderTargets& GetRenderTargets() const noexcept {
         return render_targets;
+    }
+
+    [[nodiscard]] Runtime& GetRuntime() noexcept {
+        return runtime;
     }
 
     /// Images created, deleted and created from overlapping ones (joins), invalidations of every
