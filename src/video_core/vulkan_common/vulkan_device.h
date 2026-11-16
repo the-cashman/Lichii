@@ -466,6 +466,7 @@ public:
     FN_MAX_LIMIT_ELEM(DescriptorSetSampledImages) \
     FN_MAX_LIMIT_ELEM(DescriptorSetStorageImages) \
     FN_MAX_LIMIT_ELEM(DescriptorSetInputAttachments) \
+    FN_MAX_LIMIT_ELEM(ImageDimension2D) \
     FN_MAX_LIMIT_ELEM(FramebufferWidth) \
     FN_MAX_LIMIT_ELEM(FramebufferHeight) \
     FN_MAX_LIMIT_ELEM(FramebufferLayers)

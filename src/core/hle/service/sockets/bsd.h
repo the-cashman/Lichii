@@ -79,6 +79,8 @@ private:
         /// File status flags of a socket. An eventfd keeps its own, shared by its duplicates.
         s32 flags = 0;
         bool is_connection_based = false;
+        /// The socket's domain, which decides whether IPPROTO_IPV6 options reach the host.
+        Domain domain = Domain::INET;
         /// Set once a duplicate sharing the socket was closed, which closed the socket.
         bool socket_closed = false;
         /// The socket's SO_RCVTIMEO and SO_SNDTIMEO in milliseconds, 0 for none: how long a

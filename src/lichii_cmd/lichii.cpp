@@ -50,6 +50,8 @@
 #include "core/file_sys/nup_writer.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/vfs/vfs_real.h"
+#include "core/hle/service/acc/nextendo_id_token.h"
+#include "core/hle/service/acc/profile_manager.h"
 #include "core/hle/service/am/applet_manager.h"
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/loader/loader.h"
@@ -707,6 +709,9 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         LOG_INFO(Frontend, "Restarted by the game: program index {}, {} user channel entries",
                  handoff->program_index, state->system.GetUserChannel().size());
     }
+    // SdlState read the profiles before the config named the NAND.
+    state->system.GetProfileManager().ResetUserSaveFile();
+    Common::Nextendo::MigrateAccountFile(Service::Account::Nextendo::CurrentProfile(state->system));
     if (Common::Nextendo::OnlinePlayActive()) {
         const auto loader = Loader::GetLoader(
             state->system, Core::GetGameFileFromPath(state->system.GetFilesystem(), lp.filepath),

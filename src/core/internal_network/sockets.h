@@ -23,6 +23,14 @@ namespace Network {
 
 struct ProxyPacket;
 
+/// IPPROTO_IPV6 options of an INET6 socket, each an int
+enum class Ipv6Option {
+    V6Only,
+    UnicastHops,
+    MulticastHops,
+    MulticastLoop,
+};
+
 class SocketBase {
 public:
 #ifndef _WIN32
@@ -102,6 +110,10 @@ public:
     virtual Errno SetNoDelay(bool enable) = 0;
 
     virtual Errno SetNonBlock(bool enable) = 0;
+
+    virtual Errno SetIpv6Option(Ipv6Option option, s32 value) = 0;
+
+    virtual std::pair<s32, Errno> GetIpv6Option(Ipv6Option option) = 0;
 
     virtual std::pair<Errno, Errno> GetPendingError() = 0;
 
@@ -192,6 +204,10 @@ public:
 
     Errno SetNonBlock(bool enable) override;
 
+    Errno SetIpv6Option(Ipv6Option option, s32 value) override;
+
+    std::pair<s32, Errno> GetIpv6Option(Ipv6Option option) override;
+
     template <typename T>
     Errno SetSockOpt(SOCKET fd, int level, int option, T value);
 
@@ -259,6 +275,8 @@ private:
     std::atomic_bool is_non_blocking{false};
     /// The type Initialize gave the socket (Unspecified for an accepted one).
     Type socket_type = Type::Unspecified;
+    /// The domain Initialize gave the socket, or the listening socket's for an accepted one.
+    Domain socket_domain = Domain::INET;
 };
 
 std::pair<s32, Errno> Poll(std::vector<PollFD>& poll_fds, s32 timeout);

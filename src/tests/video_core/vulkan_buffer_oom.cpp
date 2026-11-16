@@ -8,7 +8,12 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+// Before the Vulkan headers: Xlib defines Success, which NvResult (nvdata.h) declares.
+#include "video_core/renderer_vulkan/vk_state_tracker.h"
+
 #include "common/common_types.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_instance.h"
 #include "video_core/vulkan_common/vulkan_library.h"
@@ -159,4 +164,27 @@ TEST_CASE("Vulkan buffers: CreateAfterRecovery retries once after freeing memory
         REQUIRE(creates == 1);
         REQUIRE(recoveries == 0);
     }
+}
+
+// #1993: the recovery runs while a draw is set up, after its index and vertex binds were
+// recorded. A submit there left those binds in the submitted command buffer.
+TEST_CASE("Vulkan buffers: staging memory recovery does not submit the open command buffer",
+          "[vulkan_buffer_oom]") {
+    TestDevice test;
+    Vulkan::MemoryAllocator allocator(*test.device);
+    Vulkan::StateTracker state_tracker;
+    Vulkan::Scheduler scheduler(*test.device, state_tracker);
+    Vulkan::StagingBufferPool pool(*test.device, allocator, scheduler);
+
+    constexpr size_t size = 1 << 20;
+    const Vulkan::StagingBufferRef in_use = pool.Request(size, Vulkan::MemoryUsage::Download);
+    REQUIRE(in_use.buffer != VK_NULL_HANDLE);
+    const u64 tick = scheduler.CurrentTick();
+    const u64 epoch = scheduler.RecordingEpoch();
+
+    pool.ReleaseMemory();
+
+    CHECK(scheduler.CurrentTick() == tick);
+    CHECK(scheduler.RecordingEpoch() == epoch);
+    CHECK(pool.CachedBytes(Vulkan::MemoryUsage::Download) == size);
 }

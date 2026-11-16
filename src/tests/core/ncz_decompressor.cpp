@@ -9,6 +9,7 @@
 #include <limits>
 #include <mutex>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
 #define ZSTD_STATIC_LINKING_ONLY
@@ -111,6 +112,23 @@ TEST_CASE("NCZBLOCK playback remains supported", "[ncz]") {
         Put(bytes, Payload + 16, 40000);
         CHECK_FALSE(Core::Crypto::IsSupportedNCZ(
             std::make_shared<FileSys::VectorVfsFile>(std::move(bytes))));
+    }
+    SECTION("section that overflows or starts before the file") {
+        // Block mode used to skip the solid stream's section checks: these opened as files of
+        // about 2^63 bytes, or with a section before the header.
+        const std::array<std::pair<u64, u64>, 3> bad{{
+            {0x7FFFFFFFFFFFFFF0, 0x100},
+            {static_cast<u64>(-0x1000), 0x5000},
+            {Header, 0x7FFFFFFFFFFF0000},
+        }};
+        for (const auto& [offset, size] : bad) {
+            auto copy = bytes;
+            Put(copy, Header + 16, offset);
+            Put(copy, Header + 24, size);
+            auto source = std::make_shared<FileSys::VectorVfsFile>(std::move(copy));
+            CHECK_FALSE(Core::Crypto::IsSupportedNCZ(source));
+            CHECK(Core::Crypto::DecompressNCZ(source, "synthetic.nca") == nullptr);
+        }
     }
 }
 

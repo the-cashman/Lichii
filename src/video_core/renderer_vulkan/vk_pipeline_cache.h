@@ -35,6 +35,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/bounded_store.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+#include "video_core/renderer_vulkan/mesh_vertex_input.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -253,8 +254,9 @@ private:
     void QueueVulkanPipelineCacheFlush();
 
     /// Queues one write of the driver pipeline cache file on the serialization thread, with no
-    /// throttle. For the end of a precache: its builds never reach the timed flush, which counts
-    /// only pipelines built during play.
+    /// throttle, or writes it now where reading the cache during a build crashes. For the end of
+    /// a precache: its builds never reach the timed flush, which counts only pipelines built
+    /// during play.
     void QueueVulkanPipelineCacheSave();
 
     /// One build of the shader precache: a compute pipeline built and destroyed
@@ -365,6 +367,12 @@ private:
     /// was refreshed from. While both stand, a draw reuses it without a refresh or lookup.
     GraphicsPipeline* key_pipeline{};
     PipelineStateWatch state_watch;
+    /// Native mesh draws' vertex input, lent by the first key of each pipeline
+    MeshVertexInputs<GraphicsPipelineCacheKey> mesh_vertex_inputs;
+    /// mesh_vertex_inputs holds the mesh pipelines the boot load built
+    bool mesh_vertex_inputs_seeded{};
+    /// graphics_key holds vertex input another key lent it instead of the registers'
+    bool vertex_input_lent{};
 
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
     void EvictUnusedPipelines();
