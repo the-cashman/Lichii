@@ -13,6 +13,7 @@ add_executable(tests
     video_core/download_landing_sources.cpp
     video_core/aftermath_dump.cpp
     video_core/frame_dump_schedule.cpp
+    video_core/frame_dump_decode.cpp
     video_core/frame_gen_generations.cpp
     video_core/frame_pacer.cpp
     video_core/nx2_stutter_trace.cpp
@@ -189,6 +190,7 @@ add_executable(tests
     video_core/nx2_video_render.cpp
     video_core/ampere_matrix.cpp
     video_core/spirv_software_matrix.cpp
+    video_core/spirv_program_name.cpp
     video_core/spirv_builtin_capabilities.cpp
     video_core/spirv_min_max_denorms.cpp
     video_core/spirv_nan_safe_min_max.cpp
