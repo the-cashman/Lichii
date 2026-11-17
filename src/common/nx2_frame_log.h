@@ -73,6 +73,9 @@ enum class Counter : u32 {
     WorkerCycles,     ///< ...and the VulkanWorker
     WorkerInstructions,
     WorkerCacheMisses,
+    BackCoreIdleUsA,  ///< cpuidle residency (us, all states) of the lower CPU of the back's core
+    BackCoreIdleUsB,  ///< ...and of its SMT sibling (EDEN_NX2_ISOLATE pins GPUBack to both)
+    BackCpu,          ///< the CPU GPUBack ran on at the composite
     Count,
 };
 

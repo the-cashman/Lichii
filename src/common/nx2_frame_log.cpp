@@ -13,6 +13,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <cerrno>
+#include <sched.h>
 #include <linux/perf_event.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -93,7 +94,8 @@ struct State {
                            "drain_other_ns,back_cpu_ns,back_delay_ns,front_cpu_ns,front_delay_ns,"
                            "worker_cpu_ns,worker_delay_ns,back_cycles,back_instructions,back_cache_misses,"
                            "front_cycles,front_instructions,front_cache_misses,worker_cycles,"
-                           "worker_instructions,worker_cache_misses,gpu_tick\n"
+                           "worker_instructions,worker_cache_misses,core_idle_us_a,core_idle_us_b,back_cpu,"
+                           "gpu_tick\n"
                            "# E,kind,ns,arg (1 submit, 2 front state, 3 back idle, 4 reached)\n"
                            "# T,frame,ns,cntpct,thread_id,priority,core,cpu_ticks,presenter\n");
         std::fflush(file);
@@ -203,6 +205,22 @@ void State::Flush(bool all) {
 }
 
 std::array<std::atomic<int>, static_cast<size_t>(ThreadRole::Count)> g_thread_fds{};
+/// GPUBack's core (when pinned to <= 2 CPUs): the cpuidle state time files of each CPU.
+std::array<std::vector<int>, 2> g_core_idle_fds;
+
+u64 ReadIdleUs(const std::vector<int>& fds) {
+    u64 sum = 0;
+    char buf[32];
+    for (const int fd : fds) {
+        const ssize_t n = pread(fd, buf, sizeof(buf) - 1, 0);
+        if (n > 0) {
+            buf[n] = 0;
+            sum += std::strtoull(buf, nullptr, 10);
+        }
+    }
+    return sum;
+}
+
 /// Per role: the thread's perf event group (leader cycles, then instructions, cache misses).
 std::array<std::atomic<int>, static_cast<size_t>(ThreadRole::Count)> g_perf_fds{-1, -1, -1};
 
@@ -325,6 +343,28 @@ void RegisterThread(ThreadRole role) {
     if (fd >= 0) {
         g_thread_fds[static_cast<size_t>(role)].store(fd, std::memory_order_release);
     }
+    if (role == ThreadRole::Back) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        if (sched_getaffinity(0, sizeof(set), &set) == 0 && CPU_COUNT(&set) <= 2) {
+            size_t slot = 0;
+            for (int c = 0; c < CPU_SETSIZE && slot < 2; ++c) {
+                if (!CPU_ISSET(c, &set)) {
+                    continue;
+                }
+                for (int state = 0; state < 16; ++state) {
+                    const std::string file = "/sys/devices/system/cpu/cpu" + std::to_string(c) +
+                                             "/cpuidle/state" + std::to_string(state) + "/time";
+                    const int fd = open(file.c_str(), O_RDONLY | O_CLOEXEC);
+                    if (fd < 0) {
+                        break;
+                    }
+                    g_core_idle_fds[slot].push_back(fd);
+                }
+                ++slot;
+            }
+        }
+    }
     {
         const int leader = PerfOpen(PERF_COUNT_HW_CPU_CYCLES, -1);
         if (leader >= 0) {
@@ -355,6 +395,9 @@ void BeginComposite(u64 frame, u64 front_ns) {
                 st.counters[base + 1].store(wait, std::memory_order_relaxed);
             }
         }
+        st.counters[static_cast<size_t>(Counter::BackCoreIdleUsA)].store(ReadIdleUs(g_core_idle_fds[0]));
+        st.counters[static_cast<size_t>(Counter::BackCoreIdleUsB)].store(ReadIdleUs(g_core_idle_fds[1]));
+        st.counters[static_cast<size_t>(Counter::BackCpu)].store(static_cast<u64>(sched_getcpu()));
         for (size_t role = 0; role < g_perf_fds.size(); ++role) {
             const int fd = g_perf_fds[role].load(std::memory_order_acquire);
             u64 values[1 + 3]{}; // nr, then the values
