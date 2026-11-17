@@ -147,12 +147,23 @@ public:
     static constexpr u64 PageBits = 12;
     static constexpr u64 HoldFrames = 2;
 
-    [[nodiscard]] static bool Enabled() noexcept {
-        static const bool enabled = [] {
+    [[nodiscard]] static int Level() noexcept {
+        static const int level = [] {
             const char* value = std::getenv("EDEN_NX2_LAZY_UNTRACK");
-            return value != nullptr && value[0] == '1';
+            return value != nullptr && (value[0] == '1' || value[0] == '2') ? value[0] - '0' : 0;
         }();
-        return enabled;
+        return level;
+    }
+
+    [[nodiscard]] static bool Enabled() noexcept {
+        return Level() != 0;
+    }
+
+    /// =2: also the untracks of guest write traps that take the buffer cache's lock themselves
+    /// (RasterizerVulkan::OnCPUWrite's deferral after the lock): their pages stay protected
+    /// until the back thread tracks them again, so further writes trap meanwhile.
+    [[nodiscard]] static bool HoldGuest() noexcept {
+        return Level() == 2;
     }
 
     /// Set on the GPU back thread (GpuSplit::BackLoop) when enabled.

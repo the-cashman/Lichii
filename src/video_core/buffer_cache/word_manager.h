@@ -457,7 +457,9 @@ struct WordManager {
                     if (ranges.empty()) {
                         return;
                     }
-                } else if (delta < 0 && Nx2LazyUntrack::t_hold) {
+                } else if (delta < 0 &&
+                           (Nx2LazyUntrack::t_hold ||
+                            (t_deferred_page_caching != nullptr && Nx2LazyUntrack::HoldGuest()))) {
                     Nx2LazyUntrack::Get().Hold(
                         tracker,
                         [](void* held_tracker, std::span<const std::pair<VAddr, size_t>> runs,
