@@ -39,6 +39,7 @@ add_executable(tests
     core/nx2_present_pacer.cpp
     core/nx2_fence_action.cpp
     core/nx2_frame_interval.cpp
+    core/fps_target.cpp
     core/ldn_lan_protocol.cpp
     core/perf_stats.cpp
     core/service_auto_stub.cpp

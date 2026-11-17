@@ -460,6 +460,14 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, hyrule_30fps, tr("Hyrule Warriors: Age of Imprisonment: 30 FPS mode"),
            tr("Always runs at 30 FPS with the game's split-screen time step, at normal game speed. "
               "Takes precedence over dynamic FPS."));
+    INSERT(Settings, fe_60fps, tr("Fire Emblem: Fortune's Weave: 60 FPS mode"),
+           tr("Raises the game's target frame rate from 30 to 60 in gameplay, so it runs at 60 FPS "
+              "at its normal speed."));
+    INSERT(Settings, fe_60fps_fallback,
+           tr("Fire Emblem: Fortune's Weave: drop to 30 FPS when slow"),
+           tr("Only applies with the 60 FPS mode. When your PC can't hold 60 FPS, the game "
+              "switches back to 30 FPS and keeps normal speed, then tries 60 again every few "
+              "seconds. Turn it off to stay at 60 FPS, where slow frames play in slow motion."));
     INSERT(Settings, barrier_feedback_loops, tr("Barrier feedback loops"),
            tr("Improves rendering of transparency effects in specific games."));
     INSERT(Settings, enable_buffer_history, tr("Enable buffer history"),

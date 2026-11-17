@@ -2362,6 +2362,116 @@ private:
         }
     }
 
+    // Fire Emblem: Fortune's Weave's target frame rate (loader/nso.cpp). The game steps its logic
+    // by 60 / target and presents at display / target, so 60 makes gameplay run at 60 fps with its
+    // normal speed. The game sets 60 for the title and menus and 30 where gameplay starts. With
+    // the fallback, 30 is written while 60 can't be held: frames take twice as long, but the game
+    // still runs at normal speed. The game writes the field itself when it changes modes, so the
+    // value it wrote is kept and put back when the mode is turned off.
+    struct FortuneWeaveTarget {
+        // Fortune's Weave's logic runs at the step the target gives it, so a frame rate that is
+        // 10-17% short is a 10-17% slowdown. This turn-based game prefers normal speed, so the
+        // controller drops at 1.12 (about 53.5 fps), the same line its probes must stay under,
+        // rather than Hyrule's 1.2 (50 fps) band. At 30 the game presents every second vblank
+        // and steps 2.0, so it keeps normal speed.
+        Nx2FrameInterval::Controller controller{1.12};
+        std::optional<u32> game_value;
+        u32 last{};
+        bool enabled{};
+        u32 presents{};
+        u32 at_thirty{};
+        u32 probes{};
+    } m_fe_target;
+
+    void UpdateFortuneWeaveFrameTarget(const Kernel::KProcess& process,
+                                       Nx2FrameInterval::Controller::Clock::time_point now) {
+        const bool enabled = Settings::values.fe_60fps.GetValue();
+        if (!enabled && !m_fe_target.enabled) {
+            return;
+        }
+        const u64 global = process.GetFrameTargetAddress();
+        if (global == 0) {
+            return;
+        }
+        auto& memory = system.ApplicationMemory();
+        if (!memory.IsValidVirtualAddressRange(global, sizeof(u64))) {
+            return;
+        }
+        const u64 object = memory.Read64(global);
+        if (object == 0) {
+            return;
+        }
+        const u64 address = object + process.GetFrameTargetField();
+        if (address < object || !memory.IsValidVirtualAddressRange(address, sizeof(u32))) {
+            return;
+        }
+
+        const u32 current = memory.Read32(address);
+        const auto sane = [](u32 value) { return value != 0 && value <= 1000; };
+        if (m_fe_target.last == 0) {
+            if (sane(current)) {
+                m_fe_target.game_value = current;
+            }
+        } else if (current != m_fe_target.last && sane(current)) {
+            // The game wrote its own value since the last present (a mode change).
+            m_fe_target.game_value = current;
+        }
+
+        if (!enabled) {
+            if (std::exchange(m_fe_target.enabled, false)) {
+                const u32 restore = m_fe_target.game_value.value_or(0);
+                // Gameplay's 30 is what a disabled mode must put back; a menu already wants the
+                // 60 that was written. Leave a 30 in place, and a value the game did not use.
+                if (restore == 30 && current != 30) {
+                    memory.Write32(address, 30);
+                } else if (restore != 0 && restore != 30 && restore != 60 &&
+                           current != restore) {
+                    memory.Write32(address, restore);
+                }
+                LOG_INFO(Service, "nx2:vi2 Fire Emblem: Fortune's Weave 60 FPS mode off");
+            }
+            m_fe_target = {};
+            return;
+        }
+        if (!std::exchange(m_fe_target.enabled, true)) {
+            LOG_INFO(Service, "nx2:vi2 Fire Emblem: Fortune's Weave 60 FPS mode on");
+        }
+
+        u32 target = 60;
+        if (Settings::values.fe_60fps_fallback.GetValue()) {
+            const u32 speed =
+                Settings::values.use_speed_limit.GetValue() ? Settings::SpeedLimit() : 100;
+            const Nx2FrameInterval::Controller::Duration nominal{
+                1000.0 / 60.0 * 100.0 / (speed == 0 ? 100 : speed)};
+            const u32 previous = m_fe_target.controller.Interval();
+            const u32 interval = m_fe_target.controller.Update(now, nominal);
+            if (interval != previous) {
+                LOG_DEBUG(Service,
+                          "nx2:vi2 present #{}: Fire Emblem: Fortune's Weave target {} -> {} fps",
+                          m_presents, previous == 1 ? 60 : 30, interval == 1 ? 60 : 30);
+                m_fe_target.probes += previous == 2 ? 1 : 0;
+            }
+            // The controller's interval is vblanks a frame: 1 is 60 FPS, 2 is 30 FPS.
+            target = interval == 1 ? 60 : 30;
+        }
+        m_fe_target.at_thirty += target == 30 ? 1 : 0;
+        if (++m_fe_target.presents == 600) {
+            LOG_INFO(Service,
+                     "Fire Emblem: Fortune's Weave 60 FPS: {} of the last 600 presents at 30 fps, "
+                     "{} tries at 60",
+                     m_fe_target.at_thirty, m_fe_target.probes);
+            m_fe_target.presents = m_fe_target.at_thirty = m_fe_target.probes = 0;
+        }
+        if (current != target) {
+            memory.Write32(address, target);
+            LOG_DEBUG(Service,
+                      "nx2:vi2 present #{}: Fire Emblem: Fortune's Weave target frame rate {} -> "
+                      "{}",
+                      m_presents, current, target);
+        }
+        m_fe_target.last = target;
+    }
+
     struct FrameTrace {
         Common::DkbFrameTrace::RateLimit rate;
         std::chrono::steady_clock::time_point last_present{};
@@ -2533,6 +2643,10 @@ private:
             if (const u64 address = process->GetMkwFrameModeAddress(); address != 0) {
                 UpdateMkwFrameMode(address);
             }
+        }
+        if (process != nullptr && process->GetProgramId() == Settings::FortuneWeaveProgramId &&
+            process->GetFrameTargetAddress() != 0) {
+            UpdateFortuneWeaveFrameTarget(*process, std::chrono::steady_clock::now());
         }
         u32 swap_interval = std::clamp<u32>(timing >> 16, 1, 4);
         if (mkw_dynamic) {

@@ -6,6 +6,8 @@ New entries go under `## [Unreleased]`; `tools/ci/bump-version.sh` turns them in
 
 ## [Unreleased]
 
+- Fire Emblem: Fortune's Weave: optional 60 FPS mode that writes the game's own target frame
+  rate, with a 30 FPS fallback at normal game speed.
 - Fix unit-test linking when the OpenGL shader backends are disabled.
 
 ## [0.1.0]

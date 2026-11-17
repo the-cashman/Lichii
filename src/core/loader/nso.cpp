@@ -29,6 +29,7 @@
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_thread.h"
+#include "core/loader/fps_target.h"
 #include "core/loader/nso.h"
 #include "core/memory.h"
 
@@ -439,6 +440,51 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         }
     }
 
+    // Fire Emblem: Fortune's Weave's target frame rate (nx2_gsv.h). Its graphics object is a global
+    // pointer; the object holds the rate its logic steps by (60 / target) and its present asks for
+    // (display / target). The title and menus set 60 and gameplay sets 30. The field is found by its
+    // readers, as nxnative does, so a game update with the same engine keeps working; on the build
+    // the offsets were verified on, they are preferred over the scan's result.
+    u64 frame_target_offset = 0;
+    u32 frame_target_field = 0;
+    if (name == "main" && process.GetProgramId() == Settings::FortuneWeaveProgramId) {
+        const auto& text = nso_header.segments[0];
+        const auto& data = nso_header.segments[2];
+        const std::span<const u8> image{codeset.memory.data() + module_start,
+                                        codeset.memory.size() - module_start};
+        auto target = FpsTarget::Find(image, text.location, text.size, data.location);
+        const auto build_id = Common::HexToString(std::span{nso_header.build_id}.first(8));
+        if (build_id == "DB93B0125F485060") {
+            const FpsTarget::Target known{.global_offset = 0x21E60D8,
+                                           .field_offset = 0x1DC,
+                                           .readers = target ? target->readers : 0,
+                                           .stores_of_thirty =
+                                               target ? target->stores_of_thirty : 0};
+            if (target && (target->global_offset != known.global_offset ||
+                           target->field_offset != known.field_offset)) {
+                LOG_WARNING(Loader,
+                            "Fire Emblem: Fortune's Weave: scan found main+{:#x} +{:#x}, using "
+                            "the known main+{:#x} +{:#x} for build {}",
+                            target->global_offset, target->field_offset, known.global_offset,
+                            known.field_offset, build_id);
+            }
+            target = known;
+        }
+        if (target) {
+            frame_target_offset = target->global_offset;
+            frame_target_field = target->field_offset;
+            LOG_INFO(Loader,
+                     "Fire Emblem: Fortune's Weave target frame rate at main+{:#x} +{:#x} "
+                     "({} readers of 60 / target, {} stores of 30)",
+                     frame_target_offset, frame_target_field, target->readers,
+                     target->stores_of_thirty);
+        } else {
+            LOG_WARNING(Loader,
+                        "Fire Emblem: Fortune's Weave target frame rate not found (build {})",
+                        build_id);
+        }
+    }
+
 #ifdef HAS_NCE
     // If we are computing the process code layout and using nce backend, patch.
     const auto& code = codeset.CodeSegment();
@@ -535,6 +581,10 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
     if (frame_interval_offset != 0) {
         process.SetFrameIntervalAddresses(load_base + module_start + frame_interval_offset,
                                           load_base + module_start + frame_interval_source_offset);
+    }
+    if (frame_target_offset != 0) {
+        process.SetFrameTarget(load_base + module_start + frame_target_offset,
+                               frame_target_field);
     }
     return load_base + image_size;
 }

@@ -24,6 +24,15 @@ public:
     using Clock = std::chrono::steady_clock;
     using Duration = std::chrono::duration<double, std::milli>;
 
+    Controller() = default;
+    /// drop_above: mean frame time / nominal above which this controller drops to 2.
+    /// The default 1.2 (50 fps) is for Hyrule Warriors, whose action gameplay values 50-53 fps
+    /// over the 10-17% slowdown. Fortune's Weave constructs one at 1.12 (about 53.5 fps): it is
+    /// turn-based and prefers normal speed when 60 can't be held, and 1.12 is the probe's own
+    /// keep line (`KeepAtOrBelow`); a drop threshold below it would drop, probe back into the
+    /// band, and drop again.
+    explicit Controller(double drop_above_) : drop_above{drop_above_} {}
+
     /// nominal: one 60 Hz frame at the current speed limit.
     [[nodiscard]] u32 Update(Clock::time_point now, Duration nominal) {
         if (last == Clock::time_point{}) {
@@ -46,7 +55,8 @@ public:
             window[window_next] = frame;
             window_next = (window_next + 1) % window.size();
             window_count = (std::min)(window_count + 1, window.size());
-            if (window_count == window.size() && window_sum / window.size() > nominal * DropAbove) {
+            if (window_count == window.size() &&
+                window_sum / window.size() > nominal * drop_above) {
                 interval = 2;
                 probe_delay = FirstProbeDelay;
                 next_probe = now + probe_delay;
@@ -68,7 +78,7 @@ public:
 private:
     // A few percent of slow motion beats halving the frame rate: only below about 50 fps.
     static constexpr Duration MaxFrame{100.0};
-    static constexpr double DropAbove = 1.2;      // mean of the window (50 fps)
+    static constexpr double DropAbove = 1.2;      // default mean of the window (50 fps)
     static constexpr double KeepAtOrBelow = 1.12; // mean of a probe (about 53.5 fps)
     static constexpr double GiveUpAbove = 1.5;    // mean of a probe so far (40 fps)
     static constexpr int ProbeSkip = 2;           // frames the switch itself takes
@@ -105,6 +115,7 @@ private:
     }
 
     u32 interval = 1;
+    double drop_above{DropAbove};
     Clock::time_point last{};
     std::array<Duration, 60> window{};
     Duration window_sum{};

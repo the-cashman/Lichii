@@ -124,6 +124,8 @@ private:
     std::atomic<u64> m_mkw_frame_mode_address{};
     std::atomic<u64> m_frame_interval_address{};
     std::atomic<u64> m_frame_interval_source_address{};
+    std::atomic<u64> m_frame_target_address{};
+    std::atomic<u32> m_frame_target_field{};
     std::atomic<s64> m_num_process_switches{};
     std::atomic<s64> m_num_thread_switches{};
     std::atomic<s64> m_num_fpu_switches{};
@@ -227,6 +229,21 @@ public:
     void SetFrameIntervalAddresses(u64 interval, u64 source) {
         m_frame_interval_source_address.store(source, std::memory_order_relaxed);
         m_frame_interval_address.store(interval, std::memory_order_relaxed);
+    }
+
+    /// Fire Emblem: Fortune's Weave's target frame rate global (loader/nso.cpp), or 0.
+    u64 GetFrameTargetAddress() const {
+        return m_frame_target_address.load(std::memory_order_relaxed);
+    }
+
+    /// The target frame rate's offset in the object the global points to.
+    u32 GetFrameTargetField() const {
+        return m_frame_target_field.load(std::memory_order_relaxed);
+    }
+
+    void SetFrameTarget(u64 address, u32 field) {
+        m_frame_target_field.store(field, std::memory_order_relaxed);
+        m_frame_target_address.store(address, std::memory_order_relaxed);
     }
 
     u64 GetProcessId() const {

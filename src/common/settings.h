@@ -740,6 +740,14 @@ struct Values {
     SwitchableSetting<bool> hyrule_30fps{linkage, false, "hyrule_30fps", Category::RendererAdvanced,
                                          Specialization::Default, true, true};
 
+    // Fire Emblem: Fortune's Weave: write 60 into the game's target frame rate so gameplay runs
+    // at 60 fps with its normal speed, or 30 while 60 can't be held (core/hle/service/nx2_gsv.h).
+    SwitchableSetting<bool> fe_60fps{linkage, false, "fe_60fps", Category::RendererAdvanced,
+                                     Specialization::Default, true, true};
+    SwitchableSetting<bool> fe_60fps_fallback{linkage, true, "fe_60fps_fallback",
+                                              Category::RendererAdvanced, Specialization::Default,
+                                              true, true};
+
     SwitchableSetting<bool> use_reactive_flushing{linkage,
 #ifdef __ANDROID__
                                                   false,

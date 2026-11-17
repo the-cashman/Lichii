@@ -139,6 +139,8 @@ void CheckUnchangedProfile() {
     CHECK_FALSE(values.mkw_dynamic_fps.GetValue());
     CHECK_FALSE(values.hyrule_dynamic_fps.GetValue());
     CHECK_FALSE(values.hyrule_30fps.GetValue());
+    CHECK_FALSE(values.fe_60fps.GetValue());
+    CHECK(values.fe_60fps_fallback.GetValue());
     CHECK(values.use_reactive_flushing.GetValue());
     CHECK(values.barrier_feedback_loops.GetValue());
     CHECK_FALSE(values.enable_buffer_history.GetValue());

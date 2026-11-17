@@ -45,6 +45,8 @@ void ForEachRecommendedSetting(Values& settings, Func&& func) {
     entry(settings.mkw_dynamic_fps, false);
     entry(settings.hyrule_dynamic_fps, false);
     entry(settings.hyrule_30fps, false);
+    entry(settings.fe_60fps, false);
+    entry(settings.fe_60fps_fallback, true);
     entry(settings.use_reactive_flushing, true);
     entry(settings.barrier_feedback_loops, true);
     entry(settings.enable_buffer_history, false);
