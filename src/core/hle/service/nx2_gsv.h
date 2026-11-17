@@ -3279,16 +3279,18 @@ private:
                     return std::nullopt;
                 });
             system.CoreTiming().ScheduleLoopingEvent(VblankInterval, VblankInterval, m_vsync_timer);
-            // The host's display can start this session's frames (PaceToVblank says when):
-            // each frame on screen then signals its vsync events, from the presenter's thread
-            // as host1x syncpoint actions signal theirs from the GPU thread.
-            VideoCore::HostVsync::AddListener(
-                m_vsync.get(), [vsync_state = m_vsync, &kernel = system.Kernel()] {
-                    std::scoped_lock lk{vsync_state->mutex};
-                    for (auto* vsync : vsync_state->events) {
-                        vsync->Signal(kernel);
-                    }
-                });
+            if (VideoCore::HostVsync::Enabled()) {
+                // The host's display can start this session's frames (PaceToVblank says when):
+                // each frame on screen then signals its vsync events, from the presenter's thread
+                // as host1x syncpoint actions signal theirs from the GPU thread.
+                VideoCore::HostVsync::AddListener(
+                    m_vsync.get(), [vsync_state = m_vsync, &kernel = system.Kernel()] {
+                        std::scoped_lock lk{vsync_state->mutex};
+                        for (auto* vsync : vsync_state->events) {
+                            vsync->Signal(kernel);
+                        }
+                    });
+            }
         }
     }
 
