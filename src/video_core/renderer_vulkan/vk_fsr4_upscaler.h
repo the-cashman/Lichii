@@ -51,6 +51,19 @@ public:
         f32 camera_near = 0.1f;
         f32 camera_far = 25000.0f;
         std::array<f32, 2> jitter{}; ///< Offset the scene was drawn with, in render pixels.
+        /// Turns a motion vector into render pixels (FFX motionVectorScale); Ocarina's are pixels.
+        std::array<f32, 2> motion_vector_scale{1.0f, 1.0f};
+    };
+
+    /// Context options beyond Ocarina's (tonemapped colour, standard depth).
+    struct Options {
+        bool hdr = false;            ///< FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE
+        bool depth_inverted = false; ///< FFX_UPSCALE_ENABLE_DEPTH_INVERTED (1 = near)
+        bool depth_infinite = false; ///< FFX_UPSCALE_ENABLE_DEPTH_INFINITE
+        /// FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION: the motion includes the jitter.
+        bool jitter_in_motion = false;
+        /// FFX_UPSCALE_ENABLE_AUTO_EXPOSURE: FSR computes the exposure (HDR colour of a game).
+        bool auto_exposure = false;
     };
 
     /// Whether FSR 4 is turned on and the device can run it: AMD's driver on Windows, and on Linux
@@ -64,11 +77,18 @@ public:
     /// (FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE, unit exposure).
     explicit Fsr4Upscaler(const Device& device, Scheduler& scheduler,
                           MemoryAllocator& memory_allocator, bool hdr = false);
+    Fsr4Upscaler(const Device& device, Scheduler& scheduler, MemoryAllocator& memory_allocator,
+                 Options options);
     ~Fsr4Upscaler();
 
     /// Records one evaluation into the output image (RGBA16F at the upscale size, GENERAL
     /// layout). False when FSR 4 can't run (the caller then uses FSR 3.1 from now on).
     bool Upscale(const Inputs& inputs);
+
+    /// Creates the context for these sizes and runs one evaluation of throwaway images, then waits
+    /// for it: FSR 4 builds its pipelines at its first dispatch (seconds on a cold shader cache),
+    /// which then happens here instead of in the middle of play.
+    void Prewarm(VkExtent2D render_size, VkExtent2D upscale_size);
 
     [[nodiscard]] bool Failed() const noexcept {
         return failed.load();
@@ -100,6 +120,7 @@ private:
     vk::Image exposure_image; ///< 1x1 R32F holding 1 (the input is tonemapped, unit exposure)
     std::atomic<bool> failed{};
     bool hdr{};
+    Options options{};
 };
 
 } // namespace Vulkan

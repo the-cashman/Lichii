@@ -2120,6 +2120,445 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
     return true;
 }
 
+namespace {
+constexpr u64 STAR_FOX = 0x0400E88025B1A000ULL;
+constexpr u64 FIRE_EMBLEM = 0x04007EF01F8AE000ULL;
+
+/// bazzite: a game's DLSS evaluation through FSR 4: Star Fox with EDEN_NX2_STARFOX_FSR4=1 or 4k
+/// (its replacement is spatial otherwise), Fire Emblem: Fortune's Weave with EDEN_NX2_FE_FSR4=1
+/// (FSR 3.1 otherwise, and if FSR 4 fails).
+bool StarFoxFsr4Requested() {
+    static const bool requested = [] {
+        const char* const value = std::getenv("EDEN_NX2_STARFOX_FSR4");
+        return value && (value[0] == '1' || value[0] == '4');
+    }();
+    return requested && Settings::GetCurrentProgramID() == STAR_FOX;
+}
+
+bool FireEmblemFsr4Requested() {
+    static const bool requested = [] {
+        const char* const value = std::getenv("EDEN_NX2_FE_FSR4");
+        return value && value[0] == '1';
+    }();
+    return requested && Settings::GetCurrentProgramID() == FIRE_EMBLEM;
+}
+
+f32 EnvFloat(const char* name, f32 fallback) {
+    const char* const value = std::getenv(name);
+    return value ? static_cast<f32>(std::strtod(value, nullptr)) : fallback;
+}
+} // Anonymous namespace
+
+void TextureCacheRuntime::PrewarmFsr4(std::array<u32, 2> render_size,
+                                      std::array<u32, 2> upscale_size) {
+    if (fsr4_prewarmed || !(StarFoxFsr4Requested() || FireEmblemFsr4Requested())) {
+        return;
+    }
+    fsr4_prewarmed = true;
+    if (!EnsureFsr4()) {
+        return;
+    }
+    fsr4_upscaler->Prewarm({render_size[0], render_size[1]}, {upscale_size[0], upscale_size[1]});
+}
+
+bool TextureCacheRuntime::UpscaleWithFsr4(Framebuffer* dst_framebuffer, ImageView& input_color,
+                                          ImageView& motion_vectors, ImageView& depth,
+                                          std::array<u32, 2> render_size,
+                                          std::array<f32, 2> jitter,
+                                          std::array<f32, 2> motion_scale) {
+    if (!EnsureFsr4()) {
+        return false;
+    }
+    return UpscaleWithFsr4Ready(dst_framebuffer, input_color, motion_vectors, depth, render_size,
+                                jitter, motion_scale);
+}
+
+bool TextureCacheRuntime::EnsureFsr4() {
+    if (fsr4_unsupported) {
+        return false;
+    }
+    if (!fsr4_upscaler) {
+        if (!Fsr4Upscaler::IsWanted(device)) {
+            LOG_WARNING(Render_Vulkan, "DLSS replacement FSR 4: no FFX API upscaler library "
+                                       "(EDEN_NX2_FSR4_LIB); the previous replacement stays");
+            fsr4_unsupported = true;
+            return false;
+        }
+        // Depth convention: EDEN_NX2_SF_FSR4_DEPTH=inverted|standard (default inverted, 1 = near:
+        // both games' reversed Z, as Fire Emblem's FSR 3.1 path takes it).
+        const char* const depth_mode = std::getenv("EDEN_NX2_SF_FSR4_DEPTH");
+        const bool inverted = !depth_mode || std::string_view{depth_mode} != "standard";
+        const bool jitter_in_motion = EnvFloat("EDEN_NX2_SF_FSR4_JITTER_IN_MOTION", 0.0f) != 0.0f;
+        // Star Fox's colour is tonemapped (sRGB); Fire Emblem's is linear HDR (B10G11R11), which
+        // its FSR 3.1 path takes with automatic exposure.
+        const bool hdr = Settings::GetCurrentProgramID() == FIRE_EMBLEM;
+        try {
+            fsr4_upscaler = std::make_unique<Fsr4Upscaler>(
+                device, scheduler, memory_allocator,
+                Fsr4Upscaler::Options{.hdr = hdr,
+                                      .depth_inverted = inverted,
+                                      .depth_infinite = inverted,
+                                      .jitter_in_motion = jitter_in_motion,
+                                      .auto_exposure = hdr});
+        } catch (const vk::Exception& exception) {
+            LOG_ERROR(Render_Vulkan, "DLSS replacement FSR 4 failed to start ({}); the "
+                                     "previous replacement stays", exception.what());
+            fsr4_unsupported = true;
+            return false;
+        }
+        fsr4_point_sampler = device.GetLogical().CreateSampler(VkSamplerCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .magFilter = VK_FILTER_NEAREST,
+            .minFilter = VK_FILTER_NEAREST,
+            .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+            .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            .mipLodBias = 0.0f,
+            .anisotropyEnable = VK_FALSE,
+            .maxAnisotropy = 1.0f,
+            .compareEnable = VK_FALSE,
+            .compareOp = VK_COMPARE_OP_NEVER,
+            .minLod = 0.0f,
+            .maxLod = VK_LOD_CLAMP_NONE,
+            .borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
+            .unnormalizedCoordinates = VK_FALSE,
+        });
+        LOG_INFO(Render_Vulkan, "DLSS replacement FSR 4: depth {}, motion {}cludes the jitter, "
+                 "colour {}",
+                 inverted ? "inverted (infinite far)" : "standard", jitter_in_motion ? "in" : "ex",
+                 hdr ? "HDR (auto exposure)" : "tonemapped");
+    }
+    return true;
+}
+
+bool TextureCacheRuntime::UpscaleWithFsr4Ready(Framebuffer* dst_framebuffer,
+                                               ImageView& input_color, ImageView& motion_vectors,
+                                               ImageView& depth, std::array<u32, 2> render_size,
+                                               std::array<f32, 2> jitter,
+                                               std::array<f32, 2> motion_scale) {
+    const VkExtent2D extent = dst_framebuffer->RenderArea();
+    const auto now = std::chrono::steady_clock::now();
+    const f32 frame_time_ms =
+        fsr4_last_evaluation
+            ? std::chrono::duration<f32, std::milli>(now - *fsr4_last_evaluation).count()
+            : 1000.0f / 60.0f;
+    const bool reset = !fsr4_last_evaluation || frame_time_ms > 250.0f;
+    fsr4_last_evaluation = now;
+    const auto image = [&](ImageView& view, VkImageAspectFlags aspect) {
+        VkFormat format =
+            MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, false, view.format).format;
+        // FFX knows no packed ABGR formats: the same bytes as R8G8B8A8 (the images are created
+        // mutable, so FFX's own view of that format is valid).
+        if (format == VK_FORMAT_A8B8G8R8_SRGB_PACK32) {
+            format = VK_FORMAT_R8G8B8A8_SRGB;
+        } else if (format == VK_FORMAT_A8B8G8R8_UNORM_PACK32) {
+            format = VK_FORMAT_R8G8B8A8_UNORM;
+        }
+        return Fsr4Upscaler::Image{
+            .image = view.ImageHandle(),
+            .format = format,
+            .range{
+                .aspectMask = aspect,
+                .baseMipLevel = static_cast<u32>(view.range.base.level),
+                .levelCount = 1,
+                .baseArrayLayer = static_cast<u32>(view.range.base.layer),
+                .layerCount = 1,
+            },
+            .barrier_aspect = ImageAspectMask(view.format),
+        };
+    };
+    // Sharpening: the FSR slider (stored 200 = off); EDEN_NX2_TEMPORAL_SHARPEN=<stops>|off
+    // overrides it.
+    static const char* const sharpen_override = std::getenv("EDEN_NX2_TEMPORAL_SHARPEN");
+    const int slider = Settings::values.fsr_sharpening_slider.GetValue();
+    bool sharpen = slider < 200;
+    f32 stops = static_cast<f32>(slider) / 100.0f;
+    if (sharpen_override) {
+        sharpen = std::string_view{sharpen_override} != "off";
+        stops = static_cast<f32>(std::strtod(sharpen_override, nullptr));
+    }
+    // A/B switches for the conventions (multipliers on the contract's values).
+    static const f32 jitter_x = EnvFloat("EDEN_NX2_SF_FSR4_JITTER_X", 1.0f);
+    static const f32 jitter_y = EnvFloat("EDEN_NX2_SF_FSR4_JITTER_Y", 1.0f);
+    static const f32 motion_x = EnvFloat("EDEN_NX2_SF_FSR4_MOTION_X", 1.0f);
+    static const f32 motion_y = EnvFloat("EDEN_NX2_SF_FSR4_MOTION_Y", 1.0f);
+    const std::array<f32, 2> fsr_jitter{jitter[0] * jitter_x, jitter[1] * jitter_y};
+    const std::array<f32, 2> fsr_motion{
+        motion_scale[0] * motion_x * static_cast<f32>(render_size[0]),
+        motion_scale[1] * motion_y * static_cast<f32>(render_size[1])};
+    // A depth with a stencil plane goes to FSR 4 as a D32 copy of its depth aspect (FFX views a
+    // depth resource as D32, which a D32S8 image can't be viewed as).
+    Fsr4Upscaler::Image depth_input = image(depth, VK_IMAGE_ASPECT_DEPTH_BIT);
+    if (depth.format == PixelFormat::D32_FLOAT_S8_UINT) {
+        const VkExtent2D depth_extent{render_size[0], render_size[1]};
+        if (!fsr4_depth_copy || fsr4_depth_extent.width != depth_extent.width ||
+            fsr4_depth_extent.height != depth_extent.height) {
+            if (fsr4_depth_copy) {
+                scheduler.Finish();
+            }
+            fsr4_depth_copy = memory_allocator.CreateImage(VkImageCreateInfo{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .imageType = VK_IMAGE_TYPE_2D,
+                .format = VK_FORMAT_D32_SFLOAT,
+                .extent = {depth_extent.width, depth_extent.height, 1},
+                .mipLevels = 1,
+                .arrayLayers = 1,
+                .samples = VK_SAMPLE_COUNT_1_BIT,
+                .tiling = VK_IMAGE_TILING_OPTIMAL,
+                .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                .queueFamilyIndexCount = 0,
+                .pQueueFamilyIndices = nullptr,
+                .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            });
+            fsr4_depth_buffer = memory_allocator.CreateBuffer(
+                VkBufferCreateInfo{
+                    .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                    .pNext = nullptr,
+                    .flags = 0,
+                    .size = VkDeviceSize{depth_extent.width} * depth_extent.height * 4,
+                    .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                    .queueFamilyIndexCount = 0,
+                    .pQueueFamilyIndices = nullptr,
+                },
+                MemoryUsage::DeviceLocal);
+            fsr4_depth_extent = depth_extent;
+            fsr4_depth_fresh = true;
+        }
+        const VkImage source = depth.ImageHandle();
+        const u32 level = static_cast<u32>(depth.range.base.level);
+        const u32 layer = static_cast<u32>(depth.range.base.layer);
+        scheduler.RequestOutsideRenderPassOperationContext();
+        scheduler.Record([source, level, layer, copy = *fsr4_depth_copy,
+                          buffer = *fsr4_depth_buffer, extent = depth_extent,
+                          fresh = fsr4_depth_fresh](vk::CommandBuffer cmdbuf) {
+            constexpr VkAccessFlags WRITES = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                                             VK_ACCESS_SHADER_WRITE_BIT |
+                                             VK_ACCESS_TRANSFER_WRITE_BIT;
+            const VkImageMemoryBarrier source_barrier{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = WRITES,
+                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+                .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+                .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = source,
+                .subresourceRange{VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, level,
+                                  1, layer, 1},
+            };
+            const VkImageMemoryBarrier copy_barrier{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = fresh ? VkAccessFlags{0} : VkAccessFlags{VK_ACCESS_SHADER_READ_BIT},
+                .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .oldLayout = fresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL,
+                .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = copy,
+                .subresourceRange{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1},
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, {}, {},
+                                   std::array{source_barrier, copy_barrier});
+            const VkBufferImageCopy from{
+                .bufferOffset = 0,
+                .bufferRowLength = 0,
+                .bufferImageHeight = 0,
+                .imageSubresource{VK_IMAGE_ASPECT_DEPTH_BIT, level, layer, 1},
+                .imageOffset{0, 0, 0},
+                .imageExtent{extent.width, extent.height, 1},
+            };
+            cmdbuf.CopyImageToBuffer(source, VK_IMAGE_LAYOUT_GENERAL, buffer, from);
+            const VkBufferMemoryBarrier staged{
+                .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .buffer = buffer,
+                .offset = 0,
+                .size = VK_WHOLE_SIZE,
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   0, {}, staged, {});
+            VkBufferImageCopy to = from;
+            to.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+            cmdbuf.CopyBufferToImage(buffer, copy, VK_IMAGE_LAYOUT_GENERAL, to);
+            const VkImageMemoryBarrier done_barrier{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+                .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+                .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = copy,
+                .subresourceRange{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1},
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, done_barrier);
+        });
+        fsr4_depth_fresh = false;
+        depth_input = Fsr4Upscaler::Image{
+            .image = *fsr4_depth_copy,
+            .format = VK_FORMAT_D32_SFLOAT,
+            .range{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1},
+            .barrier_aspect = VK_IMAGE_ASPECT_DEPTH_BIT,
+        };
+    }
+    // fsr4-vk takes no 8-bit sRGB colour: a linear RGBA16F copy (vkCmdBlitImage decodes an sRGB
+    // image's texels), as Ocarina's colour is. Other formats (Fire Emblem's B10G11R11) go the
+    // same way: RGBA16F is the colour format fsr4-vk is known to take.
+    Fsr4Upscaler::Image color_input = image(input_color, VK_IMAGE_ASPECT_COLOR_BIT);
+    if (color_input.format != VK_FORMAT_R16G16B16A16_SFLOAT) {
+        const VkExtent2D color_extent{render_size[0], render_size[1]};
+        if (!fsr4_color_copy || fsr4_color_extent.width != color_extent.width ||
+            fsr4_color_extent.height != color_extent.height) {
+            if (fsr4_color_copy) {
+                scheduler.Finish();
+            }
+            fsr4_color_copy = memory_allocator.CreateImage(VkImageCreateInfo{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .imageType = VK_IMAGE_TYPE_2D,
+                .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+                .extent = {color_extent.width, color_extent.height, 1},
+                .mipLevels = 1,
+                .arrayLayers = 1,
+                .samples = VK_SAMPLE_COUNT_1_BIT,
+                .tiling = VK_IMAGE_TILING_OPTIMAL,
+                .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                .queueFamilyIndexCount = 0,
+                .pQueueFamilyIndices = nullptr,
+                .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            });
+            fsr4_color_extent = color_extent;
+            fsr4_color_fresh = true;
+            const Image* const backing = input_color.BackingImage();
+            LOG_INFO(Render_Vulkan, "Star Fox FSR 4: colour {}x{} converted to RGBA16F (view {}, "
+                                    "image {})",
+                     color_extent.width, color_extent.height, static_cast<u32>(input_color.format),
+                     backing ? static_cast<u32>(backing->info.format) : 0U);
+        }
+        const VkImage source = input_color.ImageHandle();
+        const u32 level = static_cast<u32>(input_color.range.base.level);
+        const u32 layer = static_cast<u32>(input_color.range.base.layer);
+        scheduler.RequestOutsideRenderPassOperationContext();
+        scheduler.Record([source, level, layer, copy = *fsr4_color_copy, extent = color_extent,
+                          fresh = fsr4_color_fresh](vk::CommandBuffer cmdbuf) {
+            constexpr VkAccessFlags WRITES = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                             VK_ACCESS_SHADER_WRITE_BIT |
+                                             VK_ACCESS_TRANSFER_WRITE_BIT;
+            const std::array before{
+                VkImageMemoryBarrier{
+                    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = WRITES,
+                    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+                    .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+                    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = source,
+                    .subresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, level, 1, layer, 1},
+                },
+                VkImageMemoryBarrier{
+                    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = fresh ? VkAccessFlags{0}
+                                           : VkAccessFlags{VK_ACCESS_SHADER_READ_BIT},
+                    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .oldLayout = fresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL,
+                    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = copy,
+                    .subresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+                },
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, {}, {}, before);
+            const s32 width = static_cast<s32>(extent.width);
+            const s32 height = static_cast<s32>(extent.height);
+            const VkImageBlit region{
+                .srcSubresource{VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1},
+                .srcOffsets{{0, 0, 0}, {width, height, 1}},
+                .dstSubresource{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                .dstOffsets{{0, 0, 0}, {width, height, 1}},
+            };
+            cmdbuf.BlitImage(source, VK_IMAGE_LAYOUT_GENERAL, copy, VK_IMAGE_LAYOUT_GENERAL,
+                             region, VK_FILTER_NEAREST);
+            const VkImageMemoryBarrier after{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+                .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+                .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = copy,
+                .subresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, after);
+        });
+        fsr4_color_fresh = false;
+        color_input = Fsr4Upscaler::Image{
+            .image = *fsr4_color_copy,
+            .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+            .range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+            .barrier_aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+        };
+    }
+    const bool done = fsr4_upscaler->Upscale({
+        .color = color_input,
+        .depth = depth_input,
+        .motion_vectors = image(motion_vectors, VK_IMAGE_ASPECT_COLOR_BIT),
+        .reactive = std::nullopt,
+        .render_size = {render_size[0], render_size[1]},
+        .upscale_size = extent,
+        .frame_time_ms = frame_time_ms,
+        .reset = reset,
+        .sharpen = sharpen,
+        .sharpness = FSR::RcasSharpnessFromStops(stops),
+        .vertical_fov = 1.0f,
+        .camera_near = 0.1f,
+        .camera_far = 100000.0f,
+        .jitter = fsr_jitter,
+        .motion_vector_scale = fsr_motion,
+    });
+    scheduler.InvalidateState();
+    if (!done || fsr4_upscaler->Failed()) {
+        fsr4_unsupported = true;
+        return false;
+    }
+    DrawUpscaledOutput(dst_framebuffer, fsr4_upscaler->OutputView(), fsr4_upscaler->OutputImage(),
+                       *fsr4_point_sampler);
+    static u32 logged{};
+    if (const u32 n = logged++; n < 4 || n % 600 == 0) {
+        LOG_INFO(Render_Vulkan,
+                 "{} FSR 4 evaluated (#{}): {}x{} -> {}x{} jitter=({},{}) mv scale=({},{}){}",
+                 Settings::GetCurrentProgramID() == FIRE_EMBLEM ? "Fire Emblem" : "Star Fox", n,
+                 render_size[0], render_size[1], extent.width, extent.height, fsr_jitter[0],
+                 fsr_jitter[1], fsr_motion[0], fsr_motion[1], reset ? " reset" : "");
+    }
+    return true;
+}
+
 void TextureCacheRuntime::DrawUpscaledOutput(Framebuffer* dst_framebuffer, VkImageView view,
                                              VkImage output, VkSampler sampler) {
     // Draw the result into the DLSS output, which keeps its own format; the blit leaves the
@@ -2271,6 +2710,30 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
         return view_extent && VideoCommon::DlssContract::FitsExtent(requested, *view_extent);
     };
     const VkExtent2D output_extent = dst_framebuffer->RenderArea();
+    // bazzite: Star Fox's evaluation through FSR 4 (jittered sRGB colour, motion, depth; output
+    // RGBA16F at the output's size, 1:1 or larger). Without it, the spatial replacement below.
+    const bool star_fox_fsr4 = StarFoxFsr4Requested();
+    if (use_history && depth && (star_fox_fsr4 || FireEmblemFsr4Requested())) {
+        if (plain(dst) && plain(input_color) && plain(motion_vectors) && plain(*depth) &&
+            fits(input_color, render_size) && fits(motion_vectors, render_size) &&
+            fits(*depth, render_size) && fits(dst, {output_extent.width, output_extent.height}) &&
+            (input_color.format == PixelFormat::A8B8G8R8_SRGB ||
+             input_color.format == PixelFormat::B10G11R11_FLOAT) &&
+            ImageAspectMask(dst.format) == VK_IMAGE_ASPECT_COLOR_BIT &&
+            motion_vectors.format == PixelFormat::R16G16_FLOAT &&
+            (depth->format == PixelFormat::D32_FLOAT ||
+             depth->format == PixelFormat::D32_FLOAT_S8_UINT) &&
+            input_color.ImageHandle() != dst.ImageHandle() &&
+            UpscaleWithFsr4(dst_framebuffer, input_color, motion_vectors, *depth, render_size,
+                            jitter, motion_scale)) {
+            return true;
+        }
+        if (star_fox_fsr4) {
+            // Star Fox: the spatial replacement. Fire Emblem goes on to FSR 3.1.
+            use_history = false;
+            motion_scale = {0.0f, 0.0f};
+        }
+    }
     if (!plain(dst) || !plain(input_color) || !fits(input_color, render_size) ||
         !fits(dst, {output_extent.width, output_extent.height}) ||
         !VideoCommon::DlssContract::ValidColorFormats(input_color.format, dst.format, use_history) ||

@@ -1075,6 +1075,28 @@ constexpr u32 DLSS_NETWORK_MAX_DROPS = 3;
 constexpr u32 DLSS_CHECK_MISMATCH_PERCENT = 3;
 } // Anonymous namespace
 
+namespace {
+/// bazzite: Star Fox's DLSS evaluation through FSR 4 with the prepass's motion and depth
+/// (vk_texture_cache.cpp runs it), in place of the spatial de-jitter. EDEN_NX2_STARFOX_FSR4=1:
+/// 1920x1080 into the network's output (anti-aliasing; the game's own pass enlarges it to 4K);
+/// =4k: 1920x1080 -> 3840x2160 into the image the game's 4K upscale writes, which is skipped.
+bool StarFoxFsr4() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_STARFOX_FSR4");
+        return value && (value[0] == '1' || value[0] == '4');
+    }();
+    return enabled;
+}
+
+bool StarFoxFsr4At4k() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_STARFOX_FSR4");
+        return value && std::string_view{value} == "4k";
+    }();
+    return enabled;
+}
+} // Anonymous namespace
+
 /// Track captured network passes and return whether native dispatch should be skipped.
 /// Spatial-only chains still dispatch natively and replace the display output afterward.
 bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
@@ -1082,6 +1104,51 @@ bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
     const auto passes = CapturedPasses(program_id);
     if (!passes) {
         return false;
+    }
+    if (program_id == StarFoxProgramId && IsStarFoxUpscale(native_key) && StarFoxFsr4()) {
+        // Remember where the game's 4K upscale stores; skip it when FSR 4 drew there already.
+        const auto [reads, stores] = NativeImageHandles(regs.code_loc.Address());
+        std::optional<Texture::TICEntry> target;
+        std::optional<Texture::TICEntry> source;
+        if (reads.size() == 1 && stores.size() == 1) {
+            target = ConstBuffer0Image(stores.front());
+            source = ConstBuffer0Image(reads.front());
+        }
+        // The upscale runs from the boot logos on, long before the first DLSS evaluation (the
+        // title): build FSR 4's pipelines now, at the sizes this upscale shows (its input is the
+        // scene's size), not as a multi-second stall at the first evaluation.
+        if (!sf_fsr4_prewarmed && target && source && source->Width() >= 64 &&
+            source->Height() >= 64 && target->Width() >= source->Width() &&
+            target->Height() >= source->Height()) {
+            sf_fsr4_prewarmed = true;
+            const std::array<u32, 2> scene{source->Width(), source->Height()};
+            rasterizer->PrewarmTemporalUpscale(
+                scene, StarFoxFsr4At4k() ? std::array<u32, 2>{target->Width(), target->Height()}
+                                         : scene);
+        }
+        if (!StarFoxFsr4At4k()) {
+            return false;
+        }
+        const bool written = std::exchange(sf_upscale_written, false);
+        const bool same = target && sf_upscale_target &&
+                          target->Address() == sf_upscale_target->Address();
+        // A storage image: block linear, one layer, the colour format the upscale stores.
+        if (target && target->Address() != 0 && target->IsBlockLinear() &&
+            target->Depth() == 1 && target->format == Texture::TextureFormat::A8B8G8R8) {
+            sf_upscale_target = target;
+        } else {
+            sf_upscale_target.reset();
+        }
+        static u32 logged{};
+        if (logged++ < 4) {
+            LOG_INFO(HW_GPU, "Star Fox 4K upscale: reads {} stores {} target {:#x} {}x{} format {:#x} "
+                             "{}; FSR 4 drew it this frame: {}",
+                     reads.size(), stores.size(), target ? target->Address() : 0,
+                     target ? target->Width() : 0, target ? target->Height() : 0,
+                     target ? static_cast<u32>(target->format.Value()) : 0U,
+                     sf_upscale_target ? "kept" : "not kept", written && same);
+        }
+        return written && same;
     }
     if (passes->spatial_only && (passes->IsPrepass(native_key) || native_key == passes->output)) {
         TraceDlssContract(native_key, false);
@@ -1331,7 +1398,7 @@ bool KeplerCompute::FinishDlssEvaluation() {
         using namespace VideoCommon::FireEmblemUpscale;
         if (UseReplacement(StarFoxProgramId, StarFoxOutputProgramKey,
                            std::getenv("EDEN_NX2_DLSS_REPLACEMENT"))) {
-            return TryFireEmblemUpscale(false);
+            return TryFireEmblemUpscale(StarFoxFsr4());
         }
         dlss_motion_vectors.reset();
         dlss_depth.reset();
@@ -1691,7 +1758,8 @@ void KeplerCompute::RememberDlssMotionVectors() {
         return dlss_chain.render_region ||
                (other.Width() == color->Width() && other.Height() == color->Height());
     };
-    if (!color || !motion || color->format != Texture::TextureFormat::B10G11R11 ||
+    if (!color || !motion ||
+        !VideoCommon::FireEmblemUpscale::ValidInput(*color, dlss_chain.spatial_only) ||
         motion->format != Texture::TextureFormat::R16G16 || motion->Address() == 0 ||
         !same_grid(*motion) || !motion->IsBlockLinear())
         return;
@@ -1699,8 +1767,11 @@ void KeplerCompute::RememberDlssMotionVectors() {
     dlss_motion_color = color->Address();
     const u32 depth_offset = dlss_chain.render_region ? 0x288 : 0x298;
     const auto depth = cbuf.size.Value() >= 0x29c ? image(depth_offset) : std::nullopt;
-    if (depth && depth->format == Texture::TextureFormat::Z32 && depth->Address() != 0 &&
-        same_grid(*depth) && depth->IsBlockLinear()) {
+    // Star Fox's depth has a stencil plane (Z32_X24S8); FSR 4 reads its depth aspect.
+    const bool depth_format = depth && (depth->format == Texture::TextureFormat::Z32 ||
+                                        (dlss_chain.spatial_only &&
+                                         depth->format == Texture::TextureFormat::Z32_X24S8));
+    if (depth_format && depth->Address() != 0 && same_grid(*depth) && depth->IsBlockLinear()) {
         dlss_depth = *depth;
     } else {
         dlss_depth.reset();
@@ -1730,7 +1801,7 @@ void KeplerCompute::CaptureFireEmblemJitter() {
     fe_upscale_jitter.Capture(color.Address(), color.Width(), color.Height(),
         {std::bit_cast<f32>(memory_manager.Read<u32>(address + JitterOffset)),
          std::bit_cast<f32>(memory_manager.Read<u32>(address + JitterOffset + sizeof(f32)))});
-    if (!dlss_chain.spatial_only) {
+    if (!dlss_chain.spatial_only || StarFoxFsr4()) {
         RememberDlssMotionVectors();
     }
 }
@@ -1891,7 +1962,17 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
     if (dlss_chain.render_region) {
         return ScaleDlssRenderRegion(address, input, output, jitter, motion, depth);
     }
-    if (!input || !output || !ValidPair(*input, *output, dlss_chain.spatial_only) ||
+    // Star Fox through FSR 4 may also write an output larger than its input (a scene rendered
+    // below the output's size): the same formats, the output at least the input's size.
+    const bool starfox_pair =
+        dlss_chain.spatial_only && allow_history && input && output &&
+        ValidInput(*input, true) &&
+        StarFoxColor(*output, Texture::TextureFormat::R16G16B16A16,
+                     Texture::ComponentType::FLOAT, false) &&
+        input->Address() != output->Address() && output->Width() >= input->Width() &&
+        output->Height() >= input->Height();
+    if (!input || !output ||
+        !(starfox_pair || ValidPair(*input, *output, dlss_chain.spatial_only)) ||
         jitter->color != input->Address() || jitter->width != input->Width() ||
         jitter->height != input->Height()) {
         return false;
@@ -1916,6 +1997,26 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
     };
     const auto input_format = dlss_chain.spatial_only ? Tegra::RenderTargetFormat::A8B8G8R8_SRGB
                                                      : Tegra::RenderTargetFormat::B10G11R11_FLOAT;
+    // Star Fox, FSR 4 at 4K: into the image the game's 4K upscale writes (it is skipped), then
+    // the spatial replacement into the network's own output, as without FSR 4 (the passes after
+    // it still read that).
+    if (dlss_chain.spatial_only && use_history && StarFoxFsr4At4k() && sf_upscale_target &&
+        sf_upscale_target->Width() >= input->Width() &&
+        sf_upscale_target->Height() >= input->Height() &&
+        sf_upscale_target->Address() != input->Address()) {
+        sf_upscale_written = rasterizer->AccelerateTemporalUpscale(
+            surface(*input, input_format),
+            surface(*sf_upscale_target, Tegra::RenderTargetFormat::A8B8G8R8_SRGB),
+            surface(*motion, Tegra::RenderTargetFormat::R16G16_FLOAT), &*depth, jitter->offset,
+            std::array{1.0f, 1.0f}, true);
+        static u32 logged_4k{};
+        if (const u32 n = logged_4k++; n < 4 || n % 600 == 0) {
+            LOG_INFO(HW_GPU, "Star Fox FSR 4 at 4K (#{}): {} into {:#x} {}x{}", n,
+                     sf_upscale_written ? "drawn" : "not drawn", sf_upscale_target->Address(),
+                     sf_upscale_target->Width(), sf_upscale_target->Height());
+        }
+        use_history = false;
+    }
     const auto output_format = dlss_chain.spatial_only ? Tegra::RenderTargetFormat::R16G16B16A16_FLOAT
                                                       : Tegra::RenderTargetFormat::B10G11R11_FLOAT;
     const auto upscale = [&](bool history) {
@@ -1931,7 +2032,7 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
         done = upscale(false);
     }
     static std::array<u32, 2> logged{};
-    if (logged[game_index]++ < 8) {
+    if (const u32 n = logged[game_index]++; n < 8 || n % 600 == 0) {
         LOG_INFO(HW_GPU, "{} DLSS replacement: {} temporal={} input={:#x} {}x{} output={:#x} {}x{} jitter={},{}",
                  game, done ? "applied" : "unavailable; retaining native dispatch", use_history,
                  input->Address(), input->Width(), input->Height(), output->Address(),

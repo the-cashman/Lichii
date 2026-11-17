@@ -14,6 +14,9 @@
 #include <array>
 #include <vector>
 #include <boost/container/small_vector.hpp>
+#include <chrono>
+#include <map>
+#include <mutex>
 
 #include "common/assert.h"
 #include "common/cityhash.h"
@@ -370,6 +373,33 @@ const ShaderInfo* ShaderCache::ComputeShader() {
         } catch (const Shader::Exception&) {
             RememberRejection(*cpu_shader_addr);
             throw;
+        }
+    }
+    // bazzite: EDEN_NX2_SF_TRACE=1 logs, every 10 s, the native compute programs Star Fox
+    // dispatched (NativeProgramKey, translated hash, count), so its network and upscale passes
+    // can be followed over a run.
+    if (kepler_compute->IsNativeMode() && shader->lowered_native &&
+        program_id == FireEmblemUpscale::StarFoxProgramId) {
+        static const bool trace = [] {
+            const char* const value = std::getenv("EDEN_NX2_SF_TRACE");
+            return value && value[0] == '1';
+        }();
+        if (trace) {
+            static std::mutex mutex;
+            static std::map<std::pair<u64, u64>, u32> counts;
+            static auto window_start = std::chrono::steady_clock::now();
+            std::scoped_lock lock{mutex};
+            ++counts[{shader->lowered_native->native_program_key, shader->unique_hash}];
+            const auto now = std::chrono::steady_clock::now();
+            if (now - window_start >= std::chrono::seconds{10}) {
+                std::string line;
+                for (const auto& [key, count] : counts) {
+                    line += fmt::format(" {:016x}/{:016x}x{}", key.first, key.second, count);
+                }
+                LOG_INFO(HW_GPU, "Star Fox compute window:{}", line);
+                counts.clear();
+                window_start = now;
+            }
         }
     }
     // Check both warm and cold shader paths, before selecting a disk-cached pipeline.

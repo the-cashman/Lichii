@@ -318,6 +318,10 @@ public:
         return false;
     }
 
+    /// bazzite: build the DLSS replacement's FSR 4 pipelines ahead of their first use.
+    virtual void PrewarmTemporalUpscale(std::array<u32, 2> render_size,
+                                        std::array<u32, 2> upscale_size) {}
+
     /// Whether a game's own DLSS network can run here: its matrix multiplies are emulated with
     /// 32-wide shuffles, and its output must be checkable (ProbeGameDlssOutput).
     [[nodiscard]] virtual bool SupportsGameDlssNetwork() const {

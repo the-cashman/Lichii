@@ -428,6 +428,12 @@ private:
     u32 dlss_contract_trace_count{};
     GPUVAddr dlss_motion_color{};
     VideoCommon::FireEmblemUpscale::FrameJitter fe_upscale_jitter;
+    /// bazzite, Star Fox FSR 4 at 4K (EDEN_NX2_STARFOX_FSR4=4k): the image the game's own 4K
+    /// upscale stored last, and whether FSR 4 drew this frame's picture into it already (the
+    /// upscale dispatch is skipped then).
+    std::optional<Texture::TICEntry> sf_upscale_target;
+    bool sf_upscale_written{};
+    bool sf_fsr4_prewarmed{};
     bool ProcessNativeMethod(Core::System& system, u32 method, u32 argument, bool is_last_call);
     NativeQmdScheduler native_qmd;
     std::array<u32, 0xc00>* native_data_ram{};

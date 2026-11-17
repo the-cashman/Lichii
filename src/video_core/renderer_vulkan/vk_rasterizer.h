@@ -170,6 +170,8 @@ public:
     std::optional<VideoCore::GameDlssProbe> ProbeGameDlssOutput(
         const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst,
         std::optional<std::array<u32, 2>> src_region) override;
+    void PrewarmTemporalUpscale(std::array<u32, 2> render_size,
+                                std::array<u32, 2> upscale_size) override;
     bool AccelerateTemporalUpscale(const Tegra::Engines::Fermi2D::Surface& src,
                                    const Tegra::Engines::Fermi2D::Surface& dst,
                                    const Tegra::Engines::Fermi2D::Surface& motion_vectors,
