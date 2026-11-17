@@ -104,6 +104,8 @@ public:
     /// marks every present; otherwise only the two presents after RequestGpuBusySample.
     [[nodiscard]] FrameMark NextFrameMark();
     void MarkFrameEnd(u64 frame, FrameMark mark);
+    /// EDEN_NX2_FRAME_LOG: the worker stamps `frame` submitted at the next submission.
+    void MarkFrameLog(u64 frame);
     /// Any thread: asks for one host GPU timestamp sample of the frame after the next present.
     void RequestGpuBusySample() {
         gpu_busy_marks.store(2, std::memory_order_relaxed);
@@ -613,6 +615,7 @@ private:
     Common::DkbFrameTrace::RateLimit trace_gpu_rate;
     u64 trace_gpu_tick{};
     u64 trace_frame_end{};
+    u64 frame_log_mark{}; ///< worker side, EDEN_NX2_FRAME_LOG
     u64 trace_sample_frame{};
     u32 trace_gpu_count{};
     u64 trace_gpu_skipped{};

@@ -6,6 +6,8 @@
  * SPDX-License-Identifier: 0BSD
  */
 
+#include <atomic>
+#include <cstdint>
 #include "dynarmic/backend/x64/emit_x64.h"
 
 #include <iterator>
@@ -28,6 +30,9 @@
 
 // TODO: Have ARM flags in host flags and not have them use up GPR registers unless necessary.
 // TODO: Actually implement that proper instruction selector you've always wanted to sweetheart.
+
+// Blocks compiled so far (all cores; the emulator's EDEN_NX2_FRAME_LOG reads it per frame).
+std::atomic<std::uint64_t> dynarmic_blocks_compiled{0};
 
 namespace Dynarmic::Backend::X64 {
 
@@ -374,6 +379,7 @@ Xbyak::Label EmitX64::EmitCond(IR::Cond cond) {
 }
 
 EmitX64::BlockDescriptor EmitX64::RegisterBlock(const IR::LocationDescriptor& descriptor, CodePtr entrypoint, size_t size) {
+    dynarmic_blocks_compiled.fetch_add(1, std::memory_order_relaxed);
     // Each register takes a process-wide lock and reads the environment: not without a perf map.
     if (PerfMapEnabled()) {
         PerfMapRegister(entrypoint, code.getCurr(), LocationDescriptorToFriendlyName(descriptor));

@@ -54,6 +54,7 @@ struct Frame {
     u32 game_frame_presents{1};
     /// When the composite handed this frame to the presenter (steady clock ns; present log).
     s64 composite_ns{};
+    u64 frame_log_id{}; ///< EDEN_NX2_FRAME_LOG frame shown (0: none)
 #ifdef EGLANTINE_STREAMLINE
     // DLSS Frame Generation: the guest frame presented and where the guest image is in the frame.
     bool frame_gen{};

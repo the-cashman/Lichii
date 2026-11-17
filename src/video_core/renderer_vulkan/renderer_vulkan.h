@@ -16,6 +16,7 @@
 #include "video_core/renderer_vulkan/present/frame_gen.h"
 #endif
 #include "video_core/renderer_vulkan/vk_blit_screen.h"
+#include "video_core/renderer_vulkan/vk_frame_log.h"
 #include "video_core/renderer_vulkan/vk_present_manager.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -138,6 +139,8 @@ private:
     MemoryAllocator memory_allocator;
     StateTracker state_tracker;
     Scheduler scheduler;
+    /// EDEN_NX2_FRAME_LOG (destroyed before the scheduler).
+    std::unique_ptr<FrameLogGpuWaiter> frame_log_gpu;
     Swapchain swapchain;
     PresentManager present_manager;
     BlitScreen blit_swapchain;

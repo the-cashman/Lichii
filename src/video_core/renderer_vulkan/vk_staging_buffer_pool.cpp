@@ -11,6 +11,7 @@
 #include <fmt/ranges.h>
 
 #include "common/alignment.h"
+#include "common/nx2_frame_log.h"
 #include "common/assert.h"
 #include "common/bit_util.h"
 #include "common/common_types.h"
@@ -124,6 +125,9 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
 StagingBufferPool::~StagingBufferPool() = default;
 
 StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool deferred) {
+    if (usage == MemoryUsage::Upload && Common::Nx2FrameLog::Enabled()) [[unlikely]] {
+        Common::Nx2FrameLog::Count(Common::Nx2FrameLog::Counter::UploadBytes, size);
+    }
     if (!deferred && usage == MemoryUsage::Upload && size <= region_size) {
         return GetStreamBuffer(size);
     }

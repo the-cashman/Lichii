@@ -9,6 +9,7 @@
 #include <span>
 
 #include "common/common_types.h"
+#include "common/nx2_frame_log.h"
 
 // EDEN_NX2_BACK_IDLE_TRACE=1: what the GPU thread (the split's front) does while the back has
 // nothing to execute. The front logs its state changes into a ring; when the back gets work again
@@ -45,13 +46,19 @@ inline bool Enabled() {
     return enabled;
 }
 
+/// The front's state is tracked (also for EDEN_NX2_FRAME_LOG's per-frame front time by state).
+inline bool Tracked() {
+    static const bool tracked = Enabled() || Common::Nx2FrameLog::Enabled();
+    return tracked;
+}
+
 u64 Now();
 
 /// GPU thread: sets the front's state and returns the one before (Count on other threads).
 FrontState SwapFrontState(FrontState state);
 
 inline void SetFrontState(FrontState state) {
-    if (Enabled()) {
+    if (Tracked()) {
         SwapFrontState(state);
     }
 }
@@ -60,7 +67,7 @@ inline void SetFrontState(FrontState state) {
 class FrontWait {
 public:
     explicit FrontWait(FrontState state)
-        : previous{Enabled() ? SwapFrontState(state) : FrontState::Count} {}
+        : previous{Tracked() ? SwapFrontState(state) : FrontState::Count} {}
     ~FrontWait() {
         if (previous != FrontState::Count) {
             SwapFrontState(previous);

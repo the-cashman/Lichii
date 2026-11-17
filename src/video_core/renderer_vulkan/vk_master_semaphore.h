@@ -53,6 +53,10 @@ public:
     /// Waits for a tick to be hit on the GPU
     void Wait(u64 tick);
 
+    /// Any thread: waits up to `timeout_ns` for a tick (submitted or not yet); true when hit.
+    /// Doesn't update the known tick (EDEN_NX2_FRAME_LOG's GPU stamp).
+    bool WaitTick(u64 tick, u64 timeout_ns);
+
     /// Submits the device graphics queue, updating the tick as necessary
     VkResult SubmitQueue(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
                          VkSemaphore signal_semaphore, VkSemaphore wait_semaphore, u64 host_tick);

@@ -12,6 +12,7 @@
 
 #include "common/assert.h"
 #include "common/dkb_cpu_trace.h"
+#include "common/nx2_frame_log.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/thread.h"
@@ -132,7 +133,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     if (!scheduler.HasPendingChannels()) {
                         continue;
                     }
-                    if (BackIdleTrace::Enabled()) {
+                    if (BackIdleTrace::Tracked()) {
                         BackIdleTrace::SetFrontState(scheduler.WaitsForListCopy()
                                                          ? FrontState::PendingCopy
                                                          : FrontState::PendingSemaphore);
@@ -277,6 +278,11 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
 }
 
 void ThreadManager::SubmitList(s32 channel, Tegra::CommandList&& entries, bool is_async) {
+    if (Common::Nx2FrameLog::Enabled()) [[unlikely]] {
+        Common::Nx2FrameLog::Count(Common::Nx2FrameLog::Counter::Submits);
+        Common::Nx2FrameLog::Event(Common::Nx2FrameLog::EventKind::Submit,
+                                   Common::Nx2FrameLog::Now(), static_cast<u64>(channel));
+    }
     PushCommand(SubmitListCommand(channel, std::move(entries)), false, is_async);
 }
 
