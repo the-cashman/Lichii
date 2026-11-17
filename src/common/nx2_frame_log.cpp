@@ -12,7 +12,9 @@
 
 #include <cstring>
 #include <fcntl.h>
-#include <sched.h>
+#include <cerrno>
+#include <linux/perf_event.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include "common/logging.h"
@@ -89,7 +91,7 @@ struct State {
                            "front_drain_ns,front_writers_ns,front_semaphore_ns,front_copy_ns,"
                            "front_queue_empty_ns,back_idle_ns,submits,drain_ringfull_ns,drain_acquire_ns,"
                            "drain_other_ns,back_cpu_ns,back_delay_ns,front_cpu_ns,front_delay_ns,"
-                           "worker_cpu_ns,worker_delay_ns,back_core_run_ns,front_core_run_ns,gpu_tick\n"
+                           "worker_cpu_ns,worker_delay_ns,back_cycles,back_instructions,back_cache_misses,gpu_tick\n"
                            "# E,kind,ns,arg (1 submit, 2 front state, 3 back idle, 4 reached)\n"
                            "# T,frame,ns,cntpct,thread_id,priority,core,cpu_ticks,presenter\n");
         std::fflush(file);
@@ -199,61 +201,17 @@ void State::Flush(bool all) {
 }
 
 std::array<std::atomic<int>, static_cast<size_t>(ThreadRole::Count)> g_thread_fds{};
-/// Per role: bit mask of the CPUs the thread is pinned to (0: not pinned to <= 2 CPUs).
-std::array<std::atomic<u64>, static_cast<size_t>(ThreadRole::Count)> g_thread_cpus{};
-int g_schedstat_fd = -1; ///< /proc/schedstat, back thread only
+/// GPUBack's perf event group (leader cycles, then instructions, cache misses); -1: none.
+int g_back_perf_fd = -1;
 
-/// Sum of rq_cpu_time over the CPUs in `mask_a` and `mask_b` (one read of /proc/schedstat).
-void ReadCoreRun(u64 mask_a, u64 mask_b, u64& run_a, u64& run_b) {
-    if (g_schedstat_fd < 0) {
-        g_schedstat_fd = open("/proc/schedstat", O_RDONLY | O_CLOEXEC);
-        if (g_schedstat_fd < 0) {
-            return;
-        }
-    }
-    static char buf[65536];
-    const ssize_t n = pread(g_schedstat_fd, buf, sizeof(buf) - 1, 0);
-    if (n <= 0) {
-        return;
-    }
-    buf[n] = 0;
-    for (char* line = buf; line != nullptr && *line;) {
-        char* next = std::strchr(line, '\n');
-        if (next) {
-            *next++ = 0;
-        }
-        if (line[0] == 'c' && line[1] == 'p' && line[2] == 'u') {
-            char* p{};
-            const long cpu = std::strtol(line + 3, &p, 10);
-            if (cpu >= 0 && cpu < 64 && (((mask_a | mask_b) >> cpu) & 1)) {
-                u64 v[9]{};
-                for (int i = 0; i < 9; ++i) {
-                    v[i] = std::strtoull(p, &p, 10);
-                }
-                if ((mask_a >> cpu) & 1) {
-                    run_a += v[6];
-                }
-                if ((mask_b >> cpu) & 1) {
-                    run_b += v[6];
-                }
-            }
-        }
-        line = next;
-    }
-}
-
-/// run ns and wait ns of a schedstat file (fd kept open; pread from 0).
-bool ReadSchedstat(int fd, u64& run, u64& wait) {
-    char buf[96];
-    const ssize_t n = pread(fd, buf, sizeof(buf) - 1, 0);
-    if (n <= 0) {
-        return false;
-    }
-    buf[n] = 0;
-    char* end{};
-    run = std::strtoull(buf, &end, 10);
-    wait = std::strtoull(end, nullptr, 10);
-    return true;
+int PerfOpen(u64 config, int group) {
+    perf_event_attr attr{};
+    attr.type = PERF_TYPE_HARDWARE;
+    attr.size = sizeof(attr);
+    attr.config = config;
+    attr.exclude_hv = 1;
+    attr.read_format = PERF_FORMAT_GROUP;
+    return static_cast<int>(syscall(SYS_perf_event_open, &attr, 0, -1, group, PERF_FLAG_FD_CLOEXEC));
 }
 
 thread_local u64 t_present_frame{};
@@ -351,16 +309,15 @@ void RegisterThread(ThreadRole role) {
     if (fd >= 0) {
         g_thread_fds[static_cast<size_t>(role)].store(fd, std::memory_order_release);
     }
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    if (sched_getaffinity(0, sizeof(set), &set) == 0 && CPU_COUNT(&set) <= 2) {
-        u64 mask = 0;
-        for (int c = 0; c < 64; ++c) {
-            if (CPU_ISSET(c, &set)) {
-                mask |= u64{1} << c;
-            }
+    if (role == ThreadRole::Back) {
+        const int leader = PerfOpen(PERF_COUNT_HW_CPU_CYCLES, -1);
+        if (leader >= 0) {
+            PerfOpen(PERF_COUNT_HW_INSTRUCTIONS, leader);
+            PerfOpen(PERF_COUNT_HW_CACHE_MISSES, leader);
+            g_back_perf_fd = leader;
+        } else {
+            LOG_WARNING(HW_GPU, "EDEN_NX2_FRAME_LOG: no perf counters for GPUBack ({})", errno);
         }
-        g_thread_cpus[static_cast<size_t>(role)].store(mask, std::memory_order_release);
     }
 }
 
@@ -381,13 +338,13 @@ void BeginComposite(u64 frame, u64 front_ns) {
                 st.counters[base + 1].store(wait, std::memory_order_relaxed);
             }
         }
-        const u64 back_cpus = g_thread_cpus[static_cast<size_t>(ThreadRole::Back)].load();
-        const u64 front_cpus = g_thread_cpus[static_cast<size_t>(ThreadRole::Front)].load();
-        if (back_cpus | front_cpus) {
-            u64 back_run = 0, front_run = 0;
-            ReadCoreRun(back_cpus, front_cpus, back_run, front_run);
-            st.counters[static_cast<size_t>(Counter::BackCoreRunNs)].store(back_run);
-            st.counters[static_cast<size_t>(Counter::FrontCoreRunNs)].store(front_run);
+        if (g_back_perf_fd >= 0) {
+            u64 values[1 + 3]{}; // nr, then the values
+            if (read(g_back_perf_fd, values, sizeof(values)) > 0) {
+                for (u64 i = 0; i < values[0] && i < 3; ++i) {
+                    st.counters[static_cast<size_t>(Counter::BackCycles) + i].store(values[1 + i]);
+                }
+            }
         }
     }
     slot->stamps[static_cast<size_t>(Stage::Back)].store(Now(), std::memory_order_relaxed);
