@@ -35,6 +35,8 @@
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
+#include "video_core/nx2_pace.h"
+#include "video_core/renderer_vulkan/nx2_present_log.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/shader_cache_v2/cache.h"
@@ -1606,6 +1608,22 @@ bool Device::GetSuitability(bool requires_swapchain) {
     // The spec requires enabling VK_KHR_portability_subset on devices that expose it.
     if (supported_extensions.contains(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME)) {
         loaded_extensions.insert(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
+    }
+
+    // EDEN_NX2_PRESENT_LOG / EDEN_NX2_PACE: the compositor's present times, where offered
+    // (gamescope's WSI layer). Off otherwise, so it can't change how presents behave.
+    if (Vulkan::Nx2PresentLog::Wanted() || Tegra::Nx2Pace::Get().enabled) {
+        const auto has = [&](const char* name) { return supported_extensions.contains(name); };
+        google_display_timing = has(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
+        if (google_display_timing) {
+            loaded_extensions.insert(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
+        }
+        LOG_INFO(Render_Vulkan,
+                 "Present extensions offered: GOOGLE_display_timing {}, KHR_present_wait {}, "
+                 "KHR_present_id {}, EXT_present_timing {}",
+                 has(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME),
+                 has(VK_KHR_PRESENT_WAIT_EXTENSION_NAME), has(VK_KHR_PRESENT_ID_EXTENSION_NAME),
+                 has("VK_EXT_present_timing"));
     }
 
     extensions.depth_stencil_resolve =

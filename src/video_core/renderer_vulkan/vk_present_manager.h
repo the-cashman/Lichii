@@ -13,6 +13,8 @@
 
 #include "common/common_types.h"
 #include "common/polyfill_thread.h"
+#include "video_core/nx2_pace.h"
+#include "video_core/renderer_vulkan/nx2_present_log.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #ifdef EGLANTINE_STREAMLINE
@@ -50,6 +52,8 @@ struct Frame {
     std::chrono::nanoseconds present_spacing{};
     /// The presents that show this frame's game frame: 1 plus the frames generated for it.
     u32 game_frame_presents{1};
+    /// When the composite handed this frame to the presenter (steady clock ns; present log).
+    s64 composite_ns{};
 #ifdef EGLANTINE_STREAMLINE
     // DLSS Frame Generation: the guest frame presented and where the guest image is in the frame.
     bool frame_gen{};
@@ -176,6 +180,10 @@ private:
         std::chrono::nanoseconds spacing{};
         std::chrono::steady_clock::duration present_time{};
     } pacing_log;
+    /// EDEN_NX2_PRESENT_LOG (null when off) and EDEN_NX2_PACE's release grid.
+    std::unique_ptr<Nx2PresentLog> present_log;
+    Tegra::Nx2Pace::PresentGrid pace_grid;
+    u64 present_seq{1};
     /// See TakeBlockedTime. Atomic: a composite can also run from a syncpoint action on
     /// another thread (GPU::RequestComposite).
     std::atomic<std::chrono::steady_clock::rep> blocked_time{};

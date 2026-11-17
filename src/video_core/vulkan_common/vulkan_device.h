@@ -745,6 +745,11 @@ FN_MAX_LIMIT_LIST
         return present_id2_features.presentId2 && present_wait2_features.presentWait2;
     }
 
+    /// VK_GOOGLE_display_timing, enabled only for EDEN_NX2_PRESENT_LOG / EDEN_NX2_PACE.
+    bool IsGoogleDisplayTimingEnabled() const {
+        return google_display_timing;
+    }
+
     /// Returns true if VK_EXT_hdr_metadata is enabled.
     bool IsExtHdrMetadataEnabled() const {
         return extensions.hdr_metadata;
@@ -1537,6 +1542,7 @@ private:
     // Telemetry parameters
     std::set<std::string, std::less<>> supported_extensions; ///< Reported Vulkan extensions.
     std::set<std::string, std::less<>> loaded_extensions;    ///< Loaded Vulkan extensions.
+    bool google_display_timing{};
     bool streamline_extensions{}; ///< NVIDIA DLSS's extensions are loaded.
     bool streamline_attached{};   ///< Streamline has this device.
     std::vector<size_t> valid_heap_memory;                   ///< Heaps used.

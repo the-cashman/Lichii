@@ -293,6 +293,14 @@ bool Swapchain::Create(
         CreateSwapchain(capabilities);
     }
     CreateSemaphores();
+    if (device.IsGoogleDisplayTimingEnabled() && !past_timing_fn) {
+        device_handle = *device.GetLogical();
+        past_timing_fn = reinterpret_cast<PFN_vkGetPastPresentationTimingGOOGLE>(
+            device.GetDispatchLoader().vkGetDeviceProcAddr(device_handle,
+                                                           "vkGetPastPresentationTimingGOOGLE"));
+        LOG_INFO(Render_Vulkan, "VK_GOOGLE_display_timing: past timings {}",
+                 past_timing_fn ? "available" : "missing");
+    }
     is_suboptimal = false;
 
     resource_ticks.clear();
@@ -375,7 +383,7 @@ bool Swapchain::AcquireNextImage(bool may_flush, u32 game_frame_presents) {
     return false;
 }
 
-bool Swapchain::Present(VkSemaphore render_semaphore, u64 present_id) {
+bool Swapchain::Present(VkSemaphore render_semaphore, u64 present_id, u32 timing_id) {
     const auto present_queue{device.GetPresentQueue()};
     const VkPresentIdKHR present_id_info{
         .sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR,
@@ -393,6 +401,17 @@ bool Swapchain::Present(VkSemaphore render_semaphore, u64 present_id) {
     if (present_ids && present_id != 0) {
         id_info = present_ids2 ? static_cast<const void*>(&present_id2_info)
                                : static_cast<const void*>(&present_id_info);
+    }
+    // Tagged presents report the compositor's present times (CollectPastTimings); no desired time.
+    const VkPresentTimeGOOGLE present_time{.presentID = timing_id, .desiredPresentTime = 0};
+    const VkPresentTimesInfoGOOGLE present_times{
+        .sType = VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE,
+        .pNext = id_info,
+        .swapchainCount = 1,
+        .pTimes = &present_time,
+    };
+    if (timing_id != 0 && past_timing_fn != nullptr) {
+        id_info = &present_times;
     }
     const VkPresentInfoKHR present_info{
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
@@ -635,6 +654,15 @@ void Swapchain::CreateSwapchain(const VkSurfaceCapabilitiesKHR& capabilities) {
     }
     LOG_INFO(Render_Vulkan, "Swapchain: {}x{} format {} colour space {}", extent.width, extent.height,
              string_VkFormat(surface_format.format), string_VkColorSpaceKHR(surface_format.colorSpace));
+    {
+        std::string modes;
+        for (const VkPresentModeKHR mode : present_modes) {
+            modes += fmt::format("{}{}", modes.empty() ? "" : ",", string_VkPresentModeKHR(mode));
+        }
+        LOG_INFO(Render_Vulkan, "Swapchain: present mode {} of [{}], {} images (min {})",
+                 string_VkPresentModeKHR(present_mode), modes, image_count,
+                 capabilities.minImageCount);
+    }
     OcarinaHdr::NoteSwapchain(hdr10, hdr10_offered,
                               fmt::format("{}x{} {} {}, {} formats offered", extent.width,
                                           extent.height, string_VkFormat(surface_format.format),

@@ -16,6 +16,7 @@ add_executable(tests
     video_core/frame_dump_decode.cpp
     video_core/frame_gen_generations.cpp
     video_core/frame_pacer.cpp
+    video_core/nx2_pace.cpp
     video_core/nx2_stutter_trace.cpp
     video_core/back_idle_trace.cpp
     video_core/list_macro_trace.cpp

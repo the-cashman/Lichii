@@ -135,6 +135,7 @@ add_library(video_core STATIC
     native_qmd.h
     native_query_trace.h
     nx2.h
+    nx2_pace.h
     nx2_bindcache.h
     nx2_bindmemo_stats.h
     nx2_back_idle_trace.cpp
@@ -282,6 +283,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_pipeline_binaries.h
     renderer_vulkan/vk_shader_cache_v2.cpp
     renderer_vulkan/vk_shader_cache_v2.h
+    renderer_vulkan/nx2_present_log.cpp
+    renderer_vulkan/nx2_present_log.h
     renderer_vulkan/vk_present_manager.cpp
     renderer_vulkan/vk_present_manager.h
     renderer_vulkan/vk_query_cache.cpp

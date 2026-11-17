@@ -170,9 +170,12 @@ PresentManager::PresentManager(const vk::Instance& instance_,
     , storage_supported{CanStoreToFrame(device.GetPhysical(), swapchain.GetImageFormat())}
     // Frame generation needs the present thread to space generated frames without stalling the
     // emulator.
+    // EDEN_NX2_PACE holds presents to its grid, which must not hold the GPU thread.
     , use_present_thread{Settings::values.async_presentation.GetValue() ||
-                         Settings::values.frame_gen.GetValue()}
+                         Settings::values.frame_gen.GetValue() ||
+                         Tegra::Nx2Pace::HoldsPresents()}
     , present_wait{device.IsPresentWaitEnabled() && VideoCore::HostVsync::Enabled()}
+    , present_log{Nx2PresentLog::Create(device_)}
 {
     // No frame starter of an earlier boot is left for this presenter.
     VideoCore::HostVsync::Reset();
@@ -272,6 +275,10 @@ Frame* PresentManager::GetRenderFrame() {
 
     // Wait for the presentation to be finished so all frame resources are free
     frame->present_done.Wait();
+    if (present_log) {
+        // The log thread may still wait on the fence reset below.
+        present_log->WaitFrame(frame->index);
+    }
     blocked_time.fetch_add((std::chrono::steady_clock::now() - waiting).count(),
                            std::memory_order_relaxed);
     frame->present_done.Reset();
@@ -821,11 +828,51 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
         });
     }
 #endif
+    Nx2PresentLog::Record log_record{
+        .seq = present_seq++,
+        .frame_index = frame->index,
+        .composite_ns = frame->composite_ns,
+    };
+    if (Tegra::Nx2Pace::HoldsPresents()) {
+        // EDEN_NX2_PACE: release on the grid once the copy is done (the earliest the compositor
+        // can show the frame), so a frame that finished early waits here, not on the display.
+        const auto& pace = Tegra::Nx2Pace::Get();
+        frame->present_done.Wait();
+        const auto ready = std::chrono::steady_clock::now();
+        const s64 interval = Tegra::Nx2Pace::IntervalNs();
+        const auto slot = pace_grid.Next(ready, interval, pace.decay_ns, pace.max_hold_ns);
+        SleepUntil(slot.release);
+        const auto ns = [](std::chrono::steady_clock::time_point t) {
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch())
+                .count();
+        };
+        log_record.ready_ns = ns(ready);
+        log_record.release_ns = ns(slot.release);
+        log_record.interval_ns = interval;
+        log_record.late = slot.late;
+    }
+    log_record.call_ns = present_log ? Nx2PresentLog::Now() : 0;
     PresentRecord record{
         .generation = swapchain.Generation(),
         .id = host_vsync && swapchain.WaitsForDisplay() ? ++last_present_id : 0,
     };
-    record.accepted = swapchain.Present(render_semaphore, record.id);
+    record.accepted = swapchain.Present(render_semaphore, record.id,
+                                        present_log ? static_cast<u32>(log_record.seq) : 0);
+    if (present_log) {
+        log_record.return_ns = Nx2PresentLog::Now();
+        log_record.fence = *frame->present_done;
+        log_record.present_id = record.id;
+        present_log->Push(log_record);
+        swapchain.CollectPastTimings([this](const VkPastPresentationTimingGOOGLE& timing) {
+            present_log->PushTiming({
+                .present_id = timing.presentID,
+                .desired = timing.desiredPresentTime,
+                .actual = timing.actualPresentTime,
+                .earliest = timing.earliestPresentTime,
+                .margin = timing.presentMargin,
+            });
+        });
+    }
 #ifdef EGLANTINE_STREAMLINE
     if (frame->frame_gen) {
         Streamline::FrameGenAfterPresent(frame->frame_gen_frame.index);
@@ -913,6 +960,9 @@ void PresentManager::PresentWaitThread(std::stop_token token) {
             completed_present_id.store(record.id, std::memory_order_release);
             if (shown || gone) {
                 shown_present_id.store(record.id, std::memory_order_release);
+            }
+            if (shown && present_log) {
+                present_log->PushShown(record.id, Nx2PresentLog::Now());
             }
             if (shown) {
                 display_silent.store(false, std::memory_order_release);

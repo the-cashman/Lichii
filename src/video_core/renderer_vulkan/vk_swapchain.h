@@ -62,7 +62,8 @@ public:
     /// Presents the rendered image to the swapchain. A non-zero `present_id` is chained as the
     /// present's id when the swapchain has ids (HasPresentIds). Returns whether the present was
     /// accepted (VK_SUCCESS or VK_SUBOPTIMAL_KHR): only then can its id be waited for.
-    bool Present(VkSemaphore render_semaphore, u64 present_id = 0);
+    /// `timing_id`: non-zero tags the present for VK_GOOGLE_display_timing (present log).
+    bool Present(VkSemaphore render_semaphore, u64 present_id = 0, u32 timing_id = 0);
 
     /// Asks for presents that carry ids and can be waited for. A swapchain made without them is
     /// recreated for it once (NeedsRecreation); nothing is recreated to drop them.
@@ -92,6 +93,30 @@ public:
     /// Changes each time the swapchain is destroyed (present ids are per swapchain).
     u64 Generation() const {
         return generation.load(std::memory_order_acquire);
+    }
+
+    /// Hands the compositor's times of finished presents (VK_GOOGLE_display_timing, when the
+    /// device has it) to `sink`. Called after Present on the presenting thread.
+    template <typename Sink>
+    void CollectPastTimings(Sink&& sink) {
+        if (!past_timing_fn) {
+            return;
+        }
+        const auto use_lock = LockForUse();
+        if (!swapchain) {
+            return;
+        }
+        u32 count = 0;
+        if (past_timing_fn(device_handle, *swapchain, &count, nullptr) != VK_SUCCESS || count == 0) {
+            return;
+        }
+        past_timings.resize(count);
+        if (past_timing_fn(device_handle, *swapchain, &count, past_timings.data()) < 0) {
+            return;
+        }
+        for (u32 i = 0; i < count; ++i) {
+            sink(past_timings[i]);
+        }
     }
 
     /// Returns true when the swapchain needs to be recreated.
@@ -184,6 +209,10 @@ public:
     }
 
 private:
+    PFN_vkGetPastPresentationTimingGOOGLE past_timing_fn{};
+    VkDevice device_handle{};
+    std::vector<VkPastPresentationTimingGOOGLE> past_timings;
+
     void CreateSwapchain(const VkSurfaceCapabilitiesKHR& capabilities);
     void CreateSemaphores();
     void CreateImageViews();

@@ -72,6 +72,7 @@
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/nx2_video_decoder.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_pace.h"
 #include "video_core/textures/decoders.h"
 #include "core/hle/service/hle_ipc.h"
 #include "core/hle/service/ipc_helpers.h"
@@ -2563,7 +2564,10 @@ private:
         const bool timer_paced = Nx2VsyncRateHz() != 60;
         const bool speed_limited = !timer_paced && Settings::values.use_speed_limit.GetValue() &&
                                    Settings::SpeedLimit() != 0;
-        if (!speed_limited && fps_limit == 0) {
+        // EDEN_NX2_PACE: the rate the presenter releases frames at caps the game too, so it
+        // doesn't make frames faster than they are shown (they would queue up as latency).
+        const s64 pace_ns = Tegra::Nx2Pace::GuestIntervalNs();
+        if (!speed_limited && fps_limit == 0 && pace_ns == 0) {
             Tegra::g_nx2_guest_frame_interval_ns.store(0, std::memory_order_relaxed);
             return;
         }
@@ -2577,7 +2581,8 @@ private:
                         : std::chrono::nanoseconds{100'000'000'000LL * swap_interval /
                                                    refresh_rate /
                                                    (speed_limited ? Settings::SpeedLimit() : 100)};
-        const auto interval = PacedInterval(vblank_interval, fps_limit);
+        const auto interval =
+            (std::max)(PacedInterval(vblank_interval, fps_limit), std::chrono::nanoseconds{pace_ns});
         Tegra::g_nx2_guest_frame_interval_ns.store(
             static_cast<u64>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(interval).count()),
@@ -2587,6 +2592,14 @@ private:
         }
         const auto now = std::chrono::steady_clock::now();
         const auto pacing = m_present_pacer.Advance(now, interval);
+        if (pace_ns != 0) {
+            // Slack before the deadline, negative when late (a re-anchor counts a whole interval).
+            const s64 slack =
+                pacing.reset ? -interval.count()
+                             : std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   pacing.deadline - now).count();
+            Tegra::Nx2Pace::OnGuestPresent(now, slack);
+        }
         if (trace) {
             m_frame_trace.deadline_reset = pacing.reset;
         }
