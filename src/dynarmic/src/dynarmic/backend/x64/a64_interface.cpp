@@ -28,9 +28,6 @@
 #include "dynarmic/ir/basic_block.h"
 #include "dynarmic/ir/opt_passes.h"
 
-// emit_x64.cpp: blocks emitted, for the nx2 frame log (read by core/arm/dynarmic).
-extern std::atomic<std::uint64_t> dynarmic_blocks_compiled;
-
 namespace Dynarmic::A64 {
 
 using namespace Backend::X64;
@@ -268,8 +265,6 @@ public:
         if (!CompileBlock(descriptor, true)) {
             return PrecompileResult::Unreadable;
         }
-        // The nx2 frame log's jit_blocks counts the blocks execution compiled: not this one.
-        dynarmic_blocks_compiled.fetch_sub(1, std::memory_order_relaxed);
         ASSERT(block_of_code.SpaceRemaining() >= keep);
         return PrecompileResult::Compiled;
     }
