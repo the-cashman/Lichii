@@ -49,8 +49,11 @@ State& GetState() {
 
 bool Enabled() {
     static const bool enabled = [] {
+        // Opt-in here (upstream: on by default): at Ocarina's ~84 fps in Kokiri Forest on a
+        // 120 Hz FIFO swapchain, the present-wait hold on GPUBack beat against the display and
+        // made frame steps over 2 ms 4x as common (15.5 vs 3.7 %) at the same fps.
         const char* const value = std::getenv("EDEN_NX2_HOST_VSYNC");
-        return value == nullptr || value[0] != '0';
+        return value != nullptr && value[0] == '1';
     }();
     return enabled;
 }

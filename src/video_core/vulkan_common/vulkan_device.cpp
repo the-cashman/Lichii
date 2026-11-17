@@ -1761,7 +1761,7 @@ bool Device::GetSuitability(bool requires_swapchain) {
 
     // VK_KHR_present_id + VK_KHR_present_wait: the presenter learns when the display shows a
     // present. Each pair is asked for on its own and chained for device creation only when its
-    // extensions are enabled. Only host vsync uses them (EDEN_NX2_HOST_VSYNC=0: neither).
+    // extensions are enabled. Only host vsync uses them (without EDEN_NX2_HOST_VSYNC=1: neither).
     const auto probe_present_wait = [this, &next](auto& id_features, auto& wait_features,
                                                   VkBool32& id, VkBool32& wait,
                                                   const char* id_name, const char* wait_name) {
