@@ -64,6 +64,8 @@ enum class Counter : u32 {
     FrontDelayNs,
     WorkerCpuNs,
     WorkerDelayNs,
+    BackCoreRunNs,    ///< /proc/schedstat run time of the CPUs the back is pinned to (any task)
+    FrontCoreRunNs,   ///< ...of the front's CPUs (EDEN_NX2_ISOLATE gives each a core)
     Count,
 };
 
