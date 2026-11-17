@@ -214,6 +214,20 @@ int PerfOpen(u64 config, int group) {
     return static_cast<int>(syscall(SYS_perf_event_open, &attr, 0, -1, group, PERF_FLAG_FD_CLOEXEC));
 }
 
+/// run ns and wait ns of a schedstat file (fd kept open; pread from 0).
+bool ReadSchedstat(int fd, u64& run, u64& wait) {
+    char buf[96];
+    const ssize_t n = pread(fd, buf, sizeof(buf) - 1, 0);
+    if (n <= 0) {
+        return false;
+    }
+    buf[n] = 0;
+    char* end{};
+    run = std::strtoull(buf, &end, 10);
+    wait = std::strtoull(end, nullptr, 10);
+    return true;
+}
+
 thread_local u64 t_present_frame{};
 u64 g_composite_frame{}; ///< back thread only
 
