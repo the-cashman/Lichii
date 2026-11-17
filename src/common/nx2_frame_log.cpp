@@ -95,6 +95,7 @@ struct State {
                            "worker_cpu_ns,worker_delay_ns,back_cycles,back_instructions,back_cache_misses,"
                            "front_cycles,front_instructions,front_cache_misses,worker_cycles,"
                            "worker_instructions,worker_cache_misses,core_idle_us_a,core_idle_us_b,back_cpu,"
+                           "core_idle_entries_a,core_idle_entries_b,"
                            "gpu_tick\n"
                            "# E,kind,ns,arg (1 submit, 2 front state, 3 back idle, 4 reached)\n"
                            "# T,frame,ns,cntpct,thread_id,priority,core,cpu_ticks,presenter\n");
@@ -207,6 +208,7 @@ void State::Flush(bool all) {
 std::array<std::atomic<int>, static_cast<size_t>(ThreadRole::Count)> g_thread_fds{};
 /// GPUBack's core (when pinned to <= 2 CPUs): the cpuidle state time files of each CPU.
 std::array<std::vector<int>, 2> g_core_idle_fds;
+std::array<std::vector<int>, 2> g_core_usage_fds;
 
 u64 ReadIdleUs(const std::vector<int>& fds) {
     u64 sum = 0;
@@ -360,6 +362,12 @@ void RegisterThread(ThreadRole role) {
                         break;
                     }
                     g_core_idle_fds[slot].push_back(fd);
+                    const std::string usage = "/sys/devices/system/cpu/cpu" + std::to_string(c) +
+                                              "/cpuidle/state" + std::to_string(state) + "/usage";
+                    const int ufd = open(usage.c_str(), O_RDONLY | O_CLOEXEC);
+                    if (ufd >= 0) {
+                        g_core_usage_fds[slot].push_back(ufd);
+                    }
                 }
                 ++slot;
             }
@@ -398,6 +406,8 @@ void BeginComposite(u64 frame, u64 front_ns) {
         st.counters[static_cast<size_t>(Counter::BackCoreIdleUsA)].store(ReadIdleUs(g_core_idle_fds[0]));
         st.counters[static_cast<size_t>(Counter::BackCoreIdleUsB)].store(ReadIdleUs(g_core_idle_fds[1]));
         st.counters[static_cast<size_t>(Counter::BackCpu)].store(static_cast<u64>(sched_getcpu()));
+        st.counters[static_cast<size_t>(Counter::BackCoreIdleEntriesA)].store(ReadIdleUs(g_core_usage_fds[0]));
+        st.counters[static_cast<size_t>(Counter::BackCoreIdleEntriesB)].store(ReadIdleUs(g_core_usage_fds[1]));
         for (size_t role = 0; role < g_perf_fds.size(); ++role) {
             const int fd = g_perf_fds[role].load(std::memory_order_acquire);
             u64 values[1 + 3]{}; // nr, then the values

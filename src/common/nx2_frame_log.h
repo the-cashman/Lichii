@@ -76,6 +76,8 @@ enum class Counter : u32 {
     BackCoreIdleUsA,  ///< cpuidle residency (us, all states) of the lower CPU of the back's core
     BackCoreIdleUsB,  ///< ...and of its SMT sibling (EDEN_NX2_ISOLATE pins GPUBack to both)
     BackCpu,          ///< the CPU GPUBack ran on at the composite
+    BackCoreIdleEntriesA, ///< cpuidle entries (usage, all states) of those two CPUs: a CPU that
+    BackCoreIdleEntriesB, ///< woke from idle ran something (residency counts at idle exit only)
     Count,
 };
 
