@@ -3394,6 +3394,20 @@ private:
                     std::scoped_lock lk{vsync_state->mutex};
                     if (Common::Nx2FrameLog::Enabled()) [[unlikely]] {
                         Common::Nx2FrameLog::OnVsync();
+                        // Whether the game waited for this tick (threads waiting on the event)
+                        // or hadn't consumed the last one (still signalled): late frame.
+                        u64 index = 0;
+                        for (auto* vsync : vsync_state->events) {
+                            auto& readable = vsync->GetReadableEvent();
+                            const u64 waiting =
+                                readable.GetWaitingThreadsForDebugging(kernel).size();
+                            const u64 signaled = readable.IsSignaled(kernel) ? 1 : 0;
+                            Common::Nx2FrameLog::Event(
+                                Common::Nx2FrameLog::EventKind::VsyncWait,
+                                Common::Nx2FrameLog::Now(),
+                                (std::min<u64>)(waiting, 255) | (signaled << 8) | (index << 16));
+                            ++index;
+                        }
                     }
                     if (Common::DkbFrameTrace::Enabled()) {
                         const s64 observed = scheduled + late.count();

@@ -63,7 +63,7 @@ enum class EventKind : u32 {
     FrontState = 2,  ///< the front's state changed (arg: FrontState)
     BackIdle = 3,    ///< the back went idle (arg 1) or got work (arg 0)
     Reached = 4,     ///< a present's fences reached (arg: 1 on the scheduler owner, 0 handed off)
-    VsyncWait = 5,   ///< reserved
+    VsyncWait = 5,   ///< a vsync tick, per event: threads waiting | signalled before << 8 | event << 16
 };
 
 namespace detail {
