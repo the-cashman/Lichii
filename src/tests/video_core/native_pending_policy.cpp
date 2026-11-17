@@ -8,6 +8,7 @@
 #include "video_core/renderer_vulkan/async_draw_policy.h"
 #include "video_core/renderer_vulkan/pipeline_build.h"
 #include "video_core/shader_jobs.h"
+#include "video_core/texture_cache/image_base.h"
 
 using Vulkan::DecideNativePending;
 using Vulkan::NativeDrawAction;
@@ -73,4 +74,27 @@ TEST_CASE("A slow build costs each frame at most its Bounded budget",
     REQUIRE(std::chrono::steady_clock::now() - begin >= 1s);
     REQUIRE(frames > 30);
     REQUIRE(used_us <= frames * (budget_us + 50000));
+}
+
+TEST_CASE("A guest upload invalidates prior draw and storage write history",
+          "[video_core][native_pending]") {
+    VideoCommon::ImageBase image{VideoCommon::NullImageParams{}};
+    auto has_prior_draw = [&image](u64 frame_tick) {
+        return image.first_written_frame != 0 && image.first_written_frame < frame_tick + 1;
+    };
+
+    // Before the upload the image has an earlier draw and storage-write history.
+    image.first_written_frame = 9;
+    image.storage_written_levels = 3;
+    REQUIRE(has_prior_draw(9));
+
+    // Fresh guest bytes cannot justify discarding a pending shader's first draw.
+    image.InvalidateGpuWriteHistoryOnCpuUpload();
+    REQUIRE(image.storage_written_levels == 0);
+    REQUIRE_FALSE(has_prior_draw(9));
+
+    // A subsequent draw in this frame becomes history only in the following frame.
+    image.first_written_frame = 10;
+    REQUIRE_FALSE(has_prior_draw(9));
+    REQUIRE(has_prior_draw(10));
 }

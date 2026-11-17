@@ -3932,7 +3932,7 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
 
     image.flags &= ~ImageFlagBits::CpuModified;
     image.load_tick = modification_tick;
-    image.storage_written_levels = 0;
+    image.InvalidateGpuWriteHistoryOnCpuUpload();
 
     // Images uploaded by layer stay tracked while some of their layers are dirty.
     if (False(image.flags & ImageFlagBits::Tracked)) {
