@@ -45,8 +45,9 @@ bool TimerTick(const void* owner, std::chrono::nanoseconds interval,
                const std::function<void()>& signal);
 
 /// The presenter, when a frame reached the display at `displayed`: when to start the next frame
-/// (Service::DisplayVsyncDeadline, the latest of the listeners), or nothing without a listener to
-/// start. The presenter waits until then and calls StartFrame.
+/// (Service::DisplayVsyncDeadline after the last start, the timer's included, the latest of the
+/// listeners), or nothing without a listener to start. The presenter waits until then and calls
+/// StartFrame.
 [[nodiscard]] std::optional<Clock::time_point> NextStart(Clock::time_point displayed);
 
 /// Starts the next frame of every listener the display paces.

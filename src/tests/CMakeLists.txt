@@ -26,6 +26,7 @@ add_executable(tests
     video_core/gpu_timestamp.cpp
     video_core/semaphore_waiters.cpp
     video_core/hdr_output.cpp
+    video_core/host_vsync.cpp
     core/mii_model.cpp
     core/nx2_streamplay.cpp
     core/nx2_gpu_only_regions.cpp
