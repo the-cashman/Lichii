@@ -148,13 +148,29 @@ BackIdleTrace::FrontState WaitState(DrainSite site) {
 class CountedWait {
 public:
     explicit CountedWait(DrainSite site_) : site{static_cast<size_t>(site_)} {
-        if (g_acquire_counting) {
+        if (g_acquire_counting || Common::Nx2FrameLog::Enabled()) {
             start = std::chrono::steady_clock::now();
         }
     }
     ~CountedWait() {
         if (!start) {
             return;
+        }
+        if (Common::Nx2FrameLog::Enabled()) [[unlikely]] {
+            using C = Common::Nx2FrameLog::Counter;
+            const auto s = static_cast<DrainSite>(site);
+            const C c = s == DrainSite::RingFull ? C::DrainRingFullNs
+                        : (s == DrainSite::Acquire || s == DrainSite::NarrowAcquire ||
+                           s == DrainSite::SemaphoreFlush || s == DrainSite::FenceRelease)
+                            ? C::DrainAcquireNs
+                            : C::DrainOtherNs;
+            Common::Nx2FrameLog::Count(
+                c, static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now() - *start)
+                                        .count()));
+            if (!g_acquire_counting) {
+                return;
+            }
         }
         Count(g_acquire_stats.site_drains[site]);
         Count(g_acquire_stats.site_drain_ns[site],
@@ -1362,6 +1378,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     const Common::DkbCpuTrace::Registration cpu_trace{Common::DkbCpuTrace::Role::GpuBack};
     const StutterTrace::ThreadScope stutter_thread{StutterTrace::Thread::Back};
     Common::SetCurrentThreadName("GPUBack");
+    Common::Nx2FrameLog::RegisterThread(Common::Nx2FrameLog::ThreadRole::Back);
     on_back_thread = true;
     tick_state.store(tick_state.load(std::memory_order_relaxed) + TickGeneration + TickAccepting,
                      std::memory_order_release);

@@ -61,6 +61,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
         const VideoCommon::StutterTrace::ThreadScope stutter_thread{
             VideoCommon::StutterTrace::Thread::Front};
         Common::SetCurrentThreadName("GPU");
+        Common::Nx2FrameLog::RegisterThread(Common::Nx2FrameLog::ThreadRole::Front);
         VideoCommon::GpuSplit::MarkGpuThread();
 #ifdef __linux__
         // The pending-channel waits below sleep 500 us; the default timer slack adds up to 50 more.

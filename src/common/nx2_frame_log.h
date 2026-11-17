@@ -55,8 +55,21 @@ enum class Counter : u32 {
     FrontQueueEmptyNs,
     BackIdleNs,
     Submits,
+    DrainRingFullNs,  ///< front waits for ring room
+    DrainAcquireNs,   ///< front drains for semaphore acquires / fence releases
+    DrainOtherNs,     ///< every other drain / WaitFor site
+    BackCpuNs,        ///< /proc schedstat of the registered threads: run time ...
+    BackDelayNs,      ///< ... and time runnable but waiting for a CPU
+    FrontCpuNs,
+    FrontDelayNs,
+    WorkerCpuNs,
+    WorkerDelayNs,
     Count,
 };
+
+enum class ThreadRole : u32 { Back, Front, Worker, Count };
+/// The calling thread's schedstat is sampled at each composite as that role.
+void RegisterThread(ThreadRole role);
 
 enum class EventKind : u32 {
     Submit = 1,      ///< guest command list pushed to the front's queue (arg: channel)
