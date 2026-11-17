@@ -17,6 +17,9 @@
 //   EDEN_NX2_PACE_DECAY_US=<n>  how fast the presenter's grid moves back toward the frames
 //                               after a late one (default 50 us a frame)
 //   EDEN_NX2_PACE_MAXHOLD_MS=<n> never hold a frame longer (default 8)
+//   EDEN_NX2_PACE_MARGIN_MS=<n> keep the grid this far behind the frames (default 0): a frame
+//                               up to that much later than usual still goes on the grid; costs
+//                               as much latency
 
 #include <algorithm>
 #include <atomic>
@@ -45,6 +48,7 @@ struct Config {
     bool hold{true};
     s64 decay_ns{50'000};
     s64 max_hold_ns{8'000'000};
+    s64 margin_ns{0};
 };
 
 namespace Detail {
@@ -80,12 +84,14 @@ inline Config Parse() {
     config.hold = EnvFlag("EDEN_NX2_PACE_HOLD", true);
     config.decay_ns = static_cast<s64>(EnvDouble("EDEN_NX2_PACE_DECAY_US", 50.0) * 1000.0);
     config.max_hold_ns = static_cast<s64>(EnvDouble("EDEN_NX2_PACE_MAXHOLD_MS", 8.0) * 1e6);
+    config.margin_ns = static_cast<s64>(EnvDouble("EDEN_NX2_PACE_MARGIN_MS", 0.0) * 1e6);
     LOG_INFO(Render_Vulkan,
              "EDEN_NX2_PACE: {} {:.1f} Hz (range {:.0f}-{:.0f}), guest cap {}, presenter hold {}, "
-             "decay {} us/frame, max hold {:.1f} ms",
+             "decay {} us/frame, max hold {:.1f} ms, margin {:.1f} ms",
              config.adaptive ? "adaptive from" : "fixed", config.start_hz, config.min_hz,
              config.max_hz, config.guest ? "on" : "off", config.hold ? "on" : "off",
-             config.decay_ns / 1000, static_cast<double>(config.max_hold_ns) / 1e6);
+             config.decay_ns / 1000, static_cast<double>(config.max_hold_ns) / 1e6,
+             static_cast<double>(config.margin_ns) / 1e6);
     return config;
 }
 inline s64 HzToNs(double hz) {
@@ -207,7 +213,8 @@ inline void OnGuestPresent(Clock::time_point now, s64 slack_ns) {
  * The presenter's release grid. Each frame goes one interval after the previous release, or at
  * once when it is ready later than that (a late frame moves the grid). While frames are early the
  * grid creeps back toward them by `decay_ns` a frame, so after a late frame the added latency
- * drains away instead of staying. A gap of more than two intervals (loading, a pause) restarts
+ * drains away instead of staying; it creeps no closer than `margin_ns`, and moves away by
+ * `decay_ns` a frame while closer, so a frame up to the margin later than usual stays on it. A gap of more than two intervals (loading, a pause) restarts
  * the grid. Pure; the caller supplies the times.
  */
 class PresentGrid {
@@ -217,19 +224,24 @@ public:
         bool late;
     };
 
-    Slot Next(Clock::time_point ready, s64 interval_ns, s64 decay_ns, s64 max_hold_ns) {
+    Slot Next(Clock::time_point ready, s64 interval_ns, s64 decay_ns, s64 max_hold_ns,
+              s64 margin_ns = 0) {
         const std::chrono::nanoseconds interval{interval_ns};
         if (interval_ns <= 0 || !last || ready > *last + 3 * interval) {
             last = ready;
             return {ready, false};
         }
         const auto slot = *last + interval;
-        if (ready >= slot) {
-            last = ready;
-            return {ready, ready > slot};
-        }
         s64 hold = std::chrono::duration_cast<std::chrono::nanoseconds>(slot - ready).count();
-        hold -= std::min(hold, decay_ns);
+        if (hold < 0) {
+            last = ready;
+            return {ready, true};
+        }
+        if (hold > margin_ns) {
+            hold -= std::min(hold - margin_ns, decay_ns);
+        } else {
+            hold = std::min(hold + decay_ns, margin_ns);
+        }
         hold = std::min(hold, max_hold_ns);
         last = ready + std::chrono::nanoseconds{hold};
         return {*last, false};

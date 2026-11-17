@@ -840,7 +840,8 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
         frame->present_done.Wait();
         const auto ready = std::chrono::steady_clock::now();
         const s64 interval = Tegra::Nx2Pace::IntervalNs();
-        const auto slot = pace_grid.Next(ready, interval, pace.decay_ns, pace.max_hold_ns);
+        const auto slot =
+            pace_grid.Next(ready, interval, pace.decay_ns, pace.max_hold_ns, pace.margin_ns);
         SleepUntil(slot.release);
         const auto ns = [](std::chrono::steady_clock::time_point t) {
             return std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch())

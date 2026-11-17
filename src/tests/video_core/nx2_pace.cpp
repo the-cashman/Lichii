@@ -59,6 +59,21 @@ TEST_CASE("A late frame moves the grid and the decay drains it", "[nx2_pace]") {
     REQUIRE(hold == 0);
 }
 
+TEST_CASE("The margin keeps the grid behind the frames", "[nx2_pace]") {
+    PresentGrid grid;
+    constexpr s64 interval = 20 * Ms;
+    // Frames on time: the hold grows to the 4 ms margin by 0.1 ms a frame and stays.
+    for (int i = 0; i < 100; ++i) {
+        grid.Next(At(i * interval), interval, 100'000, 8 * Ms, 4 * Ms);
+    }
+    const auto slot = grid.Next(At(100 * interval), interval, 100'000, 8 * Ms, 4 * Ms);
+    REQUIRE(Since(slot.release) - 100 * interval == 4 * Ms);
+    // A frame 3 ms late still goes on the grid.
+    const auto late = grid.Next(At(101 * interval + 3 * Ms), interval, 100'000, 8 * Ms, 4 * Ms);
+    REQUIRE(!late.late);
+    REQUIRE(Since(late.release) - Since(slot.release) <= interval + 100'000);
+}
+
 TEST_CASE("A long gap restarts the grid", "[nx2_pace]") {
     PresentGrid grid;
     grid.Next(At(0), 20 * Ms, 0, 8 * Ms);
