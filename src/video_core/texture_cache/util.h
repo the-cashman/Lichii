@@ -175,8 +175,11 @@ void SwizzleImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const Ima
                                    const Settings::ResolutionScalingInfo& resolution,
                                    u32 max_extent) noexcept;
 
-/// Whether a block-linear 2D image is wider than tall by padding only: made as wide as it is
-/// tall, it takes the same guest memory with the same layout.
+/// Whether a block-linear 2D image is wider than `width` by padding only: made `width` wide, it
+/// takes the same guest memory with the same layout.
+[[nodiscard]] bool IsPaddedWidth(const ImageInfo& info, u32 width) noexcept;
+
+/// Whether a block-linear 2D image is wider than tall by padding only.
 [[nodiscard]] bool IsPaddedSquare(const ImageInfo& info) noexcept;
 
 [[nodiscard]] bool IsPitchLinearSameSize(const ImageInfo& lhs, const ImageInfo& rhs,

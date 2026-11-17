@@ -1634,13 +1634,18 @@ bool IsBlockLinearSizeCompatible(const ImageInfo& lhs, const ImageInfo& rhs, u32
     }
 }
 
-bool IsPaddedSquare(const ImageInfo& info) noexcept {
-    if (info.type != ImageType::e2D || info.num_samples != 1 || info.size.width <= info.size.height) {
+bool IsPaddedWidth(const ImageInfo& info, u32 width) noexcept {
+    if (info.type != ImageType::e2D || info.num_samples != 1 || width == 0 ||
+        info.size.width <= width) {
         return false;
     }
-    ImageInfo square = info;
-    square.size.width = info.size.height;
-    return IsBlockLinearSizeCompatible(info, square, 0, 0, false);
+    ImageInfo narrow = info;
+    narrow.size.width = width;
+    return IsBlockLinearSizeCompatible(info, narrow, 0, 0, false);
+}
+
+bool IsPaddedSquare(const ImageInfo& info) noexcept {
+    return IsPaddedWidth(info, info.size.height);
 }
 
 bool IsBlockLinearSizeCompatibleBPPRelaxed(const ImageInfo& lhs, const ImageInfo& rhs,

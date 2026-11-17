@@ -3319,6 +3319,9 @@ public:
 
     u32 GetMaxCurrentVertices();
 
+    /// The most vertices an enabled per-vertex stream holds, 0 when none bounds a draw.
+    u32 GetMaxStreamVertices();
+
     size_t EstimateIndexBufferSize();
 
     /// Handles a write to the CLEAR_BUFFERS register.

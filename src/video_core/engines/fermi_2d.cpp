@@ -3,6 +3,7 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <mutex>
 #include <set>
 #include <cstdlib>
@@ -154,6 +155,30 @@ void Fermi2D::Blit() {
 
     memory_manager.FlushCaching();
     if (!rasterizer->AccelerateSurfaceCopy(src, regs.dst, config)) {
+        // The software blit reads the source from guest memory, which downloads it first when the
+        // GPU rendered it: the first shapes narrower than their surface that take this path are logged.
+        static std::mutex mutex;
+        static std::set<std::array<u32, 8>> logged;
+        const std::array<u32, 8> shape{
+            src.width,   src.height,   static_cast<u32>(src.format),
+            regs.dst.width, regs.dst.height, static_cast<u32>(regs.dst.format),
+            static_cast<u32>(config.src_x1 - config.src_x0),
+            static_cast<u32>(config.dst_x1 - config.dst_x0)};
+        bool should_log = false;
+        if (regs.dst.width != static_cast<u32>(config.dst_x1 - config.dst_x0)) {
+            const std::scoped_lock lock{mutex};
+            should_log = logged.size() < 16 && logged.emplace(shape).second;
+        }
+        if (should_log) {
+            LOG_INFO(HW_GPU,
+                     "Software 2D blit: {:#x} {}x{} format {:#x} [{},{} {},{}] -> {:#x} {}x{} "
+                     "format {:#x} [{},{} {},{}]",
+                     src.Address(), src.width, src.height, static_cast<u32>(src.format),
+                     config.src_x0, config.src_y0, config.src_x1, config.src_y1,
+                     regs.dst.Address(), regs.dst.width, regs.dst.height,
+                     static_cast<u32>(regs.dst.format), config.dst_x0, config.dst_y0,
+                     config.dst_x1, config.dst_y1);
+        }
         sw_blitter->Blit(src, regs.dst, config);
     }
 }

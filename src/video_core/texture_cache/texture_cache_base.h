@@ -739,6 +739,9 @@ private:
     /// Find or create an image view for the depth buffer
     [[nodiscard]] ImageViewId FindDepthBuffer();
 
+    /// Narrows a render target given padded to whole GOBs to the surface clip (Switch 2).
+    bool ClipPaddedTarget(ImageInfo& info) const;
+
     /// Find or create a view for a render target with the given image parameters
     [[nodiscard]] ImageViewId FindRenderTargetView(const ImageInfo& info, GPUVAddr gpu_addr);
 
@@ -1070,8 +1073,10 @@ private:
     /// set first_written_frame, not blits, copies or DMA.
     bool drawing_render_targets = false;
     bool is_rescaling = false;
-    /// The bound depth target is wider than tall by padding only (see FindDepthBuffer).
+    /// The bound depth target is wider than tall or than the surface clip by padding only (see
+    /// FindDepthBuffer), and the colour targets that are wider than the clip by padding only.
     bool depth_target_padded = false;
+    u32 color_targets_padded = 0;
     u64 total_used_memory = 0;
     u64 minimum_memory;
     u64 expected_memory;

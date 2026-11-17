@@ -1715,6 +1715,7 @@ void BufferCache<P>::DisableGraphicsUniformBuffer(size_t stage, u32 index) {
 
 template <class P>
 void BufferCache<P>::UpdateGraphicsBuffers(bool is_indexed) {
+    current_draw_indexed = is_indexed;
     do {
         channel_state->has_deleted_buffers = false;
         DoUpdateGraphicsBuffers(is_indexed);
@@ -1913,7 +1914,8 @@ void BufferCache<P>::UnbindGraphicsStorageBuffers(size_t stage) {
 template <class P>
 bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, u32 cbuf_index,
                                                u32 cbuf_offset, bool is_written,
-                                               u32 indirect_offset) {
+                                               u32 indirect_offset,
+                                               const Shader::StorageWriteExtent& write_extent) {
     if (stage >= NUM_STAGES || ssbo_index >= NUM_STORAGE_BUFFERS) {
         LOG_ERROR(HW_GPU, "Invalid graphics storage buffer binding: stage {}, index {}",
                   stage, ssbo_index);
@@ -1934,6 +1936,7 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
     }
     channel_state->enabled_storage_buffers[stage] |= u64{1} << ssbo_index;
     channel_state->written_storage_buffers[stage] |= u64{is_written ? 1U : 0U} << ssbo_index;
+    channel_state->graphics_storage_write_extents[stage][ssbo_index] = {};
     if constexpr (requires { runtime.ShouldLimitDynamicStorageBuffers(); }) {
         if (runtime.ShouldLimitDynamicStorageBuffers() && !already_enabled) {
             ++channel_state->total_graphics_storage_buffers;
@@ -1960,6 +1963,21 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
     if (indirect_offset != ~0U) {
         TraceTablePointer(false, stage, ssbo_index, cbuf_index, cbuf_offset, indirect_offset, holder,
                           channel_state->storage_buffers[stage][ssbo_index]);
+    }
+    // A native pointer has no size: the binding reaches up to 8 MiB past it, or to the end of its
+    // mapping. The draw marks GPU-written what the program's stores provably reach instead (a
+    // skinning shader's output buffers and a culling shader's counters share their memory pool
+    // with command lists, which then counted as GPU-written and were read back at every use).
+    if (const Binding& binding = channel_state->storage_buffers[stage][ssbo_index];
+        is_written && write_extent.bounded && indirect_offset == ~0U && binding.size != 0 &&
+        maxwell3d->GetNativeMacroEngine().native_turing) {
+        // The extent counts from the pointer, the binding from the pointer aligned down.
+        const GPUVAddr pointer = gpu_memory->Read<u64>(ssbo_addr);
+        if (pointer >= binding.gpu_addr && pointer - binding.gpu_addr < binding.size) {
+            channel_state->graphics_storage_write_extents[stage][ssbo_index] = write_extent;
+            channel_state->graphics_storage_write_pads[stage][ssbo_index] =
+                static_cast<u32>(pointer - binding.gpu_addr);
+        }
     }
     return (channel_state->storage_buffers[stage][ssbo_index].buffer_id != NULL_BUFFER_ID);
 }
@@ -2996,7 +3014,31 @@ void BufferCache<P>::BindHostGraphicsStorageBuffers(size_t stage) {
     ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
         const Binding& binding = channel_state->storage_buffers[stage][index];
         const bool is_written = ((channel_state->written_storage_buffers[stage] >> index) & 1) != 0;
-        if (BindMultiRangeStorage(binding, is_written, graphics_segments)) {
+        // How much of the binding the draw marks GPU-written: all of it, or what the program's
+        // stores provably reach (BindGraphicsStorageBuffer). An array draw's last vertex is its
+        // first plus its count. An indexed or indirect draw's is the GPU's: there the bound is the
+        // last vertex the longest per-vertex stream holds (a vertex past every stream has no data
+        // to fetch).
+        u64 write_mark_limit = ~u64{0};
+        if (const auto& extent = channel_state->graphics_storage_write_extents[stage][index];
+            is_written && extent.bounded) {
+            std::optional<u64> max_vertex_id;
+            if (extent.vertex_stride == 0 && extent.guard_vertex_stride == 0) {
+                // No vertex term.
+            } else if (!current_draw_indexed && current_draw_indirect == nullptr) {
+                const auto& vertices = maxwell3d->draw_manager.draw_state.vertex_buffer;
+                const u64 end = u64{vertices.first} + vertices.count;
+                max_vertex_id = end != 0 ? end - 1 : 0;
+            } else if (const u32 held = maxwell3d->GetMaxStreamVertices(); held != 0) {
+                max_vertex_id = held - 1;
+            }
+            if (const auto reach = Shader::ResolveDrawStorageWriteExtent(extent, max_vertex_id)) {
+                write_mark_limit = u64{channel_state->graphics_storage_write_pads[stage][index]} +
+                                   (std::max<u64>)(*reach, 1);
+            }
+            Nx2NoteDrawWriteExtent(binding.size, write_mark_limit);
+        }
+        if (BindMultiRangeStorage(binding, is_written, graphics_segments, write_mark_limit)) {
             return;
         }
         Buffer& buffer = slot_buffers[binding.buffer_id];
@@ -3008,7 +3050,8 @@ void BufferCache<P>::BindHostGraphicsStorageBuffers(size_t stage) {
         buffer.MarkUsage(offset, size);
 
         if (is_written) {
-            MarkWrittenBuffer(binding.buffer_id, binding.device_addr, size);
+            MarkWrittenBuffer(binding.buffer_id, binding.device_addr,
+                              static_cast<u32>((std::min<u64>)(size, write_mark_limit)));
         }
 
         if constexpr (NEEDS_BIND_STORAGE_INDEX) {
@@ -3725,6 +3768,10 @@ void BufferCache<P>::Nx2NoteListWrite(BufferId buffer_id, DAddr device_addr, u64
                     std::scoped_lock lock{nx2_list_mutex};
                     Nx2ListPage& entry = nx2_list_pages[page_addr];
                     ++entry.writes;
+                    if (!nx2_collect_list_copies) {
+                        nx2_draw_copy_pages.push_back(page_addr);
+                        ++nx2_draw_copy_writes;
+                    }
                     if (!nx2_collect_list_copies && !entry.draw_written) {
                         entry.draw_written = true;
                         LOG_INFO(HW_GPU, "Command list page {:#x} is written by draws too: its "
@@ -3742,6 +3789,32 @@ void BufferCache<P>::Nx2NoteListWrite(BufferId buffer_id, DAddr device_addr, u64
             }
             ++page;
         }
+    }
+}
+
+template <class P>
+bool BufferCache<P>::Nx2CopyDrawListPages(u64 tick) {
+    if constexpr (IS_OPENGL) {
+        return false;
+    } else {
+        if (nx2_draw_copy_pages.empty()) {
+            return false;
+        }
+        if (std::exchange(nx2_draw_copy_writes, 0) != 0) {
+            // Still being written: a copy now would be outdated by the next draw.
+            return false;
+        }
+        std::ranges::sort(nx2_draw_copy_pages);
+        const auto last = std::ranges::unique(nx2_draw_copy_pages).begin();
+        for (auto it = nx2_draw_copy_pages.begin(); it != last; ++it) {
+            // The buffer that holds the page now: the one written may have been joined since.
+            const u64 page = *it >> CACHING_PAGEBITS;
+            if (const BufferId buffer_id = page < page_table.size() ? page_table[page] : BufferId{}) {
+                nx2_list_copy_requests.emplace_back(buffer_id, *it);
+            }
+        }
+        nx2_draw_copy_pages.clear();
+        return Nx2CopyListPages(tick);
     }
 }
 

@@ -952,6 +952,45 @@ void Scheduler::ReportPassTimes(const std::vector<u64>& submission_begin,
                       : fmt::format("pass {}x{}", pass->extent.width, pass->extent.height),
                  pass->draws, pass->dispatches, shaders, pass->untracked_uses);
     }
+    // Many short passes can outweigh the slowest ones: the frame's passes again, summed by their
+    // size and first shaders.
+    struct Group {
+        double ms{};
+        u32 passes{};
+        u64 draws{};
+        const PassTrace* first{};
+        bool tail{};
+    };
+    std::vector<Group> groups;
+    for (const auto& [ms, pass, tail] : segments) {
+        const auto same = [&](const Group& group) {
+            const PassTrace& other = *group.first;
+            return group.tail == tail && other.extent.width == pass->extent.width &&
+                   other.extent.height == pass->extent.height &&
+                   other.shaders[0].hash == pass->shaders[0].hash &&
+                   other.shaders[0].fragment_hash == pass->shaders[0].fragment_hash;
+        };
+        auto group = std::ranges::find_if(groups, same);
+        if (group == groups.end()) {
+            group = groups.insert(groups.end(), Group{.first = pass, .tail = tail});
+        }
+        group->ms += ms;
+        ++group->passes;
+        group->draws += pass->draws;
+    }
+    std::ranges::sort(groups, std::greater<>{}, &Group::ms);
+    for (size_t i = 0; i < groups.size() && i < 12; ++i) {
+        const Group& group = groups[i];
+        const auto& shader = group.first->shaders[0];
+        LOG_INFO(Render_Vulkan,
+                 "DKB gpu_pass_group {:.3f}ms in {} {} with {} draws, first shaders "
+                 "s{}:{:016x}+s5:{:016x}",
+                 group.ms, group.passes,
+                 group.tail ? std::string{"tails after the last pass"}
+                            : fmt::format("passes {}x{}", group.first->extent.width,
+                                          group.first->extent.height),
+                 group.draws, shader.stage, shader.hash, shader.fragment_hash);
+    }
 }
 
 void Scheduler::ReportWorkTimes() {

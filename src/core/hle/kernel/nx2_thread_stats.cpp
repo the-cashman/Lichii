@@ -79,6 +79,10 @@ struct Counters {
     std::atomic<s64> wait_since{};  ///< 0 unless waiting
     std::atomic<u8> wait_kind{};
     std::atomic<u32> svc{}; ///< The thread's last SVC: what it waits in
+    /// The GPU-cached address the thread's longest poll read, how often and how wide.
+    std::atomic<u64> hot_read{};
+    std::atomic<u64> hot_read_votes{};
+    std::atomic<u64> hot_read_size{};
     Totals<ThreadFields> totals{};
 };
 
@@ -169,7 +173,7 @@ void Report(u64 now) {
     };
 
     struct Row {
-        const Counters* counters;
+        Counters* counters;
         Snapshot<ThreadFields> delta;
     };
     std::vector<Row> rows;
@@ -220,6 +224,15 @@ void Report(u64 now) {
                  ms(d[HintSpin]), ms(d[Memory]), per_frame(d[MemoryCalls]), ms(d[ReadBack]),
                  per_frame(d[ReadBacks]), ms(outside), per_frame(d[Svcs]), ms(d[Ready]),
                  ms(waited), waits);
+        if (const u64 votes = rows[i].counters->hot_read_votes.exchange(
+                0, std::memory_order_relaxed);
+            votes >= 64) {
+            LOG_INFO(Kernel,
+                     "    t{} polled GPU-cached memory: {} more reads of {} bytes at {:#x} than of "
+                     "any other address between two SVCs",
+                     c.thread_id, votes, c.hot_read_size.load(std::memory_order_relaxed),
+                     c.hot_read.load(std::memory_order_relaxed));
+        }
     }
 
     for (size_t core = 0; core < g_cores.size(); ++core) {
@@ -297,6 +310,11 @@ void EndRun(KThread* thread, size_t core, u64 start, u64 end, Exit exit, u32 svc
         Add(t[MemoryCalls], run.memory_calls);
         Add(t[ReadBack], run.read_back_ticks);
         Add(t[ReadBacks], run.read_backs);
+        if (run.hot_read_votes > counters->hot_read_votes.load(std::memory_order_relaxed)) {
+            counters->hot_read.store(run.hot_read, std::memory_order_relaxed);
+            counters->hot_read_size.store(run.hot_read_size, std::memory_order_relaxed);
+            counters->hot_read_votes.store(run.hot_read_votes, std::memory_order_relaxed);
+        }
         if (exit == Exit::Svc) {
             Add(t[Svcs], 1);
             counters->svc.store(svc, std::memory_order_relaxed);

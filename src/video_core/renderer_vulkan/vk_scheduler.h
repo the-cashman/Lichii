@@ -578,7 +578,7 @@ private:
     vk::QueryPool trace_work_pool;
     std::vector<WorkTrace> trace_work_items;
     u32 trace_work_count{};
-    static constexpr u32 TraceMaxSites = 32768;
+    static constexpr u32 TraceMaxSites = 262144;
     struct SiteTrace {
         const char* file{};
         u32 line{};

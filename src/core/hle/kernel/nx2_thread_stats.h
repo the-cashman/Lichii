@@ -74,6 +74,9 @@ struct RunTally {
     u64 memory_calls;    ///< ...and how many
     u64 read_back_ticks; ///< Of those: the calls that waited for a GPU download
     u64 read_backs;
+    u64 hot_read;       ///< The address most reads of GPU-cached memory went to (majority vote)
+    u64 hot_read_votes; ///< ...and its lead over the other addresses
+    u64 hot_read_size;
 };
 
 inline thread_local RunTally t_run{};
@@ -106,6 +109,19 @@ constexpr void CountMemory(RunTally& run, u64 ticks, bool read_back) {
     if (read_back) {
         run.read_back_ticks += ticks;
         ++run.read_backs;
+    }
+}
+
+/// A read of GPU-cached guest memory at `address`: a loop that polls one word wins the vote.
+constexpr void CountMemoryRead(RunTally& run, u64 address, u64 size) {
+    if (run.hot_read_votes == 0) {
+        run.hot_read = address;
+        run.hot_read_size = size;
+        run.hot_read_votes = 1;
+    } else if (run.hot_read == address) {
+        ++run.hot_read_votes;
+    } else {
+        --run.hot_read_votes;
     }
 }
 

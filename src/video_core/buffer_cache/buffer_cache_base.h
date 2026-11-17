@@ -170,6 +170,12 @@ public:
     u64 bounded_compute_storage_buffers = 0;
     // Bytes from each compute storage binding's start that a dispatch marks GPU-written.
     std::array<u32, NUM_STORAGE_BUFFERS> compute_storage_write_marks{};
+    // How far a native (Switch 2) draw's stores reach into each written graphics storage binding:
+    // the program's extent (unbounded: the whole binding) and the bytes from the binding's start
+    // to the pointer it counts from. Resolved per draw (BindHostGraphicsStorageBuffers).
+    std::array<std::array<Shader::StorageWriteExtent, NUM_STORAGE_BUFFERS>, NUM_STAGES>
+        graphics_storage_write_extents{};
+    std::array<std::array<u32, NUM_STORAGE_BUFFERS>, NUM_STAGES> graphics_storage_write_pads{};
 
     u32 total_graphics_storage_buffers = 0;
     u32 total_compute_storage_buffers = 0;
@@ -390,7 +396,8 @@ public:
     void UnbindGraphicsStorageBuffers(size_t stage);
 
     bool BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
-                                   bool is_written, u32 indirect_offset = ~0U);
+                                   bool is_written, u32 indirect_offset = ~0U,
+                                   const Shader::StorageWriteExtent& write_extent = {});
 
     void UnbindGraphicsTextureBuffers(size_t stage);
 
@@ -466,6 +473,10 @@ public:
     }
     /// True when it recorded copies, which the GPU completes at `tick` (the caller submits).
     bool Nx2CopyListPages(u64 tick);
+    /// The same for the command list pages draws wrote, once a submission passed without a
+    /// new write to them (a culling pass's draws each write one record): their lists then wait
+    /// for the copy's tick instead of everything the GPU was given since.
+    bool Nx2CopyDrawListPages(u64 tick);
     enum class Nx2ListRead { Unknown, Copied, Synced, NeedsSync, Pending };
     /// Front thread: Synced when guest memory holds the page `device_addr` lies in (flushed and
     /// written by no GPU work since), else Copied with `out` filled from the copy of its last
@@ -476,6 +487,30 @@ public:
     /// instead of waiting for it.
     Nx2ListRead Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool past_sync,
                                 u64* pending_tick = nullptr);
+    /// EDEN_NX2_DRAW_WRITE_TRACE=1: every 10 s, the written native storage bindings draws bound
+    /// with a store extent, how many resolved to less than the binding, and the bytes marked.
+    static void Nx2NoteDrawWriteExtent(u64 binding_size, u64 mark_limit) {
+        static const bool enabled = std::getenv("EDEN_NX2_DRAW_WRITE_TRACE") != nullptr;
+        if (!enabled) {
+            return;
+        }
+        static u64 binds{}, resolved{}, bound_bytes{}, marked_bytes{};
+        static auto window = std::chrono::steady_clock::now();
+        ++binds;
+        resolved += mark_limit < binding_size ? 1 : 0;
+        bound_bytes += binding_size;
+        marked_bytes += (std::min)(binding_size, mark_limit);
+        const auto now = std::chrono::steady_clock::now();
+        if (now - window < std::chrono::seconds{10}) {
+            return;
+        }
+        LOG_INFO(HW_GPU,
+                 "Draw write extents in 10 s: {} written bindings with an extent, {} marked short "
+                 "of the binding, {} MiB bound, {} MiB marked",
+                 binds, resolved, bound_bytes >> 20, marked_bytes >> 20);
+        binds = resolved = bound_bytes = marked_bytes = 0;
+        window = now;
+    }
     /// Front thread, the split drained: the command list page was flushed to guest memory.
     void Nx2NoteListSynced(DAddr page);
 
@@ -1029,6 +1064,8 @@ private:
     DelayedDestructionRing<Buffer, TICKS_TO_DESTROY> delayed_destruction_ring;
 
     const Tegra::Engines::Maxwell3D::DrawManager::IndirectParams* current_draw_indirect{};
+    /// Whether the draw being prepared is indexed (UpdateGraphicsBuffers).
+    bool current_draw_indexed{};
 
     u32 last_index_count = 0;
 
@@ -1508,6 +1545,10 @@ private:
     std::vector<std::pair<u64, Nx2Staging>> nx2_retired_list_copies;
     boost::container::small_vector<std::pair<BufferId, DAddr>, 8> nx2_list_copy_requests;
     bool nx2_collect_list_copies{};
+    /// Command list pages draws wrote since their last copy, and the writes noted since
+    /// Nx2CopyDrawListPages last looked.
+    std::vector<DAddr> nx2_draw_copy_pages;
+    u32 nx2_draw_copy_writes{};
 };
 
 } // namespace VideoCommon

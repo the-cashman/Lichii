@@ -1743,25 +1743,26 @@ u32 StoreSize(IR::Opcode opcode) {
     }
 }
 
-/// An upper bound of an unsigned 32-bit value for every invocation of a dispatch:
-/// c + sum(coef[i] * id[i]) over gl_LocalInvocationID.xyz (0-2) and gl_WorkGroupID.xyz (3-5),
-/// plus `base` times the storage buffer's pointer word. All coefficients are non-negative, so the
-/// bound is largest at the largest ids.
+/// An upper bound of an unsigned 32-bit value for every invocation of a dispatch or draw:
+/// c + sum(coef[i] * id[i]) over gl_LocalInvocationID.xyz (0-2), gl_WorkGroupID.xyz (3-5) and
+/// a vertex shader's gl_VertexID (6), plus `base` times the storage buffer's pointer word. All
+/// coefficients are non-negative, so the bound is largest at the largest ids.
 /// An exact bound is the value itself modulo 2^32, so a negative c means the value can wrap below
 /// zero and is no bound for an unsigned operation. An inexact bound (a select, mask, shift or field
 /// extract) is only an upper bound, with c >= 0: subtracting from it or scaling a value that can
 /// wrap by it can wrap too, so those leave the value unknown.
 struct IdBound {
     s64 c{};
-    std::array<u64, 6> coef{};
+    std::array<u64, 7> coef{};
     u32 base{};
     bool exact{true};
 
     bool IsConstant() const {
         return base == 0 && std::ranges::all_of(coef, [](u64 value) { return value == 0; });
     }
+    /// Terms whose largest id the program does not fix (the workgroup and vertex ids).
     bool HasGroupTerms() const {
-        return coef[3] != 0 || coef[4] != 0 || coef[5] != 0;
+        return coef[3] != 0 || coef[4] != 0 || coef[5] != 0 || coef[6] != 0;
     }
 };
 
@@ -1771,8 +1772,9 @@ struct IdBound {
 /// index, a signed or 64-bit computation) leaves the extent unknown.
 class StoreExtentAnalysis {
 public:
-    explicit StoreExtentAnalysis(StorageBufferAddr buffer_, const std::array<u32, 3>& workgroup_)
-        : buffer{buffer_}, workgroup{workgroup_} {}
+    explicit StoreExtentAnalysis(StorageBufferAddr buffer_, const std::array<u32, 3>& workgroup_,
+                                 Stage stage_)
+        : buffer{buffer_}, workgroup{workgroup_}, stage{stage_} {}
 
     /// Extent of one store, merged into `extent`
     void AddStore(IR::Inst& inst, StorageWriteExtent& extent) {
@@ -1815,6 +1817,10 @@ private:
             result.local_stride[i] = static_cast<u32>(low->coef[i]);
             result.group_stride[i] = static_cast<u32>(low->coef[i + 3]);
         }
+        if (low->coef[6] >= COEF_LIMIT) {
+            return std::nullopt;
+        }
+        result.vertex_stride = static_cast<u32>(low->coef[6]);
         if (guard) {
             if (guard->c > s64{0xffff}) {
                 return std::nullopt;
@@ -1828,6 +1834,10 @@ private:
                 result.guard_local_stride[i] = static_cast<u32>(guard->coef[i]);
                 result.guard_group_stride[i] = static_cast<u32>(guard->coef[i + 3]);
             }
+            if (guard->coef[6] > 0xffff) {
+                return std::nullopt;
+            }
+            result.guard_vertex_stride = static_cast<u32>(guard->coef[6]);
         }
         return result;
     }
@@ -2020,6 +2030,16 @@ private:
         }
         const auto arg{[&](size_t index) { return Evaluate(inst.Arg(index), depth + 1); }};
         switch (inst.GetOpcode()) {
+        case IR::Opcode::GetAttributeU32: {
+            // gl_VertexID of a vertex shader: from 0 up to the draw's last vertex.
+            if (stage != Stage::VertexB || !inst.Arg(0).IsImmediate() ||
+                inst.Arg(0).Attribute() != IR::Attribute::VertexId) {
+                return std::nullopt;
+            }
+            IdBound result;
+            result.coef[6] = 1;
+            return result;
+        }
         case IR::Opcode::CompositeExtractU32x3: {
             if (inst.Arg(0).IsImmediate() || !inst.Arg(1).IsImmediate() || inst.Arg(1).U32() > 2) {
                 return std::nullopt;
@@ -2163,6 +2183,7 @@ private:
 
     StorageBufferAddr buffer;
     std::array<u32, 3> workgroup;
+    Stage stage;
     std::unordered_map<const IR::Inst*, std::optional<IdBound>> memo;
     std::unordered_set<const IR::Inst*> active;
     std::optional<IdBound> guard;
@@ -2371,7 +2392,8 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
                 analysis = analyses
                                .emplace(storage_inst.storage_buffer,
                                         StoreExtentAnalysis{storage_inst.storage_buffer,
-                                                            program.workgroup_size})
+                                                            program.workgroup_size,
+                                                            program.stage})
                                .first;
                 // An empty bounded extent, widened by every store
                 extents.emplace(storage_inst.storage_buffer, StorageWriteExtent{.bounded = true});

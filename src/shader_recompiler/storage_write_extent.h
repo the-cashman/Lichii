@@ -24,6 +24,9 @@ namespace Shader {
 ///
 /// A native (Switch 2) program's storage pointer carries no size, so the buffer cache binds up to
 /// 8 MiB behind it; this is what it can claim the dispatch wrote instead of all of it.
+///
+/// A vertex shader's stores add vertex_stride * gl_VertexID (ResolveDrawStorageWriteExtent); the
+/// invocation and workgroup strides are zero outside compute programs.
 struct StorageWriteExtent {
     /// False: the reach is not known (or the buffer is never written); take the whole binding.
     bool bounded{};
@@ -35,6 +38,8 @@ struct StorageWriteExtent {
     u32 guard_const{};
     std::array<u32, 3> guard_local_stride{};
     std::array<u32, 3> guard_group_stride{};
+    u32 vertex_stride{};
+    u32 guard_vertex_stride{};
 
     auto operator<=>(const StorageWriteExtent&) const = default;
 };
@@ -44,7 +49,7 @@ struct StorageWriteExtent {
 [[nodiscard]] constexpr std::optional<u64> ResolveStorageWriteExtent(
     const StorageWriteExtent& extent, const std::array<u32, 3>& block,
     const std::optional<std::array<u32, 3>>& grid) {
-    if (!extent.bounded) {
+    if (!extent.bounded || extent.vertex_stride != 0 || extent.guard_vertex_stride != 0) {
         return std::nullopt;
     }
     const auto evaluate = [&](u64 constant, const std::array<u32, 3>& local,
@@ -92,6 +97,39 @@ struct StorageWriteExtent {
     return evaluate(extent.const_end, extent.local_stride, extent.group_stride);
 }
 
+/// Bytes a draw's stores can reach past the pointer, or nullopt when unknown. max_vertex_id is
+/// the largest gl_VertexID the draw can run with, nullopt when only the GPU knows it (indexed and
+/// indirect draws).
+[[nodiscard]] constexpr std::optional<u64> ResolveDrawStorageWriteExtent(
+    const StorageWriteExtent& extent, const std::optional<u64>& max_vertex_id) {
+    if (!extent.bounded) {
+        return std::nullopt;
+    }
+    for (size_t i = 0; i < 3; ++i) {
+        if (extent.local_stride[i] != 0 || extent.group_stride[i] != 0 ||
+            extent.guard_local_stride[i] != 0 || extent.guard_group_stride[i] != 0) {
+            return std::nullopt;
+        }
+    }
+    const auto evaluate = [&](u64 constant, u32 stride) -> std::optional<u64> {
+        if (stride == 0) {
+            return constant;
+        }
+        // Both factors stay below 2^32: the sum cannot overflow.
+        if (!max_vertex_id || *max_vertex_id >= (u64{1} << 31)) {
+            return std::nullopt;
+        }
+        return constant + u64{stride} * *max_vertex_id;
+    };
+    if (extent.guarded) {
+        const auto guard = evaluate(extent.guard_const, extent.guard_vertex_stride);
+        if (!guard || *guard >= 0x10000) {
+            return std::nullopt;
+        }
+    }
+    return evaluate(extent.const_end, extent.vertex_stride);
+}
+
 /// Widens an extent to also cover another (both bounds hold for each component's maximum).
 constexpr void MergeStorageWriteExtent(StorageWriteExtent& base, const StorageWriteExtent& other) {
     if (!base.bounded || !other.bounded) {
@@ -106,16 +144,20 @@ constexpr void MergeStorageWriteExtent(StorageWriteExtent& base, const StorageWr
     base.const_end = (std::max)(base.const_end, other.const_end);
     max3(base.local_stride, other.local_stride);
     max3(base.group_stride, other.group_stride);
+    base.vertex_stride = (std::max)(base.vertex_stride, other.vertex_stride);
     if (other.guarded) {
         if (base.guarded) {
             base.guard_const = (std::max)(base.guard_const, other.guard_const);
             max3(base.guard_local_stride, other.guard_local_stride);
             max3(base.guard_group_stride, other.guard_group_stride);
+            base.guard_vertex_stride =
+                (std::max)(base.guard_vertex_stride, other.guard_vertex_stride);
         } else {
             base.guarded = true;
             base.guard_const = other.guard_const;
             base.guard_local_stride = other.guard_local_stride;
             base.guard_group_stride = other.guard_group_stride;
+            base.guard_vertex_stride = other.guard_vertex_stride;
         }
     }
 }

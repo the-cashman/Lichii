@@ -22,6 +22,7 @@ class TestEnvironment final : public Shader::Environment {
 public:
     bool native{true};
     TestEnvironment() { stage = Shader::Stage::Compute; }
+    void SetStage(Shader::Stage stage_) { stage = stage_; }
     bool IsNativeProgram() const override { return native; }
     bool IsCbufStorageBufferPointer(u32 index, u32) override { return index == 0; }
     u64 ReadInstruction(u32) override { return 0; }
@@ -343,4 +344,41 @@ TEST_CASE("Offsets whose constant wraps below zero are unbounded", "[shader][sto
         ir.ISub(ir.LocalInvocationIdX(), ir.Imm32(0x40000000)), ir.Imm32(2))};
     ir.WriteGlobal32(Address(ir, 0x170, ir.IAdd(shifted, ir.Imm32(0x2000))), ir.Imm32(0));
     CHECK_FALSE(fixture.Run(0x170).write_extent.bounded);
+}
+
+TEST_CASE("A vertex shader's stores indexed by gl_VertexID scale with the draw",
+          "[shader][storage_extent]") {
+    // 12 bytes a vertex from c0[0x170], as a skinning shader writes positions
+    KernelProgram fixture;
+    fixture.env.SetStage(Shader::Stage::VertexB);
+    fixture.program.stage = Shader::Stage::VertexB;
+    IR::IREmitter ir{fixture.entry};
+    const IR::U32 vertex{ir.GetAttributeU32(IR::Attribute::VertexId)};
+    const IR::U32 record{ir.IMul(vertex, ir.Imm32(12))};
+    ir.WriteGlobal32(Address(ir, 0x170, ir.IAdd(record, ir.Imm32(8))), ir.Imm32(0));
+    const StorageWriteExtent& extent{fixture.Run(0x170).write_extent};
+    REQUIRE(extent.bounded);
+    CHECK(extent.const_end == 12);
+    CHECK(extent.vertex_stride == 12);
+    // The last vertex of a 100-vertex array draw ends at 100 * 12 bytes.
+    CHECK(Shader::ResolveDrawStorageWriteExtent(extent, u64{99}) == u64{1200});
+    // Only the GPU knows an indexed draw's last vertex.
+    CHECK_FALSE(Shader::ResolveDrawStorageWriteExtent(extent, std::nullopt));
+    // A dispatch has no vertex id to bound it with.
+    CHECK_FALSE(At(extent, {64, 1, 1}, std::array<u32, 3>{1, 1, 1}));
+}
+
+TEST_CASE("gl_VertexID bounds nothing outside a vertex shader", "[shader][storage_extent]") {
+    KernelProgram fixture;
+    IR::IREmitter ir{fixture.entry};
+    const IR::U32 vertex{ir.GetAttributeU32(IR::Attribute::VertexId)};
+    ir.WriteGlobal32(Address(ir, 0x170, ir.ShiftLeftLogical(vertex, ir.Imm32(2))), ir.Imm32(0));
+    CHECK_FALSE(fixture.Run(0x170).write_extent.bounded);
+}
+
+TEST_CASE("A draw's constant stores need no vertex count", "[shader][storage_extent]") {
+    StorageWriteExtent extent{.bounded = true, .const_end = 8};
+    CHECK(Shader::ResolveDrawStorageWriteExtent(extent, std::nullopt) == u64{8});
+    extent.local_stride[0] = 4;
+    CHECK_FALSE(Shader::ResolveDrawStorageWriteExtent(extent, u64{10}));
 }

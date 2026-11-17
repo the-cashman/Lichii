@@ -69,6 +69,64 @@ namespace VideoCommon {
     return enabled;
 }
 
+/// EDEN_NX2_ALIAS_COPY_TRACE=1: every 10 s, how many copies SynchronizeAliases made between
+/// images that share memory, and the pairs it made most of (a draw that samples one alias of the
+/// target it renders to copies the target once per draw).
+[[nodiscard]] inline bool AliasCopyTrace() {
+    static const bool enabled = std::getenv("EDEN_NX2_ALIAS_COPY_TRACE") != nullptr;
+    return enabled;
+}
+
+/// `src_bound`: the newer image is one of the draw's render targets.
+inline void TraceAliasCopy(const ImageBase& dst, const ImageBase& src, bool src_bound,
+                           const Tegra::Engines::Maxwell3D::Regs& regs) {
+    struct Pair {
+        std::string text;
+        u64 copies{};
+        u64 bound{};
+    };
+    static std::mutex mutex;
+    static std::map<std::pair<GPUVAddr, GPUVAddr>, Pair> pairs;
+    static u64 total{};
+    static auto window = std::chrono::steady_clock::now();
+    std::scoped_lock lock{mutex};
+    const auto describe = [](const ImageBase& image) {
+        const auto& info = image.info;
+        return fmt::format("{:#x} {} {}x{}x{} type {} levels {} layers {} samples {}{}",
+                           image.gpu_addr, static_cast<u32>(info.format), info.size.width,
+                           info.size.height, info.size.depth, static_cast<u32>(info.type),
+                           info.resources.levels, info.resources.layers, info.num_samples,
+                           True(image.flags & ImageFlagBits::Rescaled) ? " rescaled" : "");
+    };
+    Pair& pair = pairs[{dst.gpu_addr, src.gpu_addr}];
+    if (pair.copies == 0) {
+        const auto& clip = regs.surface_clip;
+        pair.text = fmt::format("[{}] <- [{}], surface clip {},{} {}x{}", describe(dst),
+                                describe(src), clip.x.Value(), clip.y.Value(),
+                                clip.width.Value(), clip.height.Value());
+    }
+    ++pair.copies;
+    pair.bound += src_bound ? 1 : 0;
+    ++total;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - window < std::chrono::seconds{10}) {
+        return;
+    }
+    std::vector<const Pair*> sorted;
+    for (const auto& [key, value] : pairs) {
+        sorted.push_back(&value);
+    }
+    std::ranges::sort(sorted, std::greater<>{}, &Pair::copies);
+    LOG_INFO(HW_GPU, "Alias copies in 10 s: {} between {} pairs", total, pairs.size());
+    for (size_t i = 0; i < sorted.size() && i < 8; ++i) {
+        LOG_INFO(HW_GPU, "  {} copies ({} from a bound render target): {}", sorted[i]->copies,
+                 sorted[i]->bound, sorted[i]->text);
+    }
+    pairs.clear();
+    total = 0;
+    window = now;
+}
+
 using Tegra::Texture::TICEntry;
 using Tegra::Texture::TSCEntry;
 using VideoCore::Surface::GetFormatType;
@@ -2618,7 +2676,9 @@ bool TextureCache<P>::RescaleRenderTargets() {
         };
         for (size_t index = 0; index < NUM_RT; ++index) {
             ImageViewId& color_buffer_id = render_targets.color_buffer_ids[index];
-            if (flags[Dirty::ColorBuffer0 + index] || force) {
+            // As for the depth target below: a padded target's size depends on the surface clip.
+            if (flags[Dirty::ColorBuffer0 + index] || force ||
+                ((color_targets_padded >> index) & 1) != 0) {
                 flags[Dirty::ColorBuffer0 + index] = false;
                 BindRenderTarget(&color_buffer_id, FindColorBuffer(index));
             }
@@ -5359,6 +5419,19 @@ std::optional<typename TextureCache<P>::BlitImages> TextureCache<P>::GetBlitImag
     const GPUVAddr src_addr = src.Address();
     ImageInfo dst_info(dst);
     ImageInfo src_info(src);
+    if (gpu_memory->UsesNativeTiling()) {
+        // As ClipPaddedTarget: a Switch 2 program gives a blit's surfaces padded to whole GOBs
+        // too. Donkey Kong Bananza copies the 8x8 level of a texture it rendered as a 16x8
+        // surface, which matched no image: the copy ran in software, on a download of the source.
+        const auto unpad = [](ImageInfo& info, s32 right) {
+            if (info.type == ImageType::e2D && right > 0 &&
+                IsPaddedWidth(info, static_cast<u32>(right))) {
+                info.size.width = static_cast<u32>(right);
+            }
+        };
+        unpad(src_info, copy.src_x1);
+        unpad(dst_info, copy.dst_x1);
+    }
     const bool can_be_depth_blit =
         dst_info.format == src_info.format && copy.filter == Tegra::Engines::Fermi2D::Filter::Point;
     ImageId dst_id;
@@ -5519,6 +5592,7 @@ SamplerId TextureCache<P>::FindSampler(const TSCEntry& config, bool compute) {
 template <class P>
 ImageViewId TextureCache<P>::FindColorBuffer(size_t index) {
     const auto& regs = maxwell3d->regs;
+    color_targets_padded &= ~(1U << index);
     if (index >= regs.rt_control.count) {
         return ImageViewId{};
     }
@@ -5530,15 +5604,41 @@ ImageViewId TextureCache<P>::FindColorBuffer(size_t index) {
     if (rt.format == Tegra::RenderTargetFormat::NONE) {
         return ImageViewId{};
     }
-    const ImageInfo info(regs.rt[index], regs.anti_alias_samples_mode);
+    ImageInfo info(regs.rt[index], regs.anti_alias_samples_mode);
+    // #2081: the clipped width depends on the surface clip, so it is part of the key then.
+    const bool padded = ClipPaddedTarget(info);
+    if (padded) {
+        color_targets_padded |= 1U << index;
+    }
     // address, size, format, tile mode, depth, array pitch, base layer, mark_ieee_clean
     static constexpr size_t RtWords = 10;
     static_assert(sizeof(rt) >= RtWords * sizeof(u32));
     RenderTargetLookupKey key{};
-    key[0] = static_cast<u32>(index) + 1;
+    key[0] = (static_cast<u32>(index) + 1) | (padded ? info.size.width << 8 : 0U);
     std::memcpy(&key[1], &rt, RtWords * sizeof(u32));
     key[1 + RtWords] = static_cast<u32>(regs.anti_alias_samples_mode);
     return FindRenderTargetViewMemo(key, info, gpu_addr);
+}
+
+template <class P>
+bool TextureCache<P>::ClipPaddedTarget(ImageInfo& info) const {
+    // A Switch 2 program gives a target's width padded to whole GOBs and samples it at its own:
+    // Donkey Kong Bananza draws its characters into a 2112x1179 R16_FLOAT target (2 bytes a
+    // texel, 32 texels a GOB) and a 2096x1179 depth target, with a 2095x1179 surface clip, and
+    // their shader samples the first as a 2095x1179 texture at the same address. Image lookups
+    // compare sizes strictly, so the target and the texture were two images, and each of those
+    // draws (about 1,600 a frame) copied the whole target to the texture first. Both take the
+    // same guest memory with the same layout, and the clip keeps rendering out of the padding.
+    if (!gpu_memory->UsesNativeTiling() || info.type != ImageType::e2D) {
+        return false;
+    }
+    const auto& clip = maxwell3d->regs.surface_clip;
+    const u32 clip_right = clip.x.Value() + clip.width.Value();
+    if (!IsPaddedWidth(info, clip_right)) {
+        return false;
+    }
+    info.size.width = clip_right;
+    return true;
 }
 
 template <class P>
@@ -5560,8 +5660,12 @@ ImageViewId TextureCache<P>::FindDepthBuffer() {
     // One image then serves both, instead of two with a copy for each new size.
     const u32 clip_right = regs.surface_clip.x.Value() + regs.surface_clip.width.Value();
     const bool squared = depth_target_padded && clip_right <= info.size.height;
+    bool clipped = false;
     if (squared) {
         info.size.width = info.size.height;
+    } else if (ClipPaddedTarget(info)) {
+        depth_target_padded = true;
+        clipped = true;
     }
     static_assert(sizeof(regs.zeta) == 5 * sizeof(u32) && sizeof(regs.zeta_size) == 3 * sizeof(u32));
     RenderTargetLookupKey key{};
@@ -5570,6 +5674,8 @@ ImageViewId TextureCache<P>::FindDepthBuffer() {
     std::memcpy(&key[1], &regs.zeta, sizeof(regs.zeta));
     std::memcpy(&key[6], &regs.zeta_size, sizeof(regs.zeta_size));
     key[9] = static_cast<u32>(regs.anti_alias_samples_mode);
+    // #2081: so is a width clipped off GOB padding.
+    key[10] = clipped ? info.size.width : 0U;
     return FindRenderTargetViewMemo(key, info, gpu_addr);
 }
 
@@ -6328,6 +6434,15 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
     });
     const auto& resolution = Settings::values.resolution_info;
     for (const AliasedImage* const aliased : aliased_images) {
+        if (AliasCopyTrace()) [[unlikely]] {
+            const auto bound = [&](ImageViewId view_id) {
+                return view_id && slot_image_views[view_id].image_id == aliased->id;
+            };
+            TraceAliasCopy(image, slot_images[aliased->id],
+                           bound(render_targets.depth_buffer_id) ||
+                               std::ranges::any_of(render_targets.color_buffer_ids, bound),
+                           maxwell3d->regs);
+        }
         if (!resolution.active || !any_rescaled) {
             CopyImage(image_id, aliased->id, aliased->copies);
             continue;

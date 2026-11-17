@@ -905,6 +905,7 @@ struct Memory::Impl {
         const u64 start = timing.GetClockTicks();
         const u64 reads = VideoCore::AsyncReadback::t_reads;
         DownloadFromRasterizer(v_address, size, known_pointer);
+        Kernel::Nx2ThreadStats::CountMemoryRead(Kernel::Nx2ThreadStats::t_run, v_address, size);
         Kernel::Nx2ThreadStats::CountMemory(Kernel::Nx2ThreadStats::t_run,
                                             timing.GetClockTicks() - start,
                                             VideoCore::AsyncReadback::t_reads != reads);

@@ -343,6 +343,27 @@ u32 Maxwell3D::GetMaxCurrentVertices() {
     return num_vertices;
 }
 
+u32 Maxwell3D::GetMaxStreamVertices() {
+    u64 num_vertices = 0;
+    for (size_t index = 0; index < Regs::NumVertexArrays; ++index) {
+        const auto& array = regs.vertex_streams[index];
+        if (array.enable == 0 || regs.vertex_stream_instances.IsInstancingEnabled(index)) {
+            continue;
+        }
+        const u32 stride = array.stride.Value();
+        if (stride == 0) {
+            // Every vertex fetches the same element: the stream bounds nothing.
+            return 0;
+        }
+        const u64 stream_size = GetNativeMacroEngine().native_turing
+                                    ? regs.NativeVertexStreamSize(index)
+                                    : regs.vertex_stream_limits[index].Address() + 1 -
+                                          array.Address();
+        num_vertices = (std::max)(num_vertices, stream_size / stride);
+    }
+    return static_cast<u32>((std::min<u64>)(num_vertices, (std::numeric_limits<u32>::max)()));
+}
+
 size_t Maxwell3D::EstimateIndexBufferSize() {
     GPUVAddr start_address = regs.index_buffer.StartAddress();
     GPUVAddr end_address = regs.index_buffer.EndAddress();

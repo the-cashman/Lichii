@@ -4598,6 +4598,10 @@ void RasterizerVulkan::FlushWork() {
         scheduler.DispatchWork(true);
         break;
     case SubmissionPolicy::Action::Flush:
+        if (native) {
+            std::scoped_lock lock{buffer_cache.mutex};
+            buffer_cache.Nx2CopyDrawListPages(scheduler.CurrentTick());
+        }
         scheduler.Flush();
         pending_native_work = false;
         break;

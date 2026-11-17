@@ -50,3 +50,26 @@ TEST_CASE("Other depth targets are not padded squares", "[video_core][texture_ca
     volume.type = ImageType::e3D;
     REQUIRE_FALSE(VideoCommon::IsPaddedSquare(volume));
 }
+
+TEST_CASE("A target padded to whole GOBs is as wide as its clip", "[video_core][texture_cache]") {
+    // Donkey Kong Bananza's character targets, with a 2095x1179 surface clip.
+    REQUIRE(VideoCommon::IsPaddedWidth(Depth(PixelFormat::R16_FLOAT, 2112, 1179), 2095));
+    REQUIRE(VideoCommon::IsPaddedWidth(Depth(PixelFormat::D32_FLOAT, 2096, 1179), 2095));
+    REQUIRE(VideoCommon::IsPaddedWidth(Depth(PixelFormat::B10G11R11_FLOAT, 368, 204), 360));
+    // 2 bytes a texel: 2081 texels are the first of the last GOB column.
+    REQUIRE(VideoCommon::IsPaddedWidth(Depth(PixelFormat::R16_FLOAT, 2112, 1179), 2081));
+}
+
+TEST_CASE("A clip that ends before the last GOB column is no padding",
+          "[video_core][texture_cache]") {
+    REQUIRE_FALSE(VideoCommon::IsPaddedWidth(Depth(PixelFormat::R16_FLOAT, 2112, 1179), 2080));
+    REQUIRE_FALSE(VideoCommon::IsPaddedWidth(Depth(PixelFormat::D32_FLOAT, 2096, 1179), 1440));
+    // As wide as the target, wider, or empty
+    REQUIRE_FALSE(VideoCommon::IsPaddedWidth(Depth(PixelFormat::D32_FLOAT, 2096, 1179), 2096));
+    REQUIRE_FALSE(VideoCommon::IsPaddedWidth(Depth(PixelFormat::D32_FLOAT, 2096, 1179), 2100));
+    REQUIRE_FALSE(VideoCommon::IsPaddedWidth(Depth(PixelFormat::D32_FLOAT, 2096, 1179), 0));
+
+    ImageInfo multisampled = Depth(PixelFormat::D32_FLOAT, 2096, 1179);
+    multisampled.num_samples = 4;
+    REQUIRE_FALSE(VideoCommon::IsPaddedWidth(multisampled, 2095));
+}
