@@ -468,7 +468,10 @@ TEST_CASE("Built-in FPS Unlock defaults on and replaces Dynamic FPS", "[patch_ma
     Settings::values.disabled_addons[OcarinaTitleId] = {std::string{FpsUnlock}};
     REQUIRE_FALSE(listed(FpsUnlock).enabled);
     REQUIRE(listed(DynamicFps).version == "IPS");
-    patched = manager.PatchNSO(nso, "main");
+    // Either patch unlocks the frame rate (KProcess::IsFrameRateUnlocked).
+    bool frame_rate_unlocked = false;
+    patched = manager.PatchNSO(nso, "main", &frame_rate_unlocked);
+    REQUIRE(frame_rate_unlocked);
     REQUIRE(WordAt(patched, DynamicCallOffset) == DynamicCallInstruction);
     REQUIRE(routine(patched, DynamicRoutineSize) ==
             std::string{RoutineHead} + "C300001C0309231E4020231E4D0000544840201EC0035FD6"
@@ -498,7 +501,9 @@ TEST_CASE("Built-in FPS Unlock defaults on and replaces Dynamic FPS", "[patch_ma
     // Both unchecked: hook and code cave stay untouched.
     Settings::values.disabled_addons[OcarinaTitleId] = {std::string{FpsUnlock},
                                                         std::string{DynamicFps}};
-    patched = manager.PatchNSO(nso, "main");
+    frame_rate_unlocked = false;
+    patched = manager.PatchNSO(nso, "main", &frame_rate_unlocked);
+    REQUIRE_FALSE(frame_rate_unlocked);
     REQUIRE(WordAt(patched, DynamicCallOffset) == DynamicOriginalInstruction);
     REQUIRE(WordAt(patched, DynamicRoutineOffset) == 0);
     REQUIRE(water_untouched(patched));

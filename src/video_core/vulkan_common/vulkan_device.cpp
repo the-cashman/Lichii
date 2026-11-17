@@ -30,10 +30,13 @@
 #include <ranges>
 #include "common/settings.h"
 #include "common/settings_enums.h"
+#include "video_core/host_vsync.h"
 #include "video_core/nx2_stutter_trace.h"
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
+#include "video_core/nx2_pace.h"
+#include "video_core/renderer_vulkan/nx2_present_log.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/shader_cache_v2/cache.h"
@@ -1607,6 +1610,22 @@ bool Device::GetSuitability(bool requires_swapchain) {
         loaded_extensions.insert(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
     }
 
+    // EDEN_NX2_PRESENT_LOG / EDEN_NX2_PACE: the compositor's present times, where offered
+    // (gamescope's WSI layer). Off otherwise, so it can't change how presents behave.
+    if (Vulkan::Nx2PresentLog::Wanted() || Tegra::Nx2Pace::Get().enabled) {
+        const auto has = [&](const char* name) { return supported_extensions.contains(name); };
+        google_display_timing = has(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
+        if (google_display_timing) {
+            loaded_extensions.insert(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
+        }
+        LOG_INFO(Render_Vulkan,
+                 "Present extensions offered: GOOGLE_display_timing {}, KHR_present_wait {}, "
+                 "KHR_present_id {}, EXT_present_timing {}",
+                 has(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME),
+                 has(VK_KHR_PRESENT_WAIT_EXTENSION_NAME), has(VK_KHR_PRESENT_ID_EXTENSION_NAME),
+                 has("VK_EXT_present_timing"));
+    }
+
     extensions.depth_stencil_resolve =
         extensions.depth_stencil_resolve &&
         (instance_version >= VK_API_VERSION_1_2 || extensions.create_renderpass2);
@@ -1738,6 +1757,61 @@ bool Device::GetSuitability(bool requires_swapchain) {
     if (has_device_fault_extension) {
         device_fault_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT;
         SetNext(next, device_fault_features);
+    }
+
+    // VK_KHR_present_id + VK_KHR_present_wait: the presenter learns when the display shows a
+    // present. Each pair is asked for on its own and chained for device creation only when its
+    // extensions are enabled. Only host vsync uses them (EDEN_NX2_HOST_VSYNC=0: neither).
+    const auto probe_present_wait = [this, &next](auto& id_features, auto& wait_features,
+                                                  VkBool32& id, VkBool32& wait,
+                                                  const char* id_name, const char* wait_name) {
+        id_features.pNext = &wait_features;
+        VkPhysicalDeviceFeatures2 probe{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+            .pNext = &id_features,
+            .features = {},
+        };
+        physical.GetFeatures2(probe);
+        id_features.pNext = nullptr;
+        const bool enabled = id && wait;
+        if (enabled) {
+            loaded_extensions.insert(id_name);
+            loaded_extensions.insert(wait_name);
+            SetNext(next, id_features);
+            SetNext(next, wait_features);
+        } else {
+            id = VK_FALSE;
+            wait = VK_FALSE;
+        }
+        LOG_INFO(Render_Vulkan, "{}/{}: {}", id_name, wait_name,
+                 enabled ? "enabled" : "not supported by the device");
+    };
+    const bool wants_present_wait =
+        requires_swapchain && VideoCore::HostVsync::Enabled() &&
+        loaded_extensions.contains(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    if (wants_present_wait && supported_extensions.contains(VK_KHR_PRESENT_ID_EXTENSION_NAME) &&
+        supported_extensions.contains(VK_KHR_PRESENT_WAIT_EXTENSION_NAME)) {
+        present_id_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR;
+        present_wait_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR;
+        probe_present_wait(present_id_features, present_wait_features,
+                           present_id_features.presentId, present_wait_features.presentWait,
+                           VK_KHR_PRESENT_ID_EXTENSION_NAME, VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
+    }
+    // VK_KHR_present_id2 + VK_KHR_present_wait2: the same per surface, preferred where the
+    // surface supports them. They need VK_KHR_get_surface_capabilities2 on the instance.
+    // EDEN_NX2_PRESENT_WAIT2=0 keeps to the first versions.
+    const char* const present_wait2_switch = std::getenv("EDEN_NX2_PRESENT_WAIT2");
+    if (wants_present_wait && (present_wait2_switch == nullptr || present_wait2_switch[0] != '0') &&
+        dld.vkGetPhysicalDeviceSurfaceCapabilities2KHR != nullptr &&
+        supported_extensions.contains(VK_KHR_PRESENT_ID_2_EXTENSION_NAME) &&
+        supported_extensions.contains(VK_KHR_PRESENT_WAIT_2_EXTENSION_NAME)) {
+        present_id2_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR;
+        present_wait2_features.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_2_FEATURES_KHR;
+        probe_present_wait(present_id2_features, present_wait2_features,
+                           present_id2_features.presentId2, present_wait2_features.presentWait2,
+                           VK_KHR_PRESENT_ID_2_EXTENSION_NAME,
+                           VK_KHR_PRESENT_WAIT_2_EXTENSION_NAME);
     }
 
     // The features the driver reports are enabled through the same chain at device creation.

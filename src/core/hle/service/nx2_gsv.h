@@ -68,9 +68,11 @@
 #include "core/hle/kernel/k_transfer_memory.h"
 #include "core/hle/kernel/svc_results.h"
 #include "core/memory.h"
+#include "video_core/host_vsync.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/nx2_video_decoder.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_pace.h"
 #include "video_core/textures/decoders.h"
 #include "core/hle/service/hle_ipc.h"
 #include "core/hle/service/ipc_helpers.h"
@@ -2043,6 +2045,9 @@ public:
     }
 
     ~INx2Vi2Session() override {
+        // The display stops starting frames for this session's events; other sessions keep
+        // theirs.
+        VideoCore::HostVsync::RemoveListener(m_vsync.get());
         // A service fiber can be discarded during shutdown without unwinding its stack.
         // Remove or join its callback before closing the session-owned event.
         m_frame_wait_action.reset();
@@ -2548,13 +2553,21 @@ private:
         }();
         const u32 fps_limit =
             forced_fps_limit != 0 ? forced_fps_limit : Settings::values.fps_limit.GetValue();
+        // The display starts this session's frames (HostVsync) only for a game whose frame rate
+        // is unlocked, no faster than the FPS limit. A locked game counts vsync events to time
+        // itself, so it keeps the timer's fixed rate.
+        VideoCore::HostVsync::SetPacing(
+            m_vsync.get(), process != nullptr && process->IsFrameRateUnlocked(), fps_limit);
         // With a frame rate limit other than 60 Hz the vsync event already paces the game; holding
         // its swap interval here as well kept it at 60 fps (interval 2 of a 120 Hz event). Only an
         // explicit FPS limit still applies then.
         const bool timer_paced = Nx2VsyncRateHz() != 60;
         const bool speed_limited = !timer_paced && Settings::values.use_speed_limit.GetValue() &&
                                    Settings::SpeedLimit() != 0;
-        if (!speed_limited && fps_limit == 0) {
+        // EDEN_NX2_PACE: the rate the presenter releases frames at caps the game too, so it
+        // doesn't make frames faster than they are shown (they would queue up as latency).
+        const s64 pace_ns = Tegra::Nx2Pace::GuestIntervalNs();
+        if (!speed_limited && fps_limit == 0 && pace_ns == 0) {
             Tegra::g_nx2_guest_frame_interval_ns.store(0, std::memory_order_relaxed);
             return;
         }
@@ -2568,7 +2581,8 @@ private:
                         : std::chrono::nanoseconds{100'000'000'000LL * swap_interval /
                                                    refresh_rate /
                                                    (speed_limited ? Settings::SpeedLimit() : 100)};
-        const auto interval = PacedInterval(vblank_interval, fps_limit);
+        const auto interval =
+            (std::max)(PacedInterval(vblank_interval, fps_limit), std::chrono::nanoseconds{pace_ns});
         Tegra::g_nx2_guest_frame_interval_ns.store(
             static_cast<u64>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(interval).count()),
@@ -2578,6 +2592,14 @@ private:
         }
         const auto now = std::chrono::steady_clock::now();
         const auto pacing = m_present_pacer.Advance(now, interval);
+        if (pace_ns != 0) {
+            // Slack before the deadline, negative when late (a re-anchor counts a whole interval).
+            const s64 slack =
+                pacing.reset ? -interval.count()
+                             : std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   pacing.deadline - now).count();
+            Tegra::Nx2Pace::OnGuestPresent(now, slack);
+        }
         if (trace) {
             m_frame_trace.deadline_reset = pacing.reset;
         }
@@ -3214,10 +3236,16 @@ private:
                 [vsync_state = m_vsync, &kernel = system.Kernel(), VblankInterval](
                     s64 scheduled,
                     std::chrono::nanoseconds late) -> std::optional<std::chrono::nanoseconds> {
+                    // While the display starts frames (HostVsync), this timer only steps in when
+                    // it stops doing so. HostVsync decides and signals under its own lock, which
+                    // it takes before this session's, as StartFrame does.
+                    VideoCore::HostVsync::TimerTick(vsync_state.get(), VblankInterval, [&] {
+                        std::scoped_lock lk{vsync_state->mutex};
+                        for (auto* vsync : vsync_state->events) {
+                            vsync->Signal(kernel);
+                        }
+                    });
                     std::scoped_lock lk{vsync_state->mutex};
-                    for (auto* vsync : vsync_state->events) {
-                        vsync->Signal(kernel);
-                    }
                     if (Common::DkbFrameTrace::Enabled()) {
                         const s64 observed = scheduled + late.count();
                         ++vsync_state->trace_callbacks;
@@ -3251,6 +3279,18 @@ private:
                     return std::nullopt;
                 });
             system.CoreTiming().ScheduleLoopingEvent(VblankInterval, VblankInterval, m_vsync_timer);
+            if (VideoCore::HostVsync::Enabled()) {
+                // The host's display can start this session's frames (PaceToVblank says when):
+                // each frame on screen then signals its vsync events, from the presenter's thread
+                // as host1x syncpoint actions signal theirs from the GPU thread.
+                VideoCore::HostVsync::AddListener(
+                    m_vsync.get(), [vsync_state = m_vsync, &kernel = system.Kernel()] {
+                        std::scoped_lock lk{vsync_state->mutex};
+                        for (auto* vsync : vsync_state->events) {
+                            vsync->Signal(kernel);
+                        }
+                    });
+            }
         }
     }
 

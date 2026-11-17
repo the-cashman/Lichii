@@ -728,6 +728,28 @@ FN_MAX_LIMIT_LIST
         return extensions.swapchain_mutable_format;
     }
 
+    /// Returns true if presents can carry an id and be waited for, through either version of
+    /// the extensions. A swapchain may still have neither (Swapchain::HasPresentIds).
+    bool IsPresentWaitEnabled() const {
+        return IsKhrPresentWaitEnabled() || IsKhrPresentWait2Enabled();
+    }
+
+    /// Returns true if VK_KHR_present_id and VK_KHR_present_wait are enabled.
+    bool IsKhrPresentWaitEnabled() const {
+        return present_id_features.presentId && present_wait_features.presentWait;
+    }
+
+    /// Returns true if VK_KHR_present_id2 and VK_KHR_present_wait2 are enabled. The surface still
+    /// has to support them.
+    bool IsKhrPresentWait2Enabled() const {
+        return present_id2_features.presentId2 && present_wait2_features.presentWait2;
+    }
+
+    /// VK_GOOGLE_display_timing, enabled only for EDEN_NX2_PRESENT_LOG / EDEN_NX2_PACE.
+    bool IsGoogleDisplayTimingEnabled() const {
+        return google_display_timing;
+    }
+
     /// Returns true if VK_EXT_hdr_metadata is enabled.
     bool IsExtHdrMetadataEnabled() const {
         return extensions.hdr_metadata;
@@ -1469,6 +1491,10 @@ private:
 
     VkPhysicalDeviceFeatures2 features2{};
     VkPhysicalDeviceFaultFeaturesEXT device_fault_features{};
+    VkPhysicalDevicePresentIdFeaturesKHR present_id_features{};
+    VkPhysicalDevicePresentWaitFeaturesKHR present_wait_features{};
+    VkPhysicalDevicePresentId2FeaturesKHR present_id2_features{};
+    VkPhysicalDevicePresentWait2FeaturesKHR present_wait2_features{};
     /// Enabled as the driver reports them (VK_KHR_portability_subset devices only).
     VkPhysicalDevicePortabilitySubsetFeaturesKHR portability_subset_features{};
     VkPhysicalDeviceProperties2 properties2{};
@@ -1516,6 +1542,7 @@ private:
     // Telemetry parameters
     std::set<std::string, std::less<>> supported_extensions; ///< Reported Vulkan extensions.
     std::set<std::string, std::less<>> loaded_extensions;    ///< Loaded Vulkan extensions.
+    bool google_display_timing{};
     bool streamline_extensions{}; ///< NVIDIA DLSS's extensions are loaded.
     bool streamline_attached{};   ///< Streamline has this device.
     std::vector<size_t> valid_heap_memory;                   ///< Heaps used.
