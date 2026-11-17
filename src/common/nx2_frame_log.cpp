@@ -10,6 +10,9 @@
 #include <thread>
 #include <vector>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include "common/logging.h"
 #include "common/nx2_frame_log.h"
 #include "common/thread.h"
@@ -82,7 +85,9 @@ struct State {
                            "# F,frame,ticks,present,fence,return,front,back,recorded,submitted,gpu,"
                            "presented,reached,images,upload_bytes,mprotect,jit_blocks,front_parse_ns,"
                            "front_drain_ns,front_writers_ns,front_semaphore_ns,front_copy_ns,"
-                           "front_queue_empty_ns,back_idle_ns,submits,gpu_tick\n"
+                           "front_queue_empty_ns,back_idle_ns,submits,drain_ringfull_ns,drain_acquire_ns,"
+                           "drain_other_ns,back_cpu_ns,back_delay_ns,front_cpu_ns,front_delay_ns,"
+                           "worker_cpu_ns,worker_delay_ns,gpu_tick\n"
                            "# E,kind,ns,arg (1 submit, 2 front state, 3 back idle, 4 reached)\n"
                            "# T,frame,ns,cntpct,thread_id,priority,core,cpu_ticks,presenter\n");
         std::fflush(file);
@@ -191,6 +196,22 @@ void State::Flush(bool all) {
     S().Write(all);
 }
 
+std::array<std::atomic<int>, static_cast<size_t>(ThreadRole::Count)> g_thread_fds{};
+
+/// run ns and wait ns of a schedstat file (fd kept open; pread from 0).
+bool ReadSchedstat(int fd, u64& run, u64& wait) {
+    char buf[96];
+    const ssize_t n = pread(fd, buf, sizeof(buf) - 1, 0);
+    if (n <= 0) {
+        return false;
+    }
+    buf[n] = 0;
+    char* end{};
+    run = std::strtoull(buf, &end, 10);
+    wait = std::strtoull(end, nullptr, 10);
+    return true;
+}
+
 thread_local u64 t_present_frame{};
 u64 g_composite_frame{}; ///< back thread only
 
@@ -276,11 +297,35 @@ void StampAt(u64 frame, Stage stage, u64 ns) {
     }
 }
 
+void RegisterThread(ThreadRole role) {
+    if (!Enabled()) {
+        return;
+    }
+    const std::string path = "/proc/self/task/" + std::to_string(static_cast<long>(gettid())) +
+                             "/schedstat";
+    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        g_thread_fds[static_cast<size_t>(role)].store(fd, std::memory_order_release);
+    }
+}
+
 void BeginComposite(u64 frame, u64 front_ns) {
     g_composite_frame = frame;
     Slot* const slot = SlotOf(frame);
     if (slot == nullptr) {
         return;
+    }
+    {
+        State& st = S();
+        for (size_t role = 0; role < g_thread_fds.size(); ++role) {
+            const int fd = g_thread_fds[role].load(std::memory_order_acquire);
+            u64 run{}, wait{};
+            if (fd > 0 && ReadSchedstat(fd, run, wait)) {
+                const size_t base = static_cast<size_t>(Counter::BackCpuNs) + 2 * role;
+                st.counters[base].store(run, std::memory_order_relaxed);
+                st.counters[base + 1].store(wait, std::memory_order_relaxed);
+            }
+        }
     }
     slot->stamps[static_cast<size_t>(Stage::Back)].store(Now(), std::memory_order_relaxed);
     slot->stamps[static_cast<size_t>(Stage::Front)].store(front_ns, std::memory_order_relaxed);
