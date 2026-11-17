@@ -27,6 +27,7 @@
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
+#include "video_core/buffer_cache/nx2_async_untrack.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -1359,6 +1360,14 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     const StutterTrace::ThreadScope stutter_thread{StutterTrace::Thread::Back};
     Common::SetCurrentThreadName("GPUBack");
     on_back_thread = true;
+    Nx2AsyncUntrack::t_defer = Nx2AsyncUntrack::Enabled();
+    Nx2LazyUntrack::t_hold = Nx2LazyUntrack::Enabled();
+    if (Nx2LazyUntrack::t_hold) {
+        LOG_INFO(HW_GPU, "EDEN_NX2_LAZY_UNTRACK: GPU back thread holds untracked pages' counts");
+    }
+    if (Nx2AsyncUntrack::t_defer) {
+        LOG_INFO(HW_GPU, "EDEN_NX2_ASYNC_UNTRACK: GPU back thread untracks pages on a helper");
+    }
     tick_state.store(tick_state.load(std::memory_order_relaxed) + TickGeneration + TickAccepting,
                      std::memory_order_release);
     back_running.store(true, std::memory_order_release);

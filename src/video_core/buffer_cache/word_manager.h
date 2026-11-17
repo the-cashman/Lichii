@@ -20,6 +20,7 @@
 #include "common/common_types.h"
 #include "common/div_ceil.h"
 #include "common/logging.h"
+#include "video_core/buffer_cache/nx2_async_untrack.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2_perf.h"
 
@@ -449,6 +450,29 @@ struct WordManager {
         if (!Nx2Perf::Verify()) {
             CoalesceInPlace(ranges);
             Nx2TrackerStats::Note(ranges, delta);
+            if constexpr (requires(DeviceTracker& t) { t.BeginDeferredCachedUpdates(); }) {
+                // EDEN_NX2_LAZY_UNTRACK: tracking uses the counts held since the untrack.
+                if (delta > 0 && Nx2LazyUntrack::Enabled() && Nx2LazyUntrack::Get().Any()) {
+                    Nx2LazyUntrack::Get().Consume(ranges);
+                    if (ranges.empty()) {
+                        return;
+                    }
+                } else if (delta < 0 && Nx2LazyUntrack::t_hold) {
+                    Nx2LazyUntrack::Get().Hold(
+                        tracker,
+                        [](void* held_tracker, std::span<const std::pair<VAddr, size_t>> runs,
+                           s32 run_delta) {
+                            static_cast<DeviceTracker*>(held_tracker)
+                                ->UpdatePagesCachedBatch(runs, run_delta);
+                        },
+                        [](void* held_tracker) {
+                            static_cast<DeviceTracker*>(held_tracker)->EndDeferredCachedUpdates();
+                        },
+                        std::span<const std::pair<VAddr, size_t>>(ranges.data(), ranges.size()));
+                    ranges.clear();
+                    return;
+                }
+            }
             if (t_deferred_page_caching != nullptr) {
                 ASSERT_MSG(delta < 0, "deferred page caching was asked to track pages");
                 if (delta < 0) {
@@ -463,6 +487,26 @@ struct WordManager {
                     ranges.clear();
                     return;
                 }
+            }
+            if constexpr (requires(DeviceTracker& t) { t.BeginDeferredCachedUpdates(); }) {
+            if (delta < 0 && Nx2AsyncUntrack::t_defer) {
+                // EDEN_NX2_ASYNC_UNTRACK: the helper applies it; unmaps wait for it.
+                tracker->BeginDeferredCachedUpdates();
+                Nx2AsyncUntrack::Get().Push(
+                    tracker,
+                    [](void* deferred_tracker, std::span<const std::pair<VAddr, size_t>> runs,
+                       s32 run_delta) {
+                        static_cast<DeviceTracker*>(deferred_tracker)
+                            ->UpdatePagesCachedBatch(runs, run_delta);
+                    },
+                    [](void* deferred_tracker) {
+                        static_cast<DeviceTracker*>(deferred_tracker)->EndDeferredCachedUpdates();
+                    },
+                    std::span<const std::pair<VAddr, size_t>>(ranges.data(), ranges.size()),
+                    delta);
+                ranges.clear();
+                return;
+            }
             }
             tracker->UpdatePagesCachedBatch(
                 std::span<const std::pair<VAddr, size_t>>(ranges.data(), ranges.size()), delta);

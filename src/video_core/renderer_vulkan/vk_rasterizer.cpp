@@ -26,6 +26,7 @@
 
 #include <fmt/format.h>
 
+#include "video_core/buffer_cache/nx2_async_untrack.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 
 #include "common/assert.h"
@@ -3157,6 +3158,10 @@ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
     if (addr == 0 || size == 0) {
         return;
     }
+    if (VideoCommon::Nx2LazyUntrack::Enabled() && VideoCommon::Nx2LazyUntrack::Get().Any()) {
+        // Device unmaps come through here: no count may be held past the backing.
+        VideoCommon::Nx2LazyUntrack::Get().Release(addr, size);
+    }
     if (True(which & VideoCommon::CacheType::TextureCache)) {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.WriteMemory(addr, size);
@@ -3392,6 +3397,9 @@ void RasterizerVulkan::InvalidateGPUCache() {
 }
 
 void RasterizerVulkan::UnmapMemory(DAddr addr, u64 size) {
+    if (VideoCommon::Nx2LazyUntrack::Enabled() && VideoCommon::Nx2LazyUntrack::Get().Any()) {
+        VideoCommon::Nx2LazyUntrack::Get().Release(addr, size);
+    }
     {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.UnmapMemory(addr, size);
@@ -4062,6 +4070,9 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
 }
 
 void RasterizerVulkan::TickFrame() {
+    if (VideoCommon::Nx2LazyUntrack::Enabled()) {
+        VideoCommon::Nx2LazyUntrack::Get().Tick();
+    }
     if (draw_record) [[unlikely]] {
         draw_record->EndFrame();
     }

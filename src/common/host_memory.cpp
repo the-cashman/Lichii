@@ -77,6 +77,44 @@ static int memfd_create(const char* name, unsigned int flags) {
 }
 #endif
 
+#if defined(__linux__)
+#include <chrono>
+#include <pthread.h>
+// EDEN_NX2_PROTECT_STATS=1: per thread, mprotect calls that take write access away
+// ("protect") or give it back ("unprotect"), their pages and wall time, logged every 10 s.
+namespace Common::ProtectStats {
+inline const bool enabled = std::getenv("EDEN_NX2_PROTECT_STATS") != nullptr;
+struct PerThread {
+    u64 calls[2]{};
+    u64 bytes[2]{};
+    u64 ns[2]{};
+    std::chrono::steady_clock::time_point last{std::chrono::steady_clock::now()};
+};
+inline void Note(bool unprotect, size_t length, std::chrono::steady_clock::duration took) {
+    thread_local PerThread t;
+    const int k = unprotect ? 1 : 0;
+    ++t.calls[k];
+    t.bytes[k] += length;
+    t.ns[k] += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(took).count());
+    const auto now = std::chrono::steady_clock::now();
+    if (now - t.last < std::chrono::seconds{10}) {
+        return;
+    }
+    const double s = std::chrono::duration<double>(now - t.last).count();
+    char name[32]{};
+    pthread_getname_np(pthread_self(), name, sizeof(name));
+    LOG_INFO(Common_Memory,
+             "nx2 protect stats {}: per s protect {:.0f} calls {:.0f} pages {:.0f} us, unprotect "
+             "{:.0f} calls {:.0f} pages {:.0f} us",
+             name, t.calls[0] / s, t.bytes[0] / 4096.0 / s, t.ns[0] / 1e3 / s, t.calls[1] / s,
+             t.bytes[1] / 4096.0 / s, t.ns[1] / 1e3 / s);
+    t = PerThread{};
+    t.last = now;
+}
+} // namespace Common::ProtectStats
+
+#endif
+
 namespace Common {
 
 thread_local HostMemory::AllocationTestControl* HostMemory::allocation_test_control{};
@@ -832,6 +870,13 @@ public:
             flags |= PROT_EXEC;
         }
 #endif
+        if (ProtectStats::enabled) [[unlikely]] {
+            const auto start = std::chrono::steady_clock::now();
+            int ret = mprotect(virtual_base + virtual_offset, length, flags);
+            ASSERT_MSG(ret == 0, "mprotect failed: {}", strerror(errno));
+            ProtectStats::Note(write, length, std::chrono::steady_clock::now() - start);
+            return;
+        }
         int ret = mprotect(virtual_base + virtual_offset, length, flags);
         ASSERT_MSG(ret == 0, "mprotect failed: {}", strerror(errno));
     }
