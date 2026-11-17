@@ -14,6 +14,10 @@
 #include <optional>
 #include <utility>
 
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
+
 #include "common/assert.h"
 #include "common/nx2_ab.h"
 #include "common/scope_exit.h"
@@ -234,9 +238,31 @@ struct GPU::Impl {
     /// Returns once the request of `fence` ran, or once the GPU threads stopped for good
     /// (NotifyShutdown): then it never runs.
     void WaitForSyncOperation(const u64 fence) {
+        if (current_sync_fence.load(std::memory_order_acquire) >= fence ||
+            sync_requests_dropped.load(std::memory_order_acquire)) {
+            return;
+        }
+        // Lichii #2268: re-check the fence for a few microseconds before sleeping on the condition
+        // variable. EDEN_NX2_SYNC_SPIN=1 turns it on (off by default here).
+        static const bool sync_spin = [] {
+            const char* value = std::getenv("EDEN_NX2_SYNC_SPIN");
+            return value != nullptr && value[0] == '1';
+        }();
+        for (int i = 0; sync_spin && i < 200; ++i) {
+#if defined(_M_X64) || defined(__x86_64__)
+            _mm_pause();
+#else
+            std::this_thread::yield();
+#endif
+            if (current_sync_fence.load(std::memory_order_acquire) >= fence ||
+                sync_requests_dropped.load(std::memory_order_acquire)) {
+                return;
+            }
+        }
         std::unique_lock lck{sync_request_mutex};
         sync_request_cv.wait(lck, [this, fence] {
-            return CurrentSyncRequestFence() >= fence || sync_requests_dropped;
+            return current_sync_fence.load(std::memory_order_acquire) >= fence ||
+                   sync_requests_dropped.load(std::memory_order_acquire);
         });
     }
 
@@ -332,7 +358,7 @@ struct GPU::Impl {
             // may refer to their waiters' frames, and release the waiters.
             std::scoped_lock requests_lock{sync_request_mutex};
             sync_requests.clear();
-            sync_requests_dropped = true;
+            sync_requests_dropped.store(true, std::memory_order_release);
         }
         sync_request_cv.notify_all();
         std::unique_lock lk{sync_mutex};
@@ -654,7 +680,9 @@ struct GPU::Impl {
     std::mutex sync_request_mutex;
     std::condition_variable sync_request_cv;
     /// The GPU threads stopped and the requests were dropped (NotifyShutdown, under the mutex).
-    bool sync_requests_dropped{};
+    /// Atomic: the fence wait checks it before taking the mutex (the pause loop), and that check
+    /// is the only way a waiter notices a shutdown while it spins.
+    std::atomic<bool> sync_requests_dropped{};
 
     /// InvalidateGPUCache: the writes it gathered and is applying, on each thread doing so.
     std::vector<const std::vector<std::pair<DAddr, u64>>*> applying_writes;
