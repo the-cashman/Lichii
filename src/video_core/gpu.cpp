@@ -30,6 +30,7 @@
 #include "video_core/control/channel_state.h"
 #include "video_core/control/scheduler.h"
 #include "video_core/dma_pusher.h"
+#include "common/nx2_frame_log.h"
 #include "video_core/due_composites.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/engines/kepler_compute.h"
@@ -551,15 +552,18 @@ struct GPU::Impl {
                 free_swap_counters.pop_front();
             }
         }
+        // EDEN_NX2_FRAME_LOG: the guest frame this present belongs to (0 when off).
+        const u64 log_frame = Common::Nx2FrameLog::CurrentPresent();
         pending_composite_fence = RequestSyncOperation(
             [this, current_request_counter, num_fences, composite_layers = std::move(layers),
-             composite_fences = std::move(fences)] {
+             composite_fences = std::move(fences), log_frame] {
                 if (num_fences == 0) {
-                    CompositeOnOwner(composite_layers);
+                    CompositeOnOwner(composite_layers, log_frame);
                     return;
                 }
                 auto& syncpoint_manager = system.Host1x().GetSyncpointManager();
-                const auto executer = [this, current_request_counter, composite_layers]() {
+                const auto executer = [this, current_request_counter, composite_layers,
+                                       log_frame]() {
                     {
                         std::unique_lock<std::mutex> lk(request_swap_mutex);
                         if (--request_swap_counters[current_request_counter] != 0) {
@@ -567,7 +571,7 @@ struct GPU::Impl {
                         }
                         free_swap_counters.push_back(current_request_counter);
                     }
-                    CompositeOnOwner(composite_layers);
+                    CompositeOnOwner(composite_layers, log_frame);
                 };
                 for (size_t i = 0; i < num_fences; i++) {
                     syncpoint_manager.RegisterGuestAction(composite_fences[i].id,
@@ -579,9 +583,28 @@ struct GPU::Impl {
 
     /// A present whose fences were all reached, on the thread that reached the last one. Every
     /// present goes through due_composites, so none overtakes one queued for the owner.
-    void CompositeOnOwner(const VideoCommon::DueComposites::Layers& layers) {
+    void CompositeOnOwner(const VideoCommon::DueComposites::Layers& layers, u64 log_frame = 0) {
+        if (log_frame != 0) {
+            const u64 now = Common::Nx2FrameLog::Now();
+            const bool owner = VideoCommon::GpuSplit::OwnsScheduler();
+            Common::Nx2FrameLog::StampAt(log_frame, Common::Nx2FrameLog::Stage::Reached, now);
+            Common::Nx2FrameLog::Event(Common::Nx2FrameLog::EventKind::Reached, now,
+                                       (log_frame << 1) | (owner ? 1 : 0));
+        }
         const auto composite = [this](const VideoCommon::DueComposites::Layers& due) {
+            const u64 frame = due_composites.RunningTag();
+            if (frame != 0) {
+                auto& split = VideoCommon::GpuSplit::Get();
+                const u64 front_ns =
+                    VideoCommon::GpuSplit::OnBackThread()
+                        ? Common::Nx2FrameLog::PublishTimeOf(split.BackEntryPosition())
+                        : 0;
+                Common::Nx2FrameLog::BeginComposite(frame, front_ns);
+            }
             renderer->Composite(due);
+            if (frame != 0) {
+                Common::Nx2FrameLog::EndComposite();
+            }
             // EDEN_NX2_AB_PERIOD: arms flip between frames, on the owner after the composite.
             Common::Nx2Ab::OnFrame();
         };
@@ -591,7 +614,7 @@ struct GPU::Impl {
             layers, VideoCommon::GpuSplit::OwnsScheduler(), composite, [this, composite] {
                 (void)RequestSyncOperation([this, composite] { due_composites.Run(composite); });
                 gpu_thread.TickGPU(true);
-            });
+            }, log_frame);
     }
 
     void WaitForComposite() {

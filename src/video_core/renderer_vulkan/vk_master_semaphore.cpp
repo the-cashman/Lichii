@@ -3,6 +3,7 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <thread>
 
 #include <ranges>
@@ -131,6 +132,20 @@ void MasterSemaphore::Wait(u64 tick) {
     }
 
     Refresh();
+}
+
+bool MasterSemaphore::WaitTick(u64 tick, u64 timeout_ns) {
+    if (!semaphore) {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::nanoseconds{timeout_ns};
+        while (gpu_tick.load(std::memory_order_acquire) < tick) {
+            if (std::chrono::steady_clock::now() >= until) {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds{100});
+        }
+        return true;
+    }
+    return semaphore.Wait(tick, timeout_ns);
 }
 
 VkResult MasterSemaphore::SubmitQueue(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,

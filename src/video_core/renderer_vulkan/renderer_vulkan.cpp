@@ -15,6 +15,7 @@
 
 #include "common/display_hdr.h"
 #include "common/logging.h"
+#include "common/nx2_frame_log.h"
 #include <ranges>
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -227,6 +228,9 @@ try
     , frame_gen(memory_allocator, scheduler)
 #endif
 {
+    if (Common::Nx2FrameLog::Enabled()) {
+        frame_log_gpu = std::make_unique<FrameLogGpuWaiter>(scheduler.GetMasterSemaphore());
+    }
 
     if (Settings::values.renderer_force_max_clock.GetValue() && device.ShouldBoostClocks()) {
         turbo_mode.emplace(instance, dld);
@@ -355,7 +359,20 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     if (const auto mark = scheduler.NextFrameMark(); mark != Scheduler::FrameMark::None) {
         scheduler.MarkFrameEnd(++trace_frame, mark);
     }
-    scheduler.Flush(*frame->render_ready);
+    // EDEN_NX2_FRAME_LOG: the worker stamps its submission of this frame, the waiter its GPU tick,
+    // the present manager its present.
+    const u64 log_frame = Common::Nx2FrameLog::CompositeFrame();
+    if (log_frame != 0) {
+        scheduler.MarkFrameLog(log_frame);
+    }
+    const u64 frame_tick = scheduler.Flush(*frame->render_ready);
+    frame->frame_log_id = log_frame;
+    if (log_frame != 0) {
+        Common::Nx2FrameLog::Recorded(log_frame, frame_tick);
+        if (frame_log_gpu) {
+            frame_log_gpu->Push(log_frame, frame_tick);
+        }
+    }
 #ifdef EGLANTINE_STREAMLINE
     {
         const Streamline::FrameGenFrame ended = Streamline::FrameGenEndFrame();

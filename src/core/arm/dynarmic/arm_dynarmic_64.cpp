@@ -9,6 +9,7 @@
 #if defined(_M_X64) || defined(__x86_64__)
 #include <immintrin.h>
 #endif
+#include "common/nx2_frame_log.h"
 #include "common/settings.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
@@ -20,6 +21,11 @@
 #include "core/hle/kernel/nx2_thread_stats.h"
 #include "dynarmic/interface/A64/config.h"
 #include "video_core/nx2_stutter_trace.h"
+
+#ifdef ARCHITECTURE_x86_64
+// dynarmic's x64 backend (emit_x64.cpp): blocks compiled so far, for EDEN_NX2_FRAME_LOG.
+extern std::atomic<std::uint64_t> dynarmic_blocks_compiled;
+#endif
 
 namespace Core {
 
@@ -661,6 +667,10 @@ ArmDynarmic64::ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProc
 {
     auto& page_table = process->GetPageTable().GetBasePageTable();
     auto& page_table_impl = page_table.GetImpl();
+#ifdef ARCHITECTURE_x86_64
+    Common::Nx2FrameLog::SetCounterSource(Common::Nx2FrameLog::Counter::JitBlocks,
+                                          &::dynarmic_blocks_compiled);
+#endif
     MakeJit(&page_table_impl, page_table.GetAddressSpaceWidth());
 }
 

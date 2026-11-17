@@ -54,6 +54,8 @@ add_library(
     nx2_sampler.h
     nx2_address_wait.cpp
     nx2_address_wait.h
+    nx2_frame_log.cpp
+    nx2_frame_log.h
     nx2_ab.cpp
     nx2_ab.h
     nx2_huge_pages.cpp

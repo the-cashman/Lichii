@@ -8,6 +8,7 @@
 
 #include "common/display_hdr.h"
 #include "common/dkb_frame_trace.h"
+#include "common/nx2_frame_log.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/thread.h"
@@ -258,6 +259,7 @@ Frame* PresentManager::GetRenderFrame() {
     blocked_time.fetch_add((std::chrono::steady_clock::now() - waiting).count(),
                            std::memory_order_relaxed);
     frame->present_done.Reset();
+    frame->frame_log_id = 0;
     frame->color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     frame->present_spacing = {};
     frame->game_frame_presents = 1;
@@ -796,6 +798,9 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     }
 #endif
     swapchain.Present(render_semaphore);
+    if (frame->frame_log_id != 0) [[unlikely]] {
+        Common::Nx2FrameLog::Stamp(frame->frame_log_id, Common::Nx2FrameLog::Stage::Presented);
+    }
 #ifdef EGLANTINE_STREAMLINE
     if (frame->frame_gen) {
         Streamline::FrameGenAfterPresent(frame->frame_gen_frame.index);

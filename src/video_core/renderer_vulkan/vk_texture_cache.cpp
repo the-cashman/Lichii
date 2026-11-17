@@ -20,6 +20,7 @@
 #include <vector>
 #include <boost/container/small_vector.hpp>
 #include "common/alignment.h"
+#include "common/nx2_frame_log.h"
 #include "common/bit_util.h"
 #include "common/div_ceil.h"
 #include "common/literals.h"
@@ -3680,6 +3681,9 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
                                    SparseTilesModeOf(runtime_.device) == SparseTilesMode::Aliased,
                                true)),
       aspect_mask(ImageAspectMask(info.format)) {
+    if (Common::Nx2FrameLog::Enabled()) [[unlikely]] {
+        Common::Nx2FrameLog::Count(Common::Nx2FrameLog::Counter::Images);
+    }
     if (OutOfMemory()) {
         return;
     }

@@ -50,6 +50,7 @@ struct Frame {
     std::chrono::nanoseconds present_spacing{};
     /// The presents that show this frame's game frame: 1 plus the frames generated for it.
     u32 game_frame_presents{1};
+    u64 frame_log_id{}; ///< EDEN_NX2_FRAME_LOG frame shown (0: none)
 #ifdef EGLANTINE_STREAMLINE
     // DLSS Frame Generation: the guest frame presented and where the guest image is in the frame.
     bool frame_gen{};

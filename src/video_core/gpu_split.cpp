@@ -24,6 +24,7 @@
 
 #include "common/dkb_cpu_trace.h"
 #include "common/logging.h"
+#include "common/nx2_frame_log.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
@@ -450,6 +451,9 @@ void GpuSplit::Publish() {
     published_local = write_position;
     publish_every = std::min<size_t>(publish_every * 2, PublishEvery);
     published.store(write_position, std::memory_order_seq_cst);
+    if (Common::Nx2FrameLog::Enabled()) [[unlikely]] {
+        Common::Nx2FrameLog::NotePublish(write_position);
+    }
     // Taken back here: the publishes until the back runs again don't wake it once more each.
     if (back_waiting.load(std::memory_order_seq_cst) &&
         back_waiting.exchange(false, std::memory_order_seq_cst)) {
@@ -1383,7 +1387,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     // Counts across batches, so a stream of short batches still checks hook requests.
     u32 entries = 0;
     const bool idle_trace = BackIdleTrace::Enabled();
+    const bool frame_log = Common::Nx2FrameLog::Enabled();
     u64 idle_since = 0;
+    u64 log_idle_since = 0; ///< EDEN_NX2_FRAME_LOG: the back idles since (0: busy)
     while (!stop_token.stop_requested()) {
         if (Nx2Profile::Report("GPU back thread", true)) [[unlikely]] {
             ReportCalls();
@@ -1394,6 +1400,11 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
             if (idle_trace && idle_since == 0) {
                 idle_since = BackIdleTrace::Now();
+            }
+            if (frame_log && log_idle_since == 0) [[unlikely]] {
+                log_idle_since = Common::Nx2FrameLog::Now();
+                Common::Nx2FrameLog::Event(Common::Nx2FrameLog::EventKind::BackIdle,
+                                           log_idle_since, 1);
             }
             back_idle.store(true, std::memory_order_relaxed);
             const auto spin_start = g_acquire_counting ? std::chrono::steady_clock::now()
@@ -1447,6 +1458,13 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             BackIdleTrace::NoteBackIdle(idle_since, BackIdleTrace::Now());
             idle_since = 0;
         }
+        if (log_idle_since != 0) [[unlikely]] {
+            const u64 now = Common::Nx2FrameLog::Now();
+            Common::Nx2FrameLog::Count(Common::Nx2FrameLog::Counter::BackIdleNs,
+                                       now - log_idle_since);
+            Common::Nx2FrameLog::Event(Common::Nx2FrameLog::EventKind::BackIdle, now, 0);
+            log_idle_since = 0;
+        }
         if (back_idle.load(std::memory_order_relaxed)) {
             back_idle.store(false, std::memory_order_relaxed);
         }
@@ -1468,6 +1486,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                     prefetched += 8;
                     PrefetchRingLine(&ring[prefetched & RingMask]);
                 }
+            }
+            if (frame_log) [[unlikely]] {
+                back_entry_position = read_position;
             }
             const size_t size =
                 Execute(&ring[index], std::min<u64>(available - read_position, RingWords - index));

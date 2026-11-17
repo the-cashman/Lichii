@@ -55,9 +55,26 @@ FrontState SwapFrontState(FrontState state) {
     const FrontState previous = front_state;
     if (state != previous) {
         front_state = state;
-        const u64 index = head.load(std::memory_order_relaxed);
-        ring[index % RingSize].store(Pack(Now(), state), std::memory_order_relaxed);
-        head.store(index + 1, std::memory_order_release);
+        if (Enabled()) {
+            const u64 index = head.load(std::memory_order_relaxed);
+            ring[index % RingSize].store(Pack(Now(), state), std::memory_order_relaxed);
+            head.store(index + 1, std::memory_order_release);
+        }
+        if (Common::Nx2FrameLog::Enabled()) {
+            // Time in the state just left, and the change itself.
+            static u64 since = 0;
+            const u64 now = Common::Nx2FrameLog::Now();
+            if (since != 0 && static_cast<size_t>(previous) < 6) {
+                Common::Nx2FrameLog::Count(
+                    static_cast<Common::Nx2FrameLog::Counter>(
+                        static_cast<u32>(Common::Nx2FrameLog::Counter::FrontParseNs) +
+                        static_cast<u32>(previous)),
+                    now - since);
+            }
+            since = now;
+            Common::Nx2FrameLog::Event(Common::Nx2FrameLog::EventKind::FrontState, now,
+                                       static_cast<u64>(state));
+        }
     }
     return previous;
 }

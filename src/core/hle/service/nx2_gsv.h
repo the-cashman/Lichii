@@ -31,6 +31,7 @@
 #include "common/display_hdr.h"
 #include "common/div_ceil.h"
 #include "common/dkb_frame_trace.h"
+#include "common/nx2_frame_log.h"
 #include "common/game_presets.h"
 #include "common/memory_detect.h"
 #include "common/scope_exit.h"
@@ -2071,9 +2072,34 @@ private:
     // 229(u64 client token, u32 slot, u32 image, ...fences): result, u64 mask of buffer slots the
     // client may acquire next, four zero words. Nothing is shown yet; every slot is handed back
     // at once (changes.patch's default mask is 0x7fff).
+    // EDEN_NX2_FRAME_LOG: each thread of the presenting process with its kernel CPU time (ticks
+    // while scheduled; the idle thread, so the idle spin, isn't any thread's time).
+    void SampleGuestThreads(HLERequestContext& ctx, u64 log_frame) {
+        Kernel::KThread& caller = ctx.GetThread();
+        Kernel::KProcess* const process = caller.GetOwnerProcess();
+        if (process == nullptr) {
+            return;
+        }
+        const u64 ns = Common::Nx2FrameLog::Now();
+        const u64 cntpct = system.CoreTiming().GetClockTicks();
+        Kernel::KScopedLightLock lk(process->GetListLock());
+        for (auto& thread : process->GetThreadList()) {
+            Common::Nx2FrameLog::ThreadSample(log_frame, ns, cntpct, thread.GetThreadId(),
+                                              thread.GetPriority(), thread.GetActiveCore(),
+                                              thread.GetCpuTime(), &thread == &caller);
+        }
+    }
+
     void PresentClientBuffer(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
         ++m_presents;
+        // EDEN_NX2_FRAME_LOG: a frame id for this present (0 when off).
+        const u64 log_frame =
+            Common::Nx2FrameLog::Enabled() ? Common::Nx2FrameLog::BeginPresent() : 0;
+        if (log_frame != 0 && Common::Nx2FrameLog::ThreadSampleInterval() != 0 &&
+            log_frame % Common::Nx2FrameLog::ThreadSampleInterval() == 0) [[unlikely]] {
+            SampleGuestThreads(ctx, log_frame);
+        }
         if (Kernel::Nx2ThreadStats::g_enabled) {
             Kernel::Nx2ThreadStats::OnPresent(&ctx.GetThread());
         }
@@ -2143,10 +2169,16 @@ private:
         m_previous_fence_id = ~w[22];
         m_previous_fence_value = w[24];
         const auto waited = std::chrono::steady_clock::now();
+        if (log_frame != 0) {
+            Common::Nx2FrameLog::Stamp(log_frame, Common::Nx2FrameLog::Stage::Fence);
+        }
         Composite(w[5], ~w[22], w[24], w[7], w[8]);
         const auto composited = std::chrono::steady_clock::now();
         PaceToVblank(w[12], ctx.GetThread().GetOwnerProcess());
         const auto paced = std::chrono::steady_clock::now();
+        if (log_frame != 0) {
+            Common::Nx2FrameLog::Stamp(log_frame, Common::Nx2FrameLog::Stage::Return);
+        }
         if (const u32 recorder = w[18] & 0xf; recorder != 0) {
             m_recorded_ticks[recorder - 1] = system.CoreTiming().GetClockTicks();
         }
@@ -3215,6 +3247,9 @@ private:
                     s64 scheduled,
                     std::chrono::nanoseconds late) -> std::optional<std::chrono::nanoseconds> {
                     std::scoped_lock lk{vsync_state->mutex};
+                    if (Common::Nx2FrameLog::Enabled()) [[unlikely]] {
+                        Common::Nx2FrameLog::OnVsync();
+                    }
                     for (auto* vsync : vsync_state->events) {
                         vsync->Signal(kernel);
                     }

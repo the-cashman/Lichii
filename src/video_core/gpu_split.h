@@ -409,6 +409,10 @@ public:
 
     /// Makes what was sent visible to the back.
     void Publish();
+    /// Back, with EDEN_NX2_FRAME_LOG: ring position of the entry the back is executing.
+    [[nodiscard]] u64 BackEntryPosition() const {
+        return back_entry_position;
+    }
     /// EDEN_NX2_PUBLISH_WAITS: before the front yields or sleeps, sends the held-back work and
     /// publishes, so the back doesn't idle on work the front already decoded.
     void PublishBeforeWait() {
@@ -926,6 +930,7 @@ private:
     u64 pending_write_count{};
     u64 last_sync_position{};
     u64 published_local{};
+    u64 back_entry_position{}; ///< back only, with EDEN_NX2_FRAME_LOG
     u64 consumed_cache{};
     /// Words between publishes: small right after a drain, while the back has nothing to do.
     size_t publish_every{PublishEvery};

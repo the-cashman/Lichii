@@ -232,6 +232,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_command_pool.h
     renderer_vulkan/vk_compute_pass.cpp
     renderer_vulkan/vk_compute_pass.h
+    renderer_vulkan/vk_frame_log.cpp
+    renderer_vulkan/vk_frame_log.h
     renderer_vulkan/vk_fsr3_upscaler.cpp
     renderer_vulkan/vk_fsr3_upscaler.h
     renderer_vulkan/vk_fsr4_upscaler.cpp

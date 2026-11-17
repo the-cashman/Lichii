@@ -22,6 +22,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include "common/nx2_frame_log.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 
@@ -832,6 +833,9 @@ public:
             flags |= PROT_EXEC;
         }
 #endif
+        if (Common::Nx2FrameLog::Enabled()) [[unlikely]] {
+            Common::Nx2FrameLog::Count(Common::Nx2FrameLog::Counter::Mprotect);
+        }
         int ret = mprotect(virtual_base + virtual_offset, length, flags);
         ASSERT_MSG(ret == 0, "mprotect failed: {}", strerror(errno));
     }
@@ -964,6 +968,9 @@ private:
                 void* ret = mmap(address, size, page.prot, MAP_SHARED | MAP_FIXED, fd, off_t(page.host_offset));
                 ASSERT_MSG(ret != MAP_FAILED, "mmap: {}", strerror(errno));
             } else {
+                if (Common::Nx2FrameLog::Enabled()) [[unlikely]] {
+                    Common::Nx2FrameLog::Count(Common::Nx2FrameLog::Counter::Mprotect);
+                }
                 int ret = mprotect(address, size, page.prot);
                 ASSERT_MSG(ret == 0, "mprotect failed: {}", strerror(errno));
             }

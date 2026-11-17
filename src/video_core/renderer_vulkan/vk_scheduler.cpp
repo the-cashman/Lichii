@@ -20,6 +20,7 @@
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 
 #include "common/logging.h"
+#include "common/nx2_frame_log.h"
 #include "common/settings.h"
 #include "common/dkb_cpu_trace.h"
 #include "common/thread.h"
@@ -379,6 +380,10 @@ Scheduler::FrameMark Scheduler::NextFrameMark() {
         return FrameMark::None;
     }
     return marks == 2 ? FrameMark::Start : FrameMark::End;
+}
+
+void Scheduler::MarkFrameLog(u64 frame) {
+    Record([this, frame](vk::CommandBuffer) { frame_log_mark = frame; });
 }
 
 void Scheduler::MarkFrameEnd(u64 frame, FrameMark mark) {
@@ -1317,6 +1322,10 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         default:
             vk::Check(result);
             break;
+        }
+        if (frame_log_mark != 0) [[unlikely]] {
+            Common::Nx2FrameLog::Stamp(frame_log_mark, Common::Nx2FrameLog::Stage::Submitted);
+            frame_log_mark = 0;
         }
         if (trace_frame_end != 0) {
             if (trace_gpu_sampling) {
