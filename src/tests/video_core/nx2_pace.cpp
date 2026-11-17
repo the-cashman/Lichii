@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include "video_core/nx2_pace.h"
@@ -65,30 +67,34 @@ TEST_CASE("A long gap restarts the grid", "[nx2_pace]") {
     REQUIRE(Since(slot.release) == 500 * Ms);
 }
 
-TEST_CASE("The rate controller slows down when late and speeds up with headroom", "[nx2_pace]") {
+TEST_CASE("The rate controller backs off below where it saturated and probes slowly",
+          "[nx2_pace]") {
     RateController controller;
     s64 interval = 1'000'000'000 / 60;
     s64 t = 0;
-    // 10 % late presents: 4 % slower after the first second.
-    std::optional<RateController::Decision> decision;
-    for (int i = 0; !decision; ++i, t += interval) {
-        decision = controller.Add(At(t), i % 10 == 0 ? -Ms : Ms, interval, 50.0, 120.0);
-    }
-    REQUIRE(decision->changed);
-    REQUIRE(decision->interval_ns > interval);
-    interval = decision->interval_ns;
-    // Then lots of slack: no speed-up for three windows, then 2 % faster each window.
-    int changes = 0;
-    for (int i = 0; i < 60 * 6; ++i, t += interval) {
-        if (const auto d = controller.Add(At(t), interval / 2, interval, 50.0, 120.0);
-            d && d->changed) {
-            REQUIRE(d->interval_ns < interval);
+    // The pipeline holds 55 Hz: faster rates make every present late.
+    constexpr double capacity = 55.0;
+    double max_seen_after_saturation = 0.0;
+    int saturations = 0;
+    for (int i = 0; i < 60 * 120; ++i, t += interval) {
+        const double hz = 1e9 / static_cast<double>(interval);
+        const s64 slack = hz > capacity ? -Ms : 10 * Ms;
+        if (const auto d = controller.Add(At(t), slack, interval, 50.0, 120.0); d) {
+            if (d->late_share > 0.03) {
+                ++saturations;
+                REQUIRE(d->interval_ns > interval);
+            }
             interval = d->interval_ns;
-            ++changes;
+            if (saturations > 0 && i > 60 * 20) {
+                max_seen_after_saturation = std::max(max_seen_after_saturation, 1e9 / interval);
+            }
         }
     }
-    REQUIRE(changes >= 2);
-    REQUIRE(changes <= 5);
+    // Starts at 60 (late), drops below 55 and stays near it: few re-saturations in 2 minutes.
+    REQUIRE(saturations >= 1);
+    REQUIRE(saturations <= 5);
+    REQUIRE(max_seen_after_saturation < 55.5);
+    REQUIRE(1e9 / interval > 52.0);
 }
 
 TEST_CASE("The rate controller stays within its range", "[nx2_pace]") {

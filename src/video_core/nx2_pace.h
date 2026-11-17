@@ -116,10 +116,13 @@ inline bool HoldsPresents() {
 }
 
 /**
- * Chooses the pace rate from the game's slack at its present deadline: the time it had left
- * before the deadline (negative when it arrived late). Once a second: more than 3 % late ->
- * 4 % slower; under 0.5 % late, the 10th percentile of the slack above 10 % of the interval and
- * no slow-down for 3 s -> 2 % faster. Pure; the caller supplies the clock.
+ * Chooses the pace rate from the game's presents: late ones (after their deadline) mark the rate
+ * the pipeline can't hold. Measured: the game's slack at the deadline is no gradient (the GPU
+ * thread, not the game, limits the village; the game presents ~17 ms early until the pipeline
+ * saturates, then every present is late), so the rate probes upward slowly and remembers where it
+ * saturated. Once a second: more than 3 % late -> ceiling = this rate, 5 % slower, no rise for
+ * 5 s; otherwise (under 0.5 % late) 2 % faster up to 97 % of the ceiling, 0.05 % up to it and
+ * 0.5 % past it. Pure; the caller supplies the clock.
  */
 class RateController {
 public:
@@ -135,6 +138,7 @@ public:
                                 double min_hz, double max_hz) {
         if (window_start == Clock::time_point{}) {
             window_start = now;
+            ceiling_hz = max_hz;
         }
         slacks.push_back(slack_ns);
         if (now - window_start < std::chrono::seconds(1) || slacks.size() < 20) {
@@ -149,25 +153,34 @@ public:
         const s64 p10_slack = *p10;
         slacks.clear();
         window_start = now;
-        ++windows_since_down;
 
-        s64 next = interval_ns;
+        const double hz = 1e9 / static_cast<double>(interval_ns);
+        double next = hz;
         if (late_share > 0.03) {
-            next = static_cast<s64>(interval_ns * 1.04);
-            windows_since_down = 0;
-        } else if (late_share < 0.005 && windows_since_down >= 3 &&
-                   p10_slack > interval_ns / 10) {
-            next = static_cast<s64>(interval_ns * 0.98);
+            ceiling_hz = hz;
+            next = hz * 0.95;
+            cooldown = 5;
+        } else if (cooldown > 0) {
+            --cooldown;
+        } else if (late_share < 0.005) {
+            // Quickly back to 97 % of the ceiling, slowly (60 s) toward it, faster past it (the
+            // scene got lighter: the old ceiling held).
+            next = hz < ceiling_hz * 0.97 ? std::min(hz * 1.02, ceiling_hz * 0.97)
+                   : hz < ceiling_hz      ? hz * 1.0005
+                                          : hz * 1.005;
+            ceiling_hz = std::max(ceiling_hz, next);
         }
-        next = std::clamp(next, Detail::HzToNs(max_hz), Detail::HzToNs(min_hz));
-        return Decision{next, next != interval_ns, late_share,
+        next = std::clamp(next, min_hz, max_hz);
+        const s64 next_ns = Detail::HzToNs(next);
+        return Decision{next_ns, next_ns != interval_ns, late_share,
                         static_cast<double>(p10_slack) / 1e6, samples};
     }
 
 private:
     Clock::time_point window_start{};
     std::vector<s64> slacks;
-    u32 windows_since_down{3};
+    double ceiling_hz{};
+    u32 cooldown{};
 };
 
 /// The game's present reached the pacer `slack_ns` before its deadline (negative: late).
