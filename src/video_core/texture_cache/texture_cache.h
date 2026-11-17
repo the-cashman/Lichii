@@ -406,7 +406,11 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             const size_t limit = num_iterations * 8;
             candidates.reserve(limit);
             lru_cache.ForEachItemBelow(last_tick, [&](ImageId image_id) {
-                if (CanEvict(image_id)) {
+                // An image an earlier pass of this run queued for write-back is still registered
+                // and in the LRU, but a write-back this pass queues can flush the batch and
+                // delete it before the loop reaches it: Cleanup would then download a deleted
+                // image ("Missing image at download", then a crash). It goes with the batch.
+                if (!IsPending(image_id) && CanEvict(image_id)) {
                     candidates.push_back(image_id);
                 }
                 return candidates.size() >= limit;
