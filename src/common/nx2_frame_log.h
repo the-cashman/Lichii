@@ -67,6 +67,12 @@ enum class Counter : u32 {
     BackCycles,       ///< GPUBack's own hardware counters (perf_event_open on the thread):
     BackInstructions, ///< cycles, instructions retired, cache misses (user + kernel)
     BackCacheMisses,
+    FrontCycles,      ///< the same for the front (GPU thread)
+    FrontInstructions,
+    FrontCacheMisses,
+    WorkerCycles,     ///< ...and the VulkanWorker
+    WorkerInstructions,
+    WorkerCacheMisses,
     Count,
 };
 
