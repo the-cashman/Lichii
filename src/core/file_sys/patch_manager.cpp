@@ -77,6 +77,11 @@ struct BuiltinPatch {
     std::optional<Settings::NvidiaDlssQuality> dlss_quality{};
     // Lets the game run faster than its console frame rate (KProcess::IsFrameRateUnlocked).
     bool unlocks_frame_rate = false;
+    // Off until checked in Add-Ons (stored as EnabledAddonKey(name)), for game options rather
+    // than fixes.
+    bool off_by_default = false;
+    // Built-ins that patch the same place: the first one applied (in this list's order) wins.
+    std::string_view group{};
 };
 
 // EDEN_NX2_<NAME>: unset or empty gives the default, otherwise on unless it starts with '0'.
@@ -629,6 +634,36 @@ constexpr std::array FPS_UNLOCK_STATES{
     BuiltinPatchState{0x4E9EE00, 0x110},
 };
 
+// Text speed (port of NotRexed/Hookshot#402): main+0xAFE140 steps a text pane's letter
+// animation. At 0xAFE1B4, the start of the letters' block, s0 holds the frame time that moves
+// the letters' clock (+0x60 += rate * time) and counts down pauses (+0x58 -= time); the
+// auto-advance timer before it keeps the game's time. The site branches to a cave that scales
+// s0 (s16 is unused in the function), redoes the displaced ldrh and branches back.
+constexpr size_t TEXT_SPEED_SITE = 0xAFE1B4;
+constexpr size_t TEXT_SPEED_CAVE = 0x3C46F00;
+constexpr std::array<u8, 4> TEXT_SPEED_ORIGINAL{0x69, 0xDE, 0x40, 0x79}; // ldrh w9, [x19, #0x6e]
+constexpr std::array<u8, 4> TEXT_SPEED_BRANCH{0x53, 0x23, 0xC5, 0x14};   // b 0x3C46F00
+// ldr s16, scale ; fmul s0, s0, s16 ; ldrh w9, [x19, #0x6e] ; b 0xAFE1B8 ; scale (float)
+#define TEXT_SPEED_CAVE_CODE                                                                       \
+    0x90, 0x00, 0x00, 0x1C, 0x00, 0x08, 0x30, 0x1E, 0x69, 0xDE, 0x40, 0x79, 0xAB, 0xDC, 0x3A, 0x17
+constexpr std::array<u8, 20> TEXT_SPEED_2X_CAVE{TEXT_SPEED_CAVE_CODE, 0x00, 0x00, 0x00, 0x40};
+constexpr std::array<u8, 20> TEXT_SPEED_4X_CAVE{TEXT_SPEED_CAVE_CODE, 0x00, 0x00, 0x80, 0x40};
+// 1e6: a page at once (a frame per pause), like the game's own skip on A.
+constexpr std::array<u8, 20> TEXT_SPEED_INSTANT_CAVE{TEXT_SPEED_CAVE_CODE, 0x00, 0x24, 0x74, 0x49};
+#undef TEXT_SPEED_CAVE_CODE
+constexpr std::array TEXT_SPEED_2X_RECORDS{
+    BuiltinPatchRecord{TEXT_SPEED_SITE, TEXT_SPEED_BRANCH, TEXT_SPEED_ORIGINAL},
+    BuiltinPatchRecord{TEXT_SPEED_CAVE, TEXT_SPEED_2X_CAVE, {}, true},
+};
+constexpr std::array TEXT_SPEED_4X_RECORDS{
+    BuiltinPatchRecord{TEXT_SPEED_SITE, TEXT_SPEED_BRANCH, TEXT_SPEED_ORIGINAL},
+    BuiltinPatchRecord{TEXT_SPEED_CAVE, TEXT_SPEED_4X_CAVE, {}, true},
+};
+constexpr std::array TEXT_SPEED_INSTANT_RECORDS{
+    BuiltinPatchRecord{TEXT_SPEED_SITE, TEXT_SPEED_BRANCH, TEXT_SPEED_ORIGINAL},
+    BuiltinPatchRecord{TEXT_SPEED_CAVE, TEXT_SPEED_INSTANT_CAVE, {}, true},
+};
+
 constexpr std::array BUILTIN_PATCHES{
     // Ocarina of Time takes its "dynamic resolution disabled" path, so the 3D renders at full scale
     // instead of following the GPU-time controller down to its 480p floor.
@@ -667,7 +702,6 @@ constexpr std::array BUILTIN_PATCHES{
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = DYNAMIC_FPS_RECORDS,
         .states = DYNAMIC_FPS_STATES,
-        .unlocks_frame_rate = true,
     },
     // The NVIDIA DLSS quality lowers Ocarina's render resolution under Max Resolution, since DLSS
     // replaces the game's own 1440p -> 4K upscale and takes whatever the game renders.
@@ -735,7 +769,58 @@ constexpr std::array BUILTIN_PATCHES{
         .records = OOT_SHADOW_RES_RECORDS,
         .env_enabled = OotShadowResEnabled,
     },
+    // Text speed: off until checked in Add-Ons; with more than one checked, the fastest wins.
+    BuiltinPatch{
+        .name = "Text Speed Instant (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = TEXT_SPEED_INSTANT_RECORDS,
+        .off_by_default = true,
+        .group = "Text Speed",
+    },
+    BuiltinPatch{
+        .name = "Text Speed 4x (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = TEXT_SPEED_4X_RECORDS,
+        .off_by_default = true,
+        .group = "Text Speed",
+    },
+    BuiltinPatch{
+        .name = "Text Speed 2x (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = TEXT_SPEED_2X_RECORDS,
+        .off_by_default = true,
+        .group = "Text Speed",
+    },
 };
+
+} // Anonymous namespace
+
+std::string EnabledAddonKey(std::string_view name) {
+    return fmt::format("+{}", name);
+}
+
+std::vector<std::string> StoredDisabledAddons(u64 title_id, std::vector<std::string> unchecked) {
+    for (const auto& patch : BUILTIN_PATCHES) {
+        if (patch.title_id != title_id || !patch.off_by_default) {
+            continue;
+        }
+        const auto it = std::find(unchecked.begin(), unchecked.end(), patch.name);
+        if (it != unchecked.end()) {
+            unchecked.erase(it);
+        } else {
+            unchecked.push_back(EnabledAddonKey(patch.name));
+        }
+    }
+    return unchecked;
+}
+
+namespace {
 
 enum class TitleVersionFormat : u8 {
     ThreeElements, ///< vX.Y.Z
@@ -936,6 +1021,15 @@ std::vector<std::string> PatchManager::GetDisabledAddons() const {
     if (parent_title_id) {
         const auto& shared = Settings::values.disabled_addons[*parent_title_id];
         disabled.insert(disabled.end(), shared.begin(), shared.end());
+    }
+    if (!Settings::values.online_service_redirect.GetValue()) {
+        if (const auto load_dir = GetModificationLoadRoot()) {
+            for (const auto& mod : load_dir->GetSubdirectories()) {
+                if (mod->GetName().starts_with(HostRedirectModPrefix)) {
+                    disabled.push_back(mod->GetName());
+                }
+            }
+        }
     }
     return disabled;
 }
@@ -1138,6 +1232,12 @@ std::vector<VirtualFile> PatchManager::CollectPatches(const std::vector<VirtualD
     for (const auto& subdir : patch_dirs) {
         if (std::find(disabled.cbegin(), disabled.cend(), subdir->GetName()) != disabled.cend())
             continue;
+        if (subdir->GetName().starts_with(HostRedirectModPrefix)) {
+            LOG_WARNING(Loader,
+                        "Host redirect: loading mod \"{}\", which changes how the game checks "
+                        "the servers it connects to",
+                        subdir->GetName());
+        }
 
         auto exefs_dir = FindSubdirectoryCaseless(subdir, "exefs");
         if (exefs_dir != nullptr) {
@@ -1224,17 +1324,29 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
 
     const auto disabled = GetDisabledAddons();
     std::vector<std::string_view> replaced;
+    std::vector<std::string_view> applied_groups;
     std::vector<std::string_view> applied;
     for (const auto& patch : BUILTIN_PATCHES) {
         if (patch.title_id != title_id || patch.module != name) {
             continue;
         }
-        if (std::find(disabled.cbegin(), disabled.cend(), patch.name) != disabled.cend()) {
+        if (patch.off_by_default) {
+            if (std::find(disabled.cbegin(), disabled.cend(), EnabledAddonKey(patch.name)) ==
+                disabled.cend()) {
+                continue;
+            }
+        } else if (std::find(disabled.cbegin(), disabled.cend(), patch.name) != disabled.cend()) {
             LOG_INFO(Loader, "    - Skipping \"{}\": disabled in Add-Ons", patch.name);
             continue;
         }
         if (patch.env_enabled != nullptr && !patch.env_enabled()) {
             LOG_INFO(Loader, "    - Skipping \"{}\": off by its EDEN_NX2_ switch", patch.name);
+            continue;
+        }
+        if (!patch.group.empty() && std::find(applied_groups.cbegin(), applied_groups.cend(),
+                                              patch.group) != applied_groups.cend()) {
+            LOG_INFO(Loader, "    - Skipping \"{}\": another {} built-in is applied", patch.name,
+                     patch.group);
             continue;
         }
         if (std::find(replaced.cbegin(), replaced.cend(), patch.name) != replaced.cend()) {
@@ -1350,6 +1462,9 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         }
         if (patch.dlss_quality) {
             Settings::SetAppliedOcarinaRenderScale(patch.dlss_quality);
+        }
+        if (!patch.group.empty()) {
+            applied_groups.push_back(patch.group);
         }
     }
 
@@ -1936,7 +2051,8 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
             return other.title_id == title_id && other.replaces == patch.name &&
                    !is_disabled(other.name);
         });
-        out.push_back({.enabled = !is_disabled(patch.name),
+        out.push_back({.enabled = patch.off_by_default ? is_disabled(EnabledAddonKey(patch.name))
+                                                       : !is_disabled(patch.name),
                        .name = std::string{patch.name},
                        .version = replacing != BUILTIN_PATCHES.end()
                                       ? fmt::format("IPS, replaced by {} when it applies",
@@ -1945,7 +2061,8 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
                        .type = PatchType::Mod,
                        .program_id = title_id,
                        .title_id = title_id,
-                       .source = PatchSource::Unknown});
+                       .source = PatchSource::Unknown,
+                       .off_by_default = patch.off_by_default});
     }
 
     // DLC

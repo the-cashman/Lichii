@@ -634,6 +634,7 @@ private:
     /// for it: it gets a depth bias towards the far value and depth clamping (see
     /// UpdateDynamicStates).
     bool far_plane_draw{};
+    float depth_bias_slope_scale = 1.0f;
 
     struct IndirectTrace {
         vk::Buffer readback;

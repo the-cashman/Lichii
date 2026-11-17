@@ -1140,10 +1140,14 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
     // index, and one access goes through them: loads take no branch, and stores and atomics take
     // one for an address no buffer holds. Otherwise the access takes one branch per candidate
     // buffer, and every branch merges back so the helper returns once, from its last block.
-    const auto define_body{[&](DefPtr ssbo_member, Id addr, const StorageTypeDefinition& type_def,
-                               u32 shift, Id result_type, Id fallback, Routing routing,
-                               auto&& callback) -> Id {
-        const Id header_label{AddLabel()};
+    // Finds the candidate buffer of `buffers` that holds addr: its descriptor index (~0U when none)
+    // and base
+    struct Route {
+        std::vector<u32> candidates;
+        Id route;
+        Id route_base;
+    };
+    const auto search{[&](Id addr) {
         const u64 ssbo_align_mask{~(profile.min_ssbo_alignment - 1U)};
         const auto base_address{[&](size_t index) {
             const auto& ssbo{info.storage_buffers_descriptors[index]};
@@ -1219,6 +1223,33 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
                 route_base = OpSelect(U64, holds[i], bases[i], route_base);
             }
         }
+        return Route{std::move(candidates), route, route_base};
+    }};
+    // With select_global_memory_buffer every access searches all bound buffers. NVIDIA compiles
+    // that search slowly at each inlined access (#1848: ~1.7 s per OoT compute pipeline), so the
+    // search is one function that is not inlined, and the accesses stay inlined.
+    Id search_function{};
+    const auto define_body{[&](DefPtr ssbo_member, Id addr, const StorageTypeDefinition& type_def,
+                               u32 shift, Id result_type, Id fallback, Routing routing,
+                               auto&& callback) -> Id {
+        const Id header_label{AddLabel()};
+        const bool select{routing != Routing::PerBuffer && profile.select_global_memory_buffer};
+        Route found_route;
+        if (select && ValidId(search_function)) {
+            for (const u32 index : buffers) {
+                if (info.native_global_bounds ||
+                    UsesNvnStorageDescriptor(info, info.storage_buffers_descriptors[index])) {
+                    found_route.candidates.push_back(index);
+                }
+            }
+            const Id result{OpFunctionCall(U32[3], search_function, addr)};
+            found_route.route = OpCompositeExtract(U32[1], result, 0U);
+            found_route.route_base =
+                OpBitcast(U64, OpVectorShuffle(U32[2], result, result, 1U, 2U));
+        } else {
+            found_route = search(addr);
+        }
+        const auto& [candidates, route, route_base] = found_route;
         const bool has_value{result_type.value != void_id.value};
         if (routing != Routing::PerBuffer && profile.select_global_memory_buffer) {
             if (candidates.empty()) {
@@ -1226,18 +1257,18 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
             }
             AddCapability(spv::Capability::VariablePointersStorageBuffer);
             Id ssbo_id{ssbos[candidates[0]].*ssbo_member};
-            Id ssbo_index{zero};
             for (size_t i = 0; i < candidates.size(); ++i) {
                 const Id routed{OpIEqual(U1, route, Const(candidates[i]))};
-                const Id offset{OpUConvert(U32[1], OpISub(U64, addr, route_base))};
                 ssbo_id = OpSelect(type_def.array, routed, ssbos[candidates[i]].*ssbo_member,
                                    ssbo_id);
-                ssbo_index = OpSelect(U32[1], routed,
-                                      OpShiftRightLogical(U32[1], offset, Const(shift)), ssbo_index);
             }
             Decorate(ssbo_id, spv::Decoration::NonUniform);
             non_uniform_ids.insert(ssbo_id.value);
             const Id found{OpINotEqual(U1, route, Const(~0U))};
+            // The offset is the same for every candidate: route_base is the routed buffer's base.
+            const Id offset{OpUConvert(U32[1], OpISub(U64, addr, route_base))};
+            const Id ssbo_index{
+                OpSelect(U32[1], found, OpShiftRightLogical(U32[1], offset, Const(shift)), zero)};
             if (routing == Routing::Load) {
                 // An address no buffer holds reads element 0 of the first one and returns fallback.
                 const Id result{
@@ -1507,6 +1538,18 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         const bool all{route == 0};
         const bool words{!profile.support_descriptor_aliasing &&
                          (use.accesses[1] || use.accesses[2])};
+        if (profile.select_global_memory_buffer) {
+            search_function = OpFunction(U32[3], spv::FunctionControlMask::DontInline,
+                                         TypeFunction(U32[3], U64));
+            const Id addr{OpFunctionParameter(U64)};
+            AddLabel();
+            const Route found{search(addr)};
+            const Id base_words{OpBitcast(U32[2], found.route_base)};
+            OpReturnValue(OpCompositeConstruct(U32[3], found.route,
+                                               OpCompositeExtract(U32[1], base_words, 0U),
+                                               OpCompositeExtract(U32[1], base_words, 1U)));
+            OpFunctionEnd();
+        }
         if (all || use.accesses[0] || words) {
             std::tie(functions->load_u32, functions->write_u32) =
                 define(&StorageDefinitions::U32, storage_types.U32, U32[1], sizeof(u32));

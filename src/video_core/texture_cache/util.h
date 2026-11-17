@@ -106,6 +106,10 @@ struct UnswizzlePlan {
 void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan& plan,
                          std::span<u8> output);
 
+/// Reads one byte of each 4 KiB page of a guest range about to be read in full, on the texture
+/// workers and this thread at once (Windows only, ranges of 1 MiB or more).
+void PrefaultGuestMemory(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, size_t size);
+
 [[nodiscard]] boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(
     Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
     std::span<const u8> input, std::span<u8> output,

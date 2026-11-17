@@ -12,14 +12,10 @@
 /// Starts the frames of a game whose frame rate is unlocked from the host's display instead of a
 /// fixed timer: the presenter reports each frame that reached the display (present wait), and the
 /// nx2:vi2 sessions that asked for it signal their vsync events then. The fixed timer only steps
-/// in while the display reports nothing (Service::TimerVsyncSignals). Only EDEN_NX2_HOST_VSYNC=1
-/// turns it on; otherwise the timer alone.
+/// in while the display reports nothing (Service::TimerVsyncSignals).
 namespace VideoCore::HostVsync {
 
 using Clock = std::chrono::steady_clock;
-
-/// Display-driven vsync is not switched off.
-[[nodiscard]] bool Enabled();
 
 /// The display starts the frames of a listener now (SetPacing).
 [[nodiscard]] bool Active();

@@ -39,7 +39,7 @@ struct StateAccess;
 
 namespace Tegra {
 
-class MemoryManager final {
+class MemoryManager final : public std::enable_shared_from_this<MemoryManager> {
     friend struct ::VideoCommon::GpuTrace::StateAccess;
 
 public:

@@ -6,6 +6,7 @@
 #pragma once
 
 #include <array>
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -55,6 +56,7 @@
 #include "video_core/texture_cache/stale_pages.h"
 #include "video_core/texture_cache/superseded_images.h"
 #include "video_core/texture_cache/types.h"
+#include "video_core/texture_cache/writeback_ranges.h"
 #include "video_core/textures/texture.h"
 #include "video_core/textures/unswizzle_worker.h"
 
@@ -279,6 +281,9 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     /// SparseTiles images: notes a written range, uploaded with the next refresh.
     void MarkRangeWritten(Image& image, DAddr cpu_addr, size_t size);
 
+    /// What a CPU write of [cpu_addr, +size) does to an image over it.
+    void MarkImageWritten(ImageId image_id, Image& image, DAddr cpu_addr, size_t size);
+
     /// SparseTiles images: binds and uploads the parts written since the last upload.
     void RefreshSparseTiles(Image& image);
 
@@ -358,6 +363,13 @@ public:
 
     /// Mark an image as modified from the GPU
     void MarkModification(ImageId id) noexcept;
+
+    /// Mark the image behind a view a shader writes through as a storage image
+    void MarkStorageWrite(ImageViewId id) noexcept;
+
+    /// Whether a view's image is absent or holds a shader's storage writes over every level it
+    /// covers, with nothing newer (no clear, render pass, copy or CPU write since).
+    [[nodiscard]] bool StorageViewHoldsShaderWrites(ImageViewId id) const noexcept;
 
     /// Fill image_view_ids with the graphics/compute images in indices
     void FillImageViews(std::span<ImageViewInOut> views, bool compute, bool blacklist = true);
@@ -502,6 +514,10 @@ public:
     /// UpdateRenderTargets should be called before this
     Framebuffer* GetFramebuffer();
 
+    /// Whether render target `index` was first written in an earlier frame: a target the title
+    /// draws every frame, rather than one it fills once (Eglantine #874).
+    [[nodiscard]] bool ColorTargetWrittenBeforeThisFrame(u32 index) noexcept;
+
     [[nodiscard]] const RenderTargets& GetRenderTargets() const noexcept {
         return render_targets;
     }
@@ -525,6 +541,12 @@ public:
 
     /// Mark images in a range as modified from the CPU
     void WriteMemory(DAddr cpu_addr, size_t size);
+
+    /// After a DMA copy of [src_addr, +size) to [dest_addr, +size) in guest memory: marks the
+    /// images over the destination whose contents guest memory now holds. gpu_written_dest are
+    /// the destination ranges that took buffer cache GPU writes, which guest memory lacks.
+    void WriteDmaCopy(GPUVAddr src_addr, GPUVAddr dest_addr, size_t size,
+                      std::span<const std::pair<DAddr, size_t>> gpu_written_dest);
 
     /// Download contents of host images to guest memory in a region
     void DownloadMemory(DAddr cpu_addr, size_t size);
@@ -800,6 +822,13 @@ private:
     /// Returns true if the current clear's render area and scissor cover a width x height image
     [[nodiscard]] bool ClearCovers(u32 width, u32 height) const;
 
+    /// Whether the current clear writes every byte of a single-level, single-layer 2D image with
+    /// this info at gpu_addr (every channel, the whole image, a target bound at that address)
+    [[nodiscard]] bool ClearWritesWhole(const ImageInfo& info, GPUVAddr gpu_addr) const;
+
+    /// Notes the bound targets the current clear writes whole as loaded at their clear's tick
+    void NoteClearedWhole();
+
     [[nodiscard]] std::pair<u32, u32> PrepareDmaImage(ImageId dst_id, GPUVAddr base_addr,
                                                       bool mark_as_modified);
 
@@ -891,10 +920,129 @@ private:
     /// pages starts without an upload: the upload would only copy stale bytes the GPU overwrites.
     /// Switch 2 titles only: the buffer cache feeds Nx2MayBeGpuWritten for them alone.
     void MarkStale(const ImageBase& image);
+    [[nodiscard]] static u64 OverlapDownloadMaxBytes();
+    [[nodiscard]] bool AsyncOverlapDownloadsEnabled();
+    /// Device byte ranges [begin, end) of a write-back that newer data owns.
+    using KeepRanges = boost::container::small_vector<std::pair<DAddr, DAddr>, 4>;
+    /// Fills `keep` with the image's bytes that newer write-backs (or newer images dropped
+    /// without one) cover, and `keep_ticks` (when given) with the modification tick of each;
+    /// true when they cover all of it.
+    [[nodiscard]] bool OverlapHasNewerData(ImageId image_id, const ImageBase& image,
+                                           KeepRanges& keep,
+                                           WritebackRanges::TickedRanges* keep_ticks = nullptr);
+    /// SwizzleImage through `memory` that leaves the `keep` ranges of guest memory as they were.
+    void SwizzleKeeping(Tegra::MemoryManager& memory, GPUVAddr gpu_addr, const ImageInfo& info,
+                        std::span<const BufferImageCopy> copies, std::span<const u8> data,
+                        const KeepRanges& keep);
+    void NoteOverlapWriteback(const ImageBase& image, bool lost = false);
+    /// The same for the image's contents at modification tick `tick`.
+    void NoteOverlapWriteback(const ImageBase& image, bool lost, u64 tick);
+    /// A noted write-back that was cancelled before it landed: its range stays newer than older
+    /// images, but its data is gone (like an image dropped without one).
+    void NoteWritebackLost(DAddr cpu_addr, u64 size, u64 tick);
+    /// Whether the image's guest memory is the one range at its cpu_addr, which write-backs
+    /// track, keep and note: not sparse, and not a stand-in address for GPU memory without CPU
+    /// backing (ImageCpuAddress; TrackImage skips those the same way).
+    [[nodiscard]] static bool HasGuestRange(const ImageBase& image) noexcept {
+        return False(image.flags & ImageFlagBits::Sparse) && image.cpu_addr < ~(1ULL << 40);
+    }
+    [[nodiscard]] bool WrittenBackAlready(const ImageBase& image) const;
+    /// Calls func(begin, end) for each range of guest memory the image's data is written to: the
+    /// one range at cpu_addr, a sparse image's mapped segments, none for a stand-in address.
+    template <typename Func>
+    void ForEachWrittenRange(const ImageBase& image, Func&& func);
+    /// WritebackRanges::KeepNewerBytes for every write-back waiting for the GPU and every range
+    /// `image` was written to, after it was written to guest memory.
+    void KeepInWaitingWritebacks(const ImageBase& image, u64 tick);
+    /// After a flush wrote `image` to guest memory: write-backs still waiting keep its bytes, and
+    /// later ones see it as newer data (NoteOverlapWriteback), while write-backs are on.
+    void NoteFlushed(const ImageBase& image);
+    /// NoteFlushed for contents staged at modification tick `tick` (asynchronous flushes: the
+    /// image may have been written again since).
+    void NoteFlushed(const ImageBase& image, u64 tick);
+    /// Fills `keep` with the bytes of the image's guest memory that landed write-backs and
+    /// flushes with contents newer than `tick` hold (an asynchronous flush's snapshot leaves them).
+    void KeepNewerLanded(const ImageBase& image, u64 tick, KeepRanges& keep);
+    /// Whether the collector's or joins' write-backs are on (writeback_switches.h).
+    [[nodiscard]] static bool OverlapWritebacksEnabled();
+    u64 join_writeback_reuses{};
+    void WriteBackBadOverlaps(ImageId new_image_id);
+    /// Collector write-backs waiting for the GPU: written to guest
+    /// memory once their command buffer is done, except bytes the guest writes first; dropped if
+    /// the memory is unmapped first. Their pages stay write-tracked meanwhile.
+    struct AsyncOverlapDownload {
+        u64 gpu_tick;
+        GPUVAddr gpu_addr;
+        DAddr cpu_addr;
+        u64 size;
+        ImageInfo info;
+        boost::container::small_vector<BufferImageCopy, 16> copies;
+        decltype(std::declval<Runtime&>().DownloadStagingBuffer(size_t{}, true)) map;
+        bool cancelled;
+        KeepRanges keep{};
+        /// The modification tick of the data each kept range holds instead (newer images', or
+        /// past the cache's tick for the guest's writes).
+        WritebackRanges::TickedRanges keep_ticks{};
+        /// Modification tick of the written-back image's contents.
+        u64 tick{};
+        /// The image's address space: gpu_addr is in it, whichever channel is bound on landing.
+        size_t address_space{};
+    };
+    std::deque<AsyncOverlapDownload> async_overlap_downloads;
+    /// The GPU memory of an address space the cache has seen, or null.
+    [[nodiscard]] std::shared_ptr<Tegra::MemoryManager> AddressSpaceMemory(size_t as_id);
+    void FinishAsyncOverlapDownloads(bool wait_all);
+    /// After a write-back of [cpu_addr, cpu_addr + size) at modification tick `tick` landed,
+    /// waiting or not: images over it the GPU did not write, with contents no newer, load it again.
+    void ReloadUnderLanded(DAddr cpu_addr, u64 size, u64 tick);
+    /// Whether a write-back still waiting covers the image and would reload it when it lands
+    /// (the image has not been GPU-written since that write-back's contents).
+    [[nodiscard]] bool WritebackWouldReload(const ImageBase& image);
+    /// Whether a write-back still waiting writes to [cpu_addr, cpu_addr + size): its GPU data
+    /// is not in guest memory yet.
+    [[nodiscard]] bool WritebackPendingOver(DAddr cpu_addr, u64 size) const;
+    void CancelAsyncOverlapDownloads(DAddr cpu_addr, u64 size);
+    /// The guest wrote [cpu_addr, cpu_addr + size): waiting write-backs keep those bytes (they
+    /// are newer) and still land the rest; one written all over is cancelled.
+    void KeepGuestWrite(DAddr cpu_addr, u64 size);
+    void CancelAsyncOverlapDownloadsGpu(size_t as_id, GPUVAddr gpu_addr, u64 size);
+    u64 async_overlap_cancels{};
+    u64 join_writebacks{};
+    u64 join_writeback_images{};
+    u64 join_writeback_wait_us{};
+    static constexpr u32 OverlapPageBits = 12;
+    /// Per 4 KiB device page: the newest modification tick of a dropped GPU-written overlapping
+    /// image over it (written back or lost), so older ones are not written back over it.
+    std::unordered_map<DAddr, u64> overlap_writeback_ticks;
+    /// The same write-backs by byte range, per page they touch (a few each, CapPageRecords):
+    /// small targets share pages, and a page-wide skip dropped a neighbour's data with them
+    /// (black UI boxes).
+    struct WritebackRange {
+        DAddr begin;
+        DAddr end;
+        u64 tick;
+        bool lost; ///< An image dropped without a write-back: newer, but its data is gone
+    };
+    /// Whether OverlapHasNewerData's last call found a lost image's range among the cover.
+    bool last_cover_lost{};
+    std::unordered_map<DAddr, boost::container::small_vector<WritebackRange, 4>>
+        overlap_writeback_ranges;
+    u64 overlap_partial_keeps{};
+    u64 overlap_download_skips{};
+    u64 overlap_download_batches{};  ///< GC overlap downloads (EDEN_DKB_FRAME_TRACE summary)
+    u64 overlap_download_images{};
+    u64 overlap_download_bytes{};
+    u64 overlap_download_wait_us{};
     void ClearStale(DAddr addr, size_t size);
-    void ClearStaleImage(const ImageBase& image);
-    /// Clears every device range [gpu_addr, gpu_addr + size) maps to.
-    void ClearStaleGpu(GPUVAddr gpu_addr, size_t size);
+    /// The memory manager a downloaded image is written back through (see WriteBackMemory), or
+    /// null when no live address space maps it.
+    std::shared_ptr<Tegra::MemoryManager> WriteBackMemory(const ImageBase& image);
+    /// Swizzles a downloaded image into guest memory through WriteBackMemory's memory manager and
+    /// clears its stale pages. False, writing nothing, when there is none.
+    bool WriteBackImage(const ImageBase& image, std::span<const BufferImageCopy> copies,
+                        std::span<const u8> data, const KeepRanges& keep = {});
+    /// Clears every device range [gpu_addr, gpu_addr + size) maps to in memory.
+    void ClearStaleGpu(Tegra::MemoryManager& memory, GPUVAddr gpu_addr, size_t size);
     StalePages stale_pages;
     u64 tc_stale_skips{};        ///< Uploads skipped (last 600 frames)
     u64 tc_stale_skip_bytes{};
@@ -907,6 +1055,9 @@ private:
     /// True while a clear binds its render targets (UpdateRenderTargets(true)), so JoinImages can
     /// skip the upload of a new target the clear overwrites whole.
     bool clearing_render_targets = false;
+    /// True while a draw binds its render targets (UpdateRenderTargets(false)): only these writes
+    /// set first_written_frame, not blits, copies or DMA.
+    bool drawing_render_targets = false;
     bool is_rescaling = false;
     /// The bound depth target is wider than tall by padding only (see FindDepthBuffer).
     bool depth_target_padded = false;
@@ -979,8 +1130,10 @@ private:
 
     Common::ScratchBuffer<u8> swizzle_data_buffer;
     Common::ScratchBuffer<u8> unswizzle_data_buffer;
-    /// What the last CPU upload spent reading guest memory and untiling it, for EDEN_NX2_TC_TRACE.
+    /// What the last CPU upload spent touching, reading and untiling guest memory, for
+    /// EDEN_NX2_TC_TRACE.
     struct {
+        double prefault_ms{};
         double read_ms{};
         double untile_ms{};
     } upload_trace;

@@ -43,6 +43,7 @@ class MultiRangeBufferCache final {
 public:
     static constexpr VkDeviceSize DEFAULT_BLOCK_SIZE = 64 * 1024;
     static constexpr size_t MAX_RETIRED = 256;
+    static constexpr u64 MAX_UNUSED_FRAMES = 60;
 
     explicit MultiRangeBufferCache(const Device& device);
 
@@ -79,6 +80,7 @@ private:
         VkDeviceSize size{};
         u64 geometry{};
         u64 content{};
+        u64 last_used{};
         bool dirty{true};
     };
 
@@ -102,6 +104,7 @@ private:
     boost::container::small_vector<Retired, MAX_RETIRED> retired;
     u32 sparse_memory_type_bits{};
     VkBufferUsageFlags sparse_usage{};
+    u64 frame{};
 };
 
 } // namespace Vulkan

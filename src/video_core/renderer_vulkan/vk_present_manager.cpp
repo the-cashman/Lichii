@@ -175,7 +175,7 @@ PresentManager::PresentManager(const vk::Instance& instance_,
                          Settings::values.frame_gen.GetValue() ||
                          Tegra::Nx2Pace::HoldsPresents()}
     , present_log{Nx2PresentLog::Create(device_)}
-    , present_wait{device.IsPresentWaitEnabled() && VideoCore::HostVsync::Enabled()}
+    , present_wait{device.IsPresentWaitEnabled()}
 {
     // No frame starter of an earlier boot is left for this presenter.
     VideoCore::HostVsync::Reset();

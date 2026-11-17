@@ -1030,6 +1030,12 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
 
 u32 GraphicsEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
     const auto& cbuf{maxwell3d->state.shader_stages[stage_index].const_buffers[cbuf_index]};
+    // Root tables 1-7 (banks 25-31) are read from an unbound bank 17 at byte 256 and up, which only
+    // the buffer cache streams: a pointer or handle there can't be resolved, so reject the program.
+    if (cbuf_index == 17 && !cbuf.enabled && cbuf_offset >= 256) {
+        throw Shader::RuntimeError("Root table {} offset {:#x} resolves a resource (unsupported)",
+                                   cbuf_offset / 256, cbuf_offset % 256);
+    }
     ASSERT(cbuf.enabled);
     u32 value{};
     if (cbuf_offset < cbuf.size) {
@@ -1151,6 +1157,9 @@ std::optional<u32> ComputeEnvironment::ReadTrapGuardConstant(u32 bank, u32 offse
 
 u32 ComputeEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
     const auto& qmd{kepler_compute->launch_description};
+    if (cbuf_index >= qmd.const_buffer_config.size()) {
+        throw Shader::RuntimeError("Compute program reads constant buffer {}", cbuf_index);
+    }
     ASSERT(((qmd.const_buffer_enable_mask.Value() >> cbuf_index) & 1) != 0);
     const auto& cbuf{qmd.const_buffer_config[cbuf_index]};
     u32 value{};

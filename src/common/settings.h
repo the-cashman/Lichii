@@ -684,7 +684,7 @@ struct Values {
         Specialization::Default};
 
     SwitchableSetting<NativeAsyncDraws> native_async_draws{linkage,
-                                                           NativeAsyncDraws::Wait,
+                                                           NativeAsyncDraws::Bounded,
                                                            "native_async_draws",
                                                            Category::RendererAdvanced,
                                                            Specialization::Default,
@@ -800,7 +800,7 @@ struct Values {
     SwitchableSetting<bool> emulate_bgr565{linkage, false, "emulate_bgr565",
                                             Category::RendererHacks};
 
-    SwitchableSetting<bool> use_asynchronous_shaders{linkage, false, "use_asynchronous_shaders",
+    SwitchableSetting<bool> use_asynchronous_shaders{linkage, true, "use_asynchronous_shaders",
                                                      Category::RendererHacks};
 
     SwitchableSetting<GpuUnswizzleSize> gpu_unswizzle_texture_size{linkage,
@@ -1144,6 +1144,9 @@ struct Values {
                                         Category::Network};
     Setting<std::string> nextendo_client_id{linkage, "nxc_eHeSgpYwMkFV", "nextendo_client_id",
                                            Category::Network};
+    // Profiles missing from the NAND whose Nextendo sign-ins the user chose to keep, comma-separated.
+    Setting<std::string> nextendo_kept_accounts{linkage, std::string(), "nextendo_kept_accounts",
+                                                Category::Network};
     // Host redirect to a server the user runs (core/internal_network/local_redirect.h). Off: the
     // online_redirect_* values are ignored.
     Setting<bool> online_service_redirect{linkage, false, "online_service_redirect",

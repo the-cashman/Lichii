@@ -14,7 +14,9 @@
 #include <tuple>
 #include <optional>
 #include <bit>
+#include <chrono>
 #include <string>
+#include <type_traits>
 #include <utility>
 #if defined(_MSC_VER) && !defined(__clang__) && (defined(_M_X64) || defined(_M_IX86))
 #include <xmmintrin.h>
@@ -26,12 +28,14 @@
 #include "common/memory_detect.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "common/dkb_frame_trace.h"
 #include "common/slot_vector.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/guest_memory.h"
+#include "video_core/texture_cache/writeback_switches.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
@@ -227,6 +231,37 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             EvictionAge(mode_age, min_age, total_used_memory, retention_limit, out_of_memory);
         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);
     };
+    // GPU-written images that overlap others without fitting them (BadOverlap) were dropped
+    // without a download, their pages marked stale. The Duskbloods renders its characters'
+    // small detail maps that way, into regions other images sample: once the sampling image
+    // was made again, the outfit, blade or enemy drew zeros (black) or, before the image
+    // loaded stale pages, leftover host memory (rainbow noise). Download them, all with one
+    // wait, oldest modification first so the newest data wins where they overlap.
+    using DownloadMap = decltype(runtime.DownloadStagingBuffer(size_t{}));
+    struct OverlapDownload {
+        u64 tick;
+        GPUVAddr gpu_addr;
+        DAddr cpu_addr;
+        u64 size;
+        ImageInfo info;
+        boost::container::small_vector<BufferImageCopy, 16> copies;
+        DownloadMap map;
+        KeepRanges keep;
+        WritebackRanges::TickedRanges keep_ticks;
+        size_t address_space;
+    };
+    std::vector<OverlapDownload> overlap_downloads;
+    // Staging maps that release themselves when destroyed (OpenGL) cannot wait in a vector.
+    // Not const, here and below: with OpenGL both would be constant expressions, which the
+    // lambda below must then not capture (-Wunused-lambda-capture), while Vulkan's must be.
+    bool download_overlaps = std::is_trivially_destructible_v<DownloadMap> &&
+                             WritebackSwitches::DuskbloodsDefault();
+    // The collector does not wait for its
+    // write-backs (each wait was 5-10 ms, several a second in combat); they reach guest memory
+    // when the GPU is done with them.
+    bool async_downloads = download_overlaps && AsyncOverlapDownloadsEnabled();
+    KeepRanges keep;
+    WritebackRanges::TickedRanges keep_ticks;
     const auto CanEvict = [this, &high_priority_mode, &aggressive_mode, &evict_old_costly,
                            &evict_bad_overlaps](ImageId image_id,
                                                 bool* out_must_download = nullptr) {
@@ -249,19 +284,18 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     };
     // Images the GPU wrote are downloaded before the collector drops them. Each used to wait for the
     // GPU on its own (Finish per image), so a pass with dozens of them drained the GPU dozens of
-    // times. A pass now records the copies, waits once and swizzles them back in the order they were
+    // times. A pass now records the copies, waits once and writes them back in the order they were
     // queued (the order the writes used to land in), as DownloadMemory does. Such an image stays
-    // registered and tracked until its data is swizzled back, and only then goes: a guest write to
-    // its pages in between waits on the cache's lock and lands after the swizzle, as it did when
+    // registered and tracked until its data is written back, and only then goes: a guest write to
+    // its pages in between waits on the cache's lock and lands after the write-back, as it did when
     // each image was written back on its own. A batch is capped so the staging memory held at once
     // stays bounded; its staging buffers are reserved (deferred) until their swizzle has read them.
     constexpr size_t MaxWriteBackBatchBytes = 64_MiB;
-    using WriteBackMap = decltype(runtime.DownloadStagingBuffer(size_t{}));
     using WriteBackCopies = decltype(FullDownloadCopies(std::declval<const ImageInfo&>()));
     struct PendingWriteBack {
         ImageId image_id;
         WriteBackCopies copies;
-        WriteBackMap map;
+        DownloadMap map;
     };
     boost::container::small_vector<PendingWriteBack, 16> pending_write_backs;
     size_t pending_write_back_bytes = 0;
@@ -270,8 +304,10 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             return entry.image_id == image_id;
         });
     };
+    // `download_queued`: an overlap write-back still reads the image on the GPU.
     const auto RemoveImage = [this, &aggressive_mode, &high_priority_mode,
-                              &evict_bad_overlaps](ImageId image_id, bool must_download) {
+                              &evict_bad_overlaps](ImageId image_id, bool must_download,
+                                                   bool download_queued) {
         auto& image = slot_images[image_id];
         if (True(image.flags & ImageFlagBits::Tracked)) {
             UntrackImage(image, image_id);
@@ -293,7 +329,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
                               : aggressive_mode    ? "gc-aggressive"
                               : high_priority_mode ? "gc-high-priority"
                                                    : "gc";
-        DeleteImage(image_id, image.scale_tick > frame_tick + 5);
+        DeleteImage(image_id, !download_queued && image.scale_tick > frame_tick + 5);
     };
     const auto FlushWriteBacks = [&] {
         if (pending_write_backs.empty()) {
@@ -325,23 +361,39 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         for (PendingWriteBack& entry : pending_write_backs) {
             Image& image = slot_images[entry.image_id];
             bool written_by_cpu;
+            bool written_back = false;
             {
                 const auto [landing_begin, landing_end] = LandingFor(image);
                 const VideoCore::DownloadLanding landing{
                     landing_begin, landing_end, VideoCore::DownloadLanding::Source::TextureCache};
                 written_by_cpu = IsWrittenByCpu(landing_begin, landing_end);
                 if (!written_by_cpu) {
-                    SwizzleImage(*gpu_memory, image.gpu_addr, image.info, entry.copies,
-                                 entry.map.mapped_span, swizzle_data_buffer);
+                    // Through the image's own address space (WriteBackImage), not the bound
+                    // channel's; false when none maps it any more.
+                    written_back = WriteBackImage(image, entry.copies, entry.map.mapped_span);
                 }
             }
             runtime.FreeDeferredStagingBuffer(entry.map);
             if (written_by_cpu) {
                 continue;
             }
+            if (!written_back) {
+                MarkStale(image);
+            } else {
+                // Older write-backs still queued keep what this one wrote, and later ones see it as
+                // newer data: also joins' when the collector's are off (NoteFlushed).
+                if (!overlap_downloads.empty()) {
+                    ForEachWrittenRange(image, [&](DAddr begin, DAddr end) {
+                        for (auto& download : overlap_downloads) {
+                            WritebackRanges::KeepNewerBytes(download, begin, end,
+                                                            image.modification_tick);
+                        }
+                    });
+                }
+                NoteFlushed(image);
+            }
             ++gc_download_deletes;
-            ClearStaleImage(image);
-            RemoveImage(entry.image_id, true);
+            RemoveImage(entry.image_id, true, false);
         }
         pending_write_backs.clear();
         pending_write_back_bytes = 0;
@@ -360,8 +412,9 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         pending_write_backs.push_back({image_id, std::move(copies), std::move(map)});
     };
     const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode, &CanEvict,
-                          out_of_memory, &QueueWriteBack, &IsPending, &RemoveImage,
-                          &UsedMemory](ImageId image_id) {
+                          &keep, &keep_ticks, out_of_memory, &overlap_downloads,
+                          download_overlaps, async_downloads, &QueueWriteBack, &IsPending,
+                          &RemoveImage, &UsedMemory](ImageId image_id) {
         if (num_iterations == 0) {
             return true;
         }
@@ -374,8 +427,52 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         if (must_download) {
             QueueWriteBack(image, image_id);
         } else {
-            MarkStale(image); // before UntrackImage (see MarkStale)
-            RemoveImage(image_id, false);
+            bool download_queued = false;
+            // A GPU-written overlap the collector may write back, and whether newer write-backs
+            // already hold all of it (then its data is not lost with it). Only must_download's
+            // complement: an overlap is BadOverlap.
+            const bool overlap_writeback =
+                download_overlaps && True(image.flags & ImageFlagBits::BadOverlap) &&
+                (async_downloads || image.guest_size_bytes <= OverlapDownloadMaxBytes()) &&
+                IsDownloadable(image) && HasGuestRange(image);
+            const bool covered =
+                overlap_writeback && OverlapHasNewerData(image_id, image, keep, &keep_ticks);
+            if (overlap_writeback && !covered) {
+                download_queued = true;
+                NoteOverlapWriteback(image);
+                // Deferred also when waiting: a later image's synchronous download in this pass
+                // finishes the GPU work, after which the pool would hand this buffer out again.
+                auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes, true);
+                auto copies = FullDownloadCopies(image.info);
+                image.DownloadMemory(map, copies);
+                overlap_downloads.push_back(OverlapDownload{
+                    .tick = image.modification_tick,
+                    .gpu_addr = image.gpu_addr,
+                    .cpu_addr = image.cpu_addr,
+                    .size = image.guest_size_bytes,
+                    .info = image.info,
+                    .copies = std::move(copies),
+                    .map = std::move(map),
+                    .keep = keep,
+                    .keep_ticks = keep_ticks,
+                    .address_space = image.address_space,
+                });
+                ++gc_download_deletes;
+                if (False(image.flags & ImageFlagBits::Sparse)) {
+                    ClearStale(image.cpu_addr, image.guest_size_bytes);
+                } else if (const auto memory = WriteBackMemory(image)) {
+                    ClearStaleGpu(*memory, image.gpu_addr, image.guest_size_bytes);
+                }
+            } else {
+                if (OverlapWritebacksEnabled() && True(image.flags & ImageFlagBits::GpuModified) &&
+                    HasGuestRange(image)) {
+                    // Its data is lost, but it is newer than what older images would write back.
+                    // Under newer write-backs it is not lost: they hold what supersedes it.
+                    NoteOverlapWriteback(image, !covered || last_cover_lost);
+                }
+                MarkStale(image); // before UntrackImage (see MarkStale)
+            }
+            RemoveImage(image_id, false, download_queued);
         }
         if (out_of_memory) {
             return false;
@@ -500,6 +597,632 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         Collect();
     }
     FlushWriteBacks();
+    if (!overlap_downloads.empty() && async_downloads) {
+        std::stable_sort(overlap_downloads.begin(), overlap_downloads.end(),
+                         [](const auto& a, const auto& b) { return a.tick < b.tick; });
+        if constexpr (requires { runtime.CurrentTick(); }) {
+            const u64 gpu_tick = runtime.CurrentTick();
+            for (auto& download : overlap_downloads) {
+                device_memory.UpdatePagesCachedCount(download.cpu_addr, download.size, 1);
+                overlap_download_bytes += download.map.mapped_span.size();
+                async_overlap_downloads.push_back(AsyncOverlapDownload{
+                    .gpu_tick = gpu_tick,
+                    .gpu_addr = download.gpu_addr,
+                    .cpu_addr = download.cpu_addr,
+                    .size = download.size,
+                    .info = download.info,
+                    .copies = std::move(download.copies),
+                    .map = download.map,
+                    .cancelled = false,
+                    .keep = download.keep,
+                    .keep_ticks = download.keep_ticks,
+                    .tick = download.tick,
+                    .address_space = download.address_space,
+                });
+            }
+        }
+        ++overlap_download_batches;
+        overlap_download_images += overlap_downloads.size();
+        overlap_downloads.clear();
+    }
+    if (!overlap_downloads.empty()) {
+        const auto wait_start = std::chrono::steady_clock::now();
+        runtime.Finish();
+        overlap_download_wait_us += static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - wait_start)
+                .count());
+        ++overlap_download_batches;
+        overlap_download_images += overlap_downloads.size();
+        std::stable_sort(overlap_downloads.begin(), overlap_downloads.end(),
+                         [](const auto& a, const auto& b) { return a.tick < b.tick; });
+        u64 bytes = 0;
+        for (auto& download : overlap_downloads) {
+            if (const auto memory = AddressSpaceMemory(download.address_space)) {
+                SwizzleKeeping(*memory, download.gpu_addr, download.info, download.copies,
+                               download.map.mapped_span, download.keep);
+                ReloadUnderLanded(download.cpu_addr, download.size, download.tick);
+            } else {
+                NoteWritebackLost(download.cpu_addr, download.size, download.tick);
+            }
+            bytes += download.map.mapped_span.size();
+            runtime.FreeDeferredStagingBuffer(download.map);
+        }
+        overlap_download_bytes += bytes;
+        if (Common::DkbFrameTrace::Enabled()) {
+            static u64 batches{};
+            static u64 images{};
+            images += overlap_downloads.size();
+            if (batches++ % 32 == 0) {
+                LOG_INFO(HW_GPU,
+                         "DKB gc overlap download batch #{} images={} bytes={:#x} total_images={} "
+                         "first gpu={:#x} {}x{}",
+                         batches, overlap_downloads.size(), bytes, images,
+                         overlap_downloads.front().gpu_addr,
+                         overlap_downloads.front().info.size.width,
+                         overlap_downloads.front().info.size.height);
+            }
+        }
+    }
+}
+
+template <class P>
+bool TextureCache<P>::OverlapHasNewerData(ImageId image_id, const ImageBase& image,
+                                          KeepRanges& keep,
+                                          WritebackRanges::TickedRanges* keep_ticks) {
+    // Memory the game reuses for other targets: an older image written back over it put another
+    // format's data under the newer image's pages (purple enemies when that image was made again).
+    keep.clear();
+    if (keep_ticks != nullptr) {
+        keep_ticks->clear();
+    }
+    last_cover_lost = false;
+    const u64 tick = image.modification_tick;
+    const DAddr begin = image.cpu_addr;
+    const DAddr end = image.cpu_addr + image.guest_size_bytes;
+    const DAddr first_page = begin >> OverlapPageBits;
+    const DAddr last_page = (end - 1) >> OverlapPageBits;
+    // Only the bytes newer data owns are kept: small targets packed together share pages, and
+    // skipping the whole image left its own bytes stale (black boxes where it was sampled).
+    for (DAddr page = first_page; page <= last_page; ++page) {
+        const auto it = overlap_writeback_ranges.find(page);
+        if (it == overlap_writeback_ranges.end()) {
+            continue;
+        }
+        for (const WritebackRange& range : it->second) {
+            if (range.end <= begin || end <= range.begin) {
+                continue;
+            }
+            // A smaller image written back after this
+            // one took its contents (or a clear replaced all of them) holds bytes this one only
+            // has old copies of: a large render target written back whole put its stale snapshot
+            // over The Duskbloods' 128x128 character maps (rainbow, purple, black outfits and
+            // enemies). Its draws since don't count: the cache can't tell a draw over those
+            // bytes from one elsewhere in the image.
+            const bool newer = range.tick > tick;
+            const bool small_after_load = !range.lost &&
+                                          range.tick > image.load_tick &&
+                                          range.end - range.begin < image.guest_size_bytes;
+            if (!newer && !small_after_load) {
+                continue;
+            }
+            keep.emplace_back((std::max)(range.begin, begin), (std::min)(range.end, end));
+            if (keep_ticks != nullptr) {
+                WritebackRanges::NoteTick(*keep_ticks, keep.back().first, keep.back().second,
+                                          range.tick);
+            }
+            last_cover_lost |= range.lost;
+        }
+    }
+    if (keep.empty()) {
+        return false;
+    }
+    std::ranges::sort(keep);
+    KeepRanges merged;
+    for (const auto& range : keep) {
+        if (!merged.empty() && range.first <= merged.back().second) {
+            merged.back().second = (std::max)(merged.back().second, range.second);
+        } else {
+            merged.push_back(range);
+        }
+    }
+    keep = std::move(merged);
+    if (keep.size() == 1 && keep.front().first == begin && keep.front().second == end) {
+        ++overlap_download_skips;
+        keep.clear();
+        if (keep_ticks != nullptr) {
+            keep_ticks->clear();
+        }
+        return true;
+    }
+    ++overlap_partial_keeps;
+    // Live overlapping images are not checked: an image made over them writes them back first
+    // (WriteBackBadOverlaps), newest last.
+    (void)image_id;
+    return false;
+}
+
+template <class P>
+void TextureCache<P>::SwizzleKeeping(Tegra::MemoryManager& memory, GPUVAddr gpu_addr,
+                                     const ImageInfo& info,
+                                     std::span<const BufferImageCopy> copies,
+                                     std::span<const u8> data, const KeepRanges& keep) {
+    if (keep.empty()) {
+        SwizzleImage(memory, gpu_addr, info, copies, data, swizzle_data_buffer);
+        return;
+    }
+    size_t total = 0;
+    for (const auto& [begin, end] : keep) {
+        total += end - begin;
+    }
+    std::vector<u8> saved(total);
+    size_t offset = 0;
+    for (const auto& [begin, end] : keep) {
+        device_memory.ReadBlockUnsafe(begin, saved.data() + offset, end - begin);
+        offset += end - begin;
+    }
+    SwizzleImage(memory, gpu_addr, info, copies, data, swizzle_data_buffer);
+    offset = 0;
+    for (const auto& [begin, end] : keep) {
+        device_memory.WriteBlockUnsafe(begin, saved.data() + offset, end - begin);
+        offset += end - begin;
+    }
+}
+
+template <class P>
+std::shared_ptr<Tegra::MemoryManager> TextureCache<P>::AddressSpaceMemory(size_t as_id) {
+    std::scoped_lock lock{config_mutex};
+    const auto it = address_spaces.find(as_id);
+    return it != address_spaces.end() ? it->second.owner.lock() : nullptr;
+}
+
+template <class P>
+void TextureCache<P>::FinishAsyncOverlapDownloads(bool wait_all) {
+    if constexpr (requires { runtime.CurrentTick(); }) {
+        if (async_overlap_downloads.empty()) {
+            return;
+        }
+        if (wait_all && !runtime.IsFree(async_overlap_downloads.back().gpu_tick)) {
+            runtime.Finish();
+        }
+        while (!async_overlap_downloads.empty() &&
+               runtime.IsFree(async_overlap_downloads.front().gpu_tick)) {
+            auto& download = async_overlap_downloads.front();
+            // Its address space, not the bound channel's: another one may be bound by now.
+            const auto memory = AddressSpaceMemory(download.address_space);
+            if (!download.cancelled && memory == nullptr) {
+                download.cancelled = true;
+                ++async_overlap_cancels;
+                NoteWritebackLost(download.cpu_addr, download.size, download.tick);
+            }
+            if (!download.cancelled) {
+                SwizzleKeeping(*memory, download.gpu_addr, download.info, download.copies,
+                               download.map.mapped_span, download.keep);
+                ReloadUnderLanded(download.cpu_addr, download.size, download.tick);
+            }
+            runtime.FreeDeferredStagingBuffer(download.map);
+            device_memory.UpdatePagesCachedCount(download.cpu_addr, download.size, -1);
+            async_overlap_downloads.pop_front();
+        }
+    }
+}
+
+template <class P>
+void TextureCache<P>::ReloadUnderLanded(DAddr cpu_addr, u64 size, u64 tick) {
+    // Images the GPU did not write loaded these pages before the data landed (made in the
+    // meantime by a join, or kept from before it): they load them again. Not one whose contents
+    // are newer than the landed data: a view made over a newer target took the target's pixels
+    // by a GPU copy without becoming GPU-modified, and reloading it put the older images' bytes in
+    // their place (The Duskbloods' 698x80 message banner band came out black or with other HUD
+    // text in it).
+    ForEachImageInRegion(cpu_addr, size, [tick](ImageId, ImageBase& image) {
+        if (False(image.flags & ImageFlagBits::GpuModified) && image.modification_tick <= tick) {
+            image.flags |= ImageFlagBits::CpuModified;
+        }
+    });
+}
+
+template <class P>
+bool TextureCache<P>::WritebackWouldReload(const ImageBase& image) {
+    // As a landing write-back's reload (ReloadUnderLanded): not GPU-written, contents no newer
+    // than the data, over any of the image's guest memory (a sparse image's mapped segments).
+    if (True(image.flags & ImageFlagBits::GpuModified)) {
+        return false;
+    }
+    bool reload = false;
+    ForEachWrittenRange(image, [&](DAddr begin, DAddr end) {
+        for (const AsyncOverlapDownload& download : async_overlap_downloads) {
+            reload |= !download.cancelled && download.cpu_addr < end &&
+                      begin < download.cpu_addr + download.size &&
+                      image.modification_tick <= download.tick;
+        }
+    });
+    return reload;
+}
+
+template <class P>
+bool TextureCache<P>::WritebackPendingOver(DAddr cpu_addr, u64 size) const {
+    return std::ranges::any_of(async_overlap_downloads, [&](const AsyncOverlapDownload& download) {
+        return !download.cancelled && download.cpu_addr < cpu_addr + size &&
+               cpu_addr < download.cpu_addr + download.size;
+    });
+}
+
+template <class P>
+void TextureCache<P>::KeepGuestWrite(DAddr cpu_addr, u64 size) {
+    // A write-back's image is newer than what guest memory held, and the guest's write is newer
+    // still: guest memory as the console has it is the image's bytes with the write over them.
+    // Cancelling the whole write-back for a write to part of it left the rest stale.
+    constexpr size_t MaxGuestKeeps = 32;
+    for (auto& download : async_overlap_downloads) {
+        const DAddr download_end = download.cpu_addr + download.size;
+        if (download.cancelled || download_end <= cpu_addr ||
+            cpu_addr + size <= download.cpu_addr) {
+            continue;
+        }
+        const DAddr begin = (std::max)(cpu_addr, download.cpu_addr);
+        const DAddr end = (std::min)(cpu_addr + size, download_end);
+        // The guest's bytes are newer than every image's contents so far, and older than those
+        // of images modified from now on.
+        WritebackRanges::NoteTick(download.keep_ticks, begin, end, modification_tick + 1);
+        // Coalesce every overlapping or touching range (a write can bridge two), so the checks
+        // below see the distinct ranges.
+        auto& keep = download.keep;
+        keep.emplace_back(begin, end);
+        std::ranges::sort(keep);
+        KeepRanges merged;
+        for (const auto& range : keep) {
+            if (!merged.empty() && range.first <= merged.back().second) {
+                merged.back().second = (std::max)(merged.back().second, range.second);
+            } else {
+                merged.push_back(range);
+            }
+        }
+        keep = std::move(merged);
+        const bool all_written = keep.size() == 1 && keep.front().first <= download.cpu_addr &&
+                                 download_end <= keep.front().second;
+        if (all_written || keep.size() > MaxGuestKeeps) {
+            // Nothing (or too scattered a rest) to land: as before, a write-back that never lands.
+            download.cancelled = true;
+            ++async_overlap_cancels;
+            NoteWritebackLost(download.cpu_addr, download.size, download.tick);
+        }
+    }
+}
+
+template <class P>
+void TextureCache<P>::CancelAsyncOverlapDownloads(DAddr cpu_addr, u64 size) {
+    for (auto& download : async_overlap_downloads) {
+        if (!download.cancelled && download.cpu_addr < cpu_addr + size &&
+            cpu_addr < download.cpu_addr + download.size) {
+            download.cancelled = true;
+            ++async_overlap_cancels;
+            NoteWritebackLost(download.cpu_addr, download.size, download.tick);
+        }
+    }
+}
+
+template <class P>
+void TextureCache<P>::CancelAsyncOverlapDownloadsGpu(size_t as_id, GPUVAddr gpu_addr, u64 size) {
+    for (auto& download : async_overlap_downloads) {
+        if (!download.cancelled && download.address_space == as_id &&
+            download.gpu_addr < gpu_addr + size &&
+            gpu_addr < download.gpu_addr + download.size) {
+            download.cancelled = true;
+            ++async_overlap_cancels;
+            NoteWritebackLost(download.cpu_addr, download.size, download.tick);
+        }
+    }
+}
+
+template <class P>
+void TextureCache<P>::WriteBackBadOverlaps(ImageId new_image_id) {
+    // An image made over
+    // GPU-written images it overlaps without fitting (kept alive, not copied in) loaded guest
+    // memory without their data. The Duskbloods renders its characters' 64x64 detail maps through
+    // other render targets at the same addresses and samples them through new images, which
+    // showed the memory's fill pattern (purple enemies) or zeros (black outfits).
+    if (!WritebackSwitches::DuskbloodsDefault()) {
+        return;
+    }
+    const bool async = AsyncOverlapDownloadsEnabled();
+    // Collector write-backs still on the GPU may cover this image: they land first. Async: when
+    // they land, images over their pages that the GPU did not write reload (one frame late).
+    if (!async && !async_overlap_downloads.empty()) {
+        const DAddr begin = slot_images[new_image_id].cpu_addr;
+        const u64 size = slot_images[new_image_id].guest_size_bytes;
+        for (const auto& download : async_overlap_downloads) {
+            if (!download.cancelled && download.cpu_addr < begin + size &&
+                begin < download.cpu_addr + download.size) {
+                FinishAsyncOverlapDownloads(true);
+                break;
+            }
+        }
+    }
+    using DownloadMap = decltype(runtime.DownloadStagingBuffer(size_t{}));
+    if constexpr (std::is_trivially_destructible_v<DownloadMap>) {
+        std::vector<ImageId> ids;
+        for (const ImageId overlap_id : join_bad_overlap_ids) {
+            if (overlap_id == new_image_id) {
+                continue;
+            }
+            const ImageBase& overlap = slot_images[overlap_id];
+            if (IsDownloadable(overlap) &&
+                (async || overlap.guest_size_bytes <= OverlapDownloadMaxBytes()) &&
+                False(overlap.flags & ImageFlagBits::IsDecoding) && HasGuestRange(overlap)) {
+                if (WrittenBackAlready(overlap)) {
+                    ++join_writeback_reuses;
+                    continue;
+                }
+                ids.push_back(overlap_id);
+            }
+        }
+        if (ids.empty()) {
+            return;
+        }
+        std::ranges::sort(ids, [this](ImageId a, ImageId b) {
+            return slot_images[a].modification_tick < slot_images[b].modification_tick;
+        });
+        struct Pending {
+            ImageId id;
+            boost::container::small_vector<BufferImageCopy, 16> copies;
+            DownloadMap map;
+            KeepRanges keep;
+        };
+        if constexpr (requires { runtime.CurrentTick(); }) {
+            if (async) {
+                // Waiting here took 60-70 ms per join in The Duskbloods (the GPU's whole queue,
+                // frames ahead included): queue them with the collector's instead.
+                const u64 gpu_tick = runtime.CurrentTick();
+                for (const ImageId id : ids) {
+                    Image& overlap = slot_images[id];
+                    // Bytes newer write-backs own stay theirs (OverlapHasNewerData); one they
+                    // own entirely is not written back at all.
+                    KeepRanges keep;
+                    WritebackRanges::TickedRanges keep_ticks;
+                    if (OverlapHasNewerData(id, overlap, keep, &keep_ticks)) {
+                        continue;
+                    }
+                    auto map = runtime.DownloadStagingBuffer(overlap.unswizzled_size_bytes, true);
+                    auto copies = FullDownloadCopies(overlap.info);
+                    overlap.DownloadMemory(map, copies);
+                    device_memory.UpdatePagesCachedCount(overlap.cpu_addr,
+                                                         overlap.guest_size_bytes, 1);
+                    async_overlap_downloads.push_back(AsyncOverlapDownload{
+                        .gpu_tick = gpu_tick,
+                        .gpu_addr = overlap.gpu_addr,
+                        .cpu_addr = overlap.cpu_addr,
+                        .size = overlap.guest_size_bytes,
+                        .info = overlap.info,
+                        .copies = std::move(copies),
+                        .map = map,
+                        .cancelled = false,
+                        .keep = keep,
+                        .keep_ticks = keep_ticks,
+                        .tick = overlap.modification_tick,
+                        .address_space = overlap.address_space,
+                    });
+                    NoteOverlapWriteback(overlap);
+                }
+                ++join_writebacks;
+                join_writeback_images += ids.size();
+                return;
+            }
+        }
+        std::vector<Pending> pending;
+        pending.reserve(ids.size());
+        for (const ImageId id : ids) {
+            Image& overlap = slot_images[id];
+            // As queued ones: bytes newer write-backs own stay theirs.
+            KeepRanges keep;
+            if (OverlapHasNewerData(id, overlap, keep)) {
+                continue;
+            }
+            auto map = runtime.DownloadStagingBuffer(overlap.unswizzled_size_bytes);
+            auto copies = FullDownloadCopies(overlap.info);
+            overlap.DownloadMemory(map, copies);
+            pending.push_back(Pending{id, std::move(copies), map, std::move(keep)});
+        }
+        if (pending.empty()) {
+            return;
+        }
+        const auto wait_start = std::chrono::steady_clock::now();
+        runtime.Finish();
+        join_writeback_wait_us += static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - wait_start)
+                .count());
+        for (auto& item : pending) {
+            const Image& overlap = slot_images[item.id];
+            if (WriteBackImage(overlap, item.copies, item.map.mapped_span, item.keep)) {
+                ReloadUnderLanded(overlap.cpu_addr, overlap.guest_size_bytes,
+                                  overlap.modification_tick);
+                NoteOverlapWriteback(overlap);
+            } else {
+                NoteWritebackLost(overlap.cpu_addr, overlap.guest_size_bytes,
+                                  overlap.modification_tick);
+            }
+        }
+        ++join_writebacks;
+        join_writeback_images += pending.size();
+    }
+}
+
+template <class P>
+bool TextureCache<P>::WrittenBackAlready(const ImageBase& image) const {
+    // Guest memory still holds this image as it is now: the last write-back over each of its
+    // pages was this image at its current modification (the 36 joins a second of a fight
+    // otherwise waited for the same small targets again and again).
+    const DAddr first_page = image.cpu_addr >> OverlapPageBits;
+    const DAddr last_page = (image.cpu_addr + image.guest_size_bytes - 1) >> OverlapPageBits;
+    for (DAddr page = first_page; page <= last_page; ++page) {
+        const auto it = overlap_writeback_ticks.find(page);
+        if (it == overlap_writeback_ticks.end() || it->second != image.modification_tick) {
+            return false;
+        }
+    }
+    // ...and that write-back landed (it was not cancelled).
+    const auto ranges = overlap_writeback_ranges.find(first_page);
+    return ranges != overlap_writeback_ranges.end() &&
+           std::ranges::any_of(ranges->second, [&](const WritebackRange& range) {
+               return range.begin == image.cpu_addr &&
+                      range.end == image.cpu_addr + image.guest_size_bytes &&
+                      range.tick == image.modification_tick && !range.lost;
+           });
+}
+
+template <class P>
+void TextureCache<P>::NoteWritebackLost(DAddr cpu_addr, u64 size, u64 tick) {
+    const DAddr first_page = cpu_addr >> OverlapPageBits;
+    const DAddr last_page = (cpu_addr + size - 1) >> OverlapPageBits;
+    for (DAddr page = first_page; page <= last_page; ++page) {
+        const auto it = overlap_writeback_ranges.find(page);
+        if (it == overlap_writeback_ranges.end()) {
+            continue;
+        }
+        for (WritebackRange& range : it->second) {
+            if (range.begin == cpu_addr && range.end == cpu_addr + size && range.tick == tick) {
+                range.lost = true;
+            }
+        }
+    }
+}
+
+template <class P>
+void TextureCache<P>::NoteOverlapWriteback(const ImageBase& image, bool lost) {
+    NoteOverlapWriteback(image, lost, image.modification_tick);
+}
+
+template <class P>
+void TextureCache<P>::NoteOverlapWriteback(const ImageBase& image, bool lost, u64 tick) {
+    const DAddr first_page = image.cpu_addr >> OverlapPageBits;
+    const DAddr last_page = (image.cpu_addr + image.guest_size_bytes - 1) >> OverlapPageBits;
+    const DAddr begin = image.cpu_addr;
+    const DAddr end = image.cpu_addr + image.guest_size_bytes;
+    const u64 image_tick = tick;
+    for (DAddr page = first_page; page <= last_page; ++page) {
+        u64& page_tick = overlap_writeback_ticks[page];
+        page_tick = (std::max)(page_tick, image_tick);
+        auto& ranges = overlap_writeback_ranges[page];
+        ranges.erase(std::remove_if(ranges.begin(), ranges.end(),
+                                    [&](const WritebackRange& range) {
+                                        return range.tick <= image_tick && (range.lost || !lost) &&
+                                               begin <= range.begin && range.end <= end;
+                                    }),
+                     ranges.end());
+        ranges.push_back(WritebackRange{begin, end, image_tick, lost});
+        // Not simply the oldest past the limit: bytes only it holds would lose their protection
+        // from older write-backs (OverlapHasNewerData).
+        const DAddr page_begin = page << OverlapPageBits;
+        WritebackRanges::CapPageRecords(ranges, page_begin,
+                                        page_begin + (DAddr{1} << OverlapPageBits));
+    }
+}
+
+template <class P>
+void TextureCache<P>::KeepInWaitingWritebacks(const ImageBase& image, u64 tick) {
+    if (async_overlap_downloads.empty()) {
+        return;
+    }
+    ForEachWrittenRange(image, [&](DAddr begin, DAddr end) {
+        for (AsyncOverlapDownload& download : async_overlap_downloads) {
+            if (!download.cancelled) {
+                WritebackRanges::KeepNewerBytes(download, begin, end, tick);
+            }
+        }
+    });
+}
+
+template <class P>
+void TextureCache<P>::NoteFlushed(const ImageBase& image) {
+    NoteFlushed(image, image.modification_tick);
+}
+
+template <class P>
+void TextureCache<P>::NoteFlushed(const ImageBase& image, u64 tick) {
+    if (!OverlapWritebacksEnabled()) {
+        return;
+    }
+    KeepInWaitingWritebacks(image, tick);
+    if (HasGuestRange(image)) {
+        NoteOverlapWriteback(image, false, tick);
+    }
+}
+
+template <class P>
+void TextureCache<P>::KeepNewerLanded(const ImageBase& image, u64 tick, KeepRanges& keep) {
+    keep.clear();
+    if (overlap_writeback_ranges.empty()) {
+        return;
+    }
+    const auto waiting = [this](const WritebackRange& range) {
+        return std::ranges::any_of(
+            async_overlap_downloads, [&](const AsyncOverlapDownload& download) {
+                return !download.cancelled && download.tick == range.tick &&
+                       download.cpu_addr == range.begin &&
+                       download.cpu_addr + download.size == range.end;
+            });
+    };
+    ForEachWrittenRange(image, [&](DAddr begin, DAddr end) {
+        const DAddr first_page = begin >> OverlapPageBits;
+        const DAddr last_page = (end - 1) >> OverlapPageBits;
+        for (DAddr page = first_page; page <= last_page; ++page) {
+            const auto it = overlap_writeback_ranges.find(page);
+            if (it != overlap_writeback_ranges.end()) {
+                WritebackRanges::AppendNewerLanded(keep, it->second, begin, end, tick, waiting);
+            }
+        }
+    });
+    WritebackRanges::MergeRanges(keep);
+}
+
+template <class P>
+bool TextureCache<P>::OverlapWritebacksEnabled() {
+    // As RunGarbageCollector and WriteBackBadOverlaps: staging maps that release themselves
+    // (OpenGL) cannot wait, so neither writes back there.
+    using DownloadMap = decltype(std::declval<Runtime&>().DownloadStagingBuffer(size_t{}));
+    if constexpr (std::is_trivially_destructible_v<DownloadMap>) {
+        return WritebackSwitches::AnyWritebackOn();
+    }
+    return false;
+}
+
+template <class P>
+template <typename Func>
+void TextureCache<P>::ForEachWrittenRange(const ImageBase& image, Func&& func) {
+    if (False(image.flags & ImageFlagBits::Sparse)) {
+        if (HasGuestRange(image)) {
+            func(image.cpu_addr, image.cpu_addr + image.guest_size_bytes);
+        }
+        return;
+    }
+    // As ForEachSparseSegment: each mapped segment is one range of guest memory.
+    const auto memory = WriteBackMemory(image);
+    if (!memory) {
+        return;
+    }
+    for (const auto& [gpu_addr, size] :
+         memory->GetSubmappedRange(image.gpu_addr, image.guest_size_bytes)) {
+        if (const std::optional<DAddr> cpu_addr = memory->GpuToCpuAddress(gpu_addr)) {
+            func(*cpu_addr, *cpu_addr + size);
+        }
+    }
+}
+
+template <class P>
+bool TextureCache<P>::AsyncOverlapDownloadsEnabled() {
+    if constexpr (requires { runtime.CurrentTick(); }) {
+        return true;
+    }
+    return false;
+}
+
+template <class P>
+u64 TextureCache<P>::OverlapDownloadMaxBytes() {
+    // Larger overlapping images are
+    // dropped as before. The Duskbloods' character maps are 16x42 to 256x256; the large ones are
+    // full-screen and shadow targets it draws again before reading.
+    return 1024ULL << 10;
 }
 
 template <class P>
@@ -509,6 +1232,15 @@ void TextureCache<P>::MarkStale(const ImageBase& image) {
         True(image.flags & (ImageFlagBits::CpuModified | ImageFlagBits::Sparse |
                             ImageFlagBits::Unbacked))) {
         return;
+    }
+    if (Common::DkbFrameTrace::Enabled()) {
+        static u64 marked{};
+        if (marked++ % 32 == 0) {
+            LOG_INFO(HW_GPU, "DKB stale mark #{} gpu={:#x} device={:#x} size={:#x} {}x{} format={} flags={:#x}",
+                     marked, image.gpu_addr, image.cpu_addr, image.guest_size_bytes,
+                     image.info.size.width, image.info.size.height,
+                     static_cast<u32>(image.info.format), static_cast<u32>(image.flags));
+        }
     }
     // Tracked from here on so CPU writes reach WriteMemory. Marking before the image's own
     // tracking goes keeps the pages' write protection from switching off and on again.
@@ -525,25 +1257,65 @@ void TextureCache<P>::ClearStale(DAddr addr, size_t size) {
 }
 
 template <class P>
-void TextureCache<P>::ClearStaleImage(const ImageBase& image) {
-    if (stale_pages.Count() == 0) {
-        return;
+std::shared_ptr<Tegra::MemoryManager> TextureCache<P>::WriteBackMemory(const ImageBase& image) {
+    // The garbage collector and CPU-side downloads reach images of every address space, so the
+    // bound channel's memory may map image.gpu_addr to other memory. The image's own address
+    // space writes it; once nvdrv has closed that one, another address space that still maps
+    // image.gpu_addr to the image's device memory does (FindImage shares images between them).
+    // The returned reference keeps the memory manager alive while the image is written.
+    boost::container::small_vector<std::shared_ptr<Tegra::MemoryManager>, 4> others;
+    {
+        std::scoped_lock lock{config_mutex};
+        for (const auto& [id, ref] : address_spaces) {
+            std::shared_ptr<Tegra::MemoryManager> memory = ref.owner.lock();
+            if (!memory) {
+                continue;
+            }
+            if (id == image.address_space) {
+                return memory;
+            }
+            others.push_back(std::move(memory));
+        }
     }
-    if (False(image.flags & ImageFlagBits::Sparse)) {
-        ClearStale(image.cpu_addr, image.guest_size_bytes);
-        return;
+    if (True(image.flags & ImageFlagBits::Sparse)) {
+        return nullptr;
     }
-    ClearStaleGpu(image.gpu_addr, image.guest_size_bytes);
+    for (std::shared_ptr<Tegra::MemoryManager>& memory : others) {
+        if (memory->GpuToCpuAddress(image.gpu_addr) == image.cpu_addr) {
+            return std::move(memory);
+        }
+    }
+    return nullptr;
 }
 
 template <class P>
-void TextureCache<P>::ClearStaleGpu(GPUVAddr gpu_addr, size_t size) {
+bool TextureCache<P>::WriteBackImage(const ImageBase& image,
+                                     std::span<const BufferImageCopy> copies,
+                                     std::span<const u8> data, const KeepRanges& keep) {
+    const std::shared_ptr<Tegra::MemoryManager> memory = WriteBackMemory(image);
+    if (!memory) {
+        return false;
+    }
+    SwizzleKeeping(*memory, image.gpu_addr, image.info, copies, data, keep);
+    if (stale_pages.Count() == 0) {
+        return true;
+    }
+    if (False(image.flags & ImageFlagBits::Sparse)) {
+        ClearStale(image.cpu_addr, image.guest_size_bytes);
+    } else {
+        ClearStaleGpu(*memory, image.gpu_addr, image.guest_size_bytes);
+    }
+    return true;
+}
+
+template <class P>
+void TextureCache<P>::ClearStaleGpu(Tegra::MemoryManager& memory, GPUVAddr gpu_addr, size_t size) {
     if (stale_pages.Count() == 0) {
         return;
     }
     // Each piece is contiguous in device memory (GetSubmappedRange splits where it is not).
-    for (const auto& [piece_addr, piece_size] : gpu_memory->GetSubmappedRange(gpu_addr, size)) {
-        if (const auto device_addr = gpu_memory->GpuToCpuAddress(piece_addr)) {
+    for (const auto& [piece_addr, piece_size] : memory.GetSubmappedRange(gpu_addr, size)) {
+        if (const auto device_addr = memory.GpuToCpuAddress(piece_addr)) {
             ClearStale(*device_addr, piece_size);
         }
     }
@@ -593,6 +1365,37 @@ void TextureCache<P>::LogThresholds() const {
 
 template <class P>
 void TextureCache<P>::TickFrame() {
+    FinishAsyncOverlapDownloads(false);
+    if (Common::DkbFrameTrace::Enabled()) {
+        static u64 frames{};
+        if (++frames % 600 == 0 && (overlap_download_batches != 0 || overlap_download_skips != 0 || join_writebacks != 0 ||
+                                    join_writeback_reuses != 0)) {
+            LOG_INFO(HW_GPU,
+                     "DKB gc overlap downloads last 600 frames: {} batches, {} images, {} KiB, "
+                     "waited {:.1f} ms, {} skipped under newer data, {} written around newer "
+                     "bytes, {} pages noted, {} cancelled",
+                     overlap_download_batches, overlap_download_images,
+                     overlap_download_bytes >> 10,
+                     static_cast<double>(overlap_download_wait_us) / 1000.0,
+                     overlap_download_skips, overlap_partial_keeps,
+                     overlap_writeback_ticks.size(), async_overlap_cancels);
+            async_overlap_cancels = 0;
+            overlap_partial_keeps = 0;
+            if (join_writebacks != 0) {
+                LOG_INFO(HW_GPU,
+                         "DKB join writebacks last 600 frames: {} joins, {} images, waited {:.1f} ms, {} "
+                         "already in memory",
+                         join_writebacks, join_writeback_images,
+                         static_cast<double>(join_writeback_wait_us) / 1000.0,
+                         join_writeback_reuses);
+            }
+            join_writebacks = join_writeback_images = join_writeback_wait_us = 0;
+            join_writeback_reuses = 0;
+            overlap_download_skips = 0;
+            overlap_download_batches = overlap_download_images = 0;
+            overlap_download_bytes = overlap_download_wait_us = 0;
+        }
+    }
     // Upload buffers grown for one huge image (title 1's 341 MiB terrain layer pools) are freed
     // rather than kept for the rest of the session.
     for (auto* const scratch : {&swizzle_data_buffer, &unswizzle_data_buffer}) {
@@ -1052,6 +1855,24 @@ typename P::ImageView& TextureCache<P>::GetImageView(u32 index) noexcept {
 template <class P>
 void TextureCache<P>::MarkModification(ImageId id) noexcept {
     MarkModification(slot_images[id]);
+}
+
+template <class P>
+void TextureCache<P>::MarkStorageWrite(ImageViewId id) noexcept {
+    const ImageViewBase& view = slot_image_views[id];
+    if (!view.image_id) {
+        return;
+    }
+    ImageBase& image = slot_images[view.image_id];
+    const u32 levels_before = image.storage_written_levels;
+    MarkModification(image);
+    NoteStorageWrite(image, levels_before, view.range);
+}
+
+template <class P>
+bool TextureCache<P>::StorageViewHoldsShaderWrites(ImageViewId id) const noexcept {
+    const ImageViewBase& view = slot_image_views[id];
+    return !view.image_id || HoldsStorageWrites(slot_images[view.image_id], view.range);
 }
 
 template <class P>
@@ -1819,12 +2640,15 @@ template <class P>
 void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     using namespace VideoCommon::Dirty;
     struct ClearingScope {
-        bool& flag;
+        bool& clearing;
+        bool& drawing;
         ~ClearingScope() {
-            flag = false;
+            clearing = false;
+            drawing = false;
         }
-    } clearing_scope{clearing_render_targets};
+    } clearing_scope{clearing_render_targets, drawing_render_targets};
     clearing_render_targets = is_clear;
+    drawing_render_targets = !is_clear;
     auto& flags = maxwell3d->dirty.flags;
     if (!flags[Dirty::RenderTargets]) {
         if (!is_clear && RenderTargetsStillPrepared()) {
@@ -1839,6 +2663,7 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
         if (is_clear) {
             rt_prepared.valid = false;
             NoteWholeClears();
+            NoteClearedWhole();
         } else {
             NoteRenderTargetsPrepared();
         }
@@ -1863,6 +2688,7 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     PrepareImageView(depth_buffer_id, true, is_clear && IsFullClear(depth_buffer_id));
     if (is_clear) {
         NoteWholeClears();
+        NoteClearedWhole();
     }
 
     rt_active_mask = 0;
@@ -1967,6 +2793,39 @@ typename P::Framebuffer* TextureCache<P>::GetFramebuffer() {
 }
 
 template <class P>
+bool TextureCache<P>::ColorTargetWrittenBeforeThisFrame(u32 index) noexcept {
+    if (!maxwell3d || index >= rt_image_id.size()) {
+        return false;
+    }
+    const auto& regs = maxwell3d->regs;
+    const auto& rt = regs.rt[index];
+    const GPUVAddr gpu_addr = rt.Address();
+    if (gpu_addr == 0 || rt.format == Tegra::RenderTargetFormat::NONE) {
+        return false;
+    }
+    std::scoped_lock lock{mutex};
+    ImageId image_id{};
+    if (!maxwell3d->dirty.flags[Dirty::RenderTargets] &&
+        !maxwell3d->dirty.flags[Dirty::ColorBuffer0 + index]) {
+        image_id = rt_image_id[index];
+    } else {
+        const ImageInfo info(rt, regs.anti_alias_samples_mode);
+        if (info.format == PixelFormat::Invalid || info.size.width == 0 || info.size.height == 0 ||
+            info.size.depth == 0 || info.size.width > 65536 || info.size.height > 65536 ||
+            info.size.depth > 2048 || info.resources.layers <= 0 ||
+            info.resources.layers > 2048) {
+            return false;
+        }
+        image_id = FindImage(info, gpu_addr, RelaxedOptions{});
+    }
+    if (!image_id) {
+        return false;
+    }
+    const ImageBase& image = slot_images[image_id];
+    return image.first_written_frame != 0 && image.first_written_frame < frame_tick + 1;
+}
+
+template <class P>
 ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
     auto& table = compute ? channel_state->compute_image_table : channel_state->graphics_image_table;
     index = Tegra::Texture::TextureHeaderIndex(index, table.current_limit,
@@ -2033,33 +2892,91 @@ FramebufferId TextureCache<P>::GetFramebufferId(const RenderTargets& key) {
 
 template <class P>
 void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
+    if (!async_overlap_downloads.empty()) {
+        KeepGuestWrite(cpu_addr, size);
+    }
     ClearStale(cpu_addr, size);
     ForEachImageInRegion(cpu_addr, size, [this, cpu_addr, size](ImageId image_id, Image& image) {
-        ++bindings_epoch;
-        if (False(image.flags & ImageFlagBits::CpuModified)) {
-            // Each branch below leaves it CPU modified: binding memos of it need the upload.
-            BumpBindingSerial(image_id);
-        }
-        VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Invalidation);
-        if (True(image.flags & ImageFlagBits::UnwrittenSparse)) {
-            // Written at last: a backed image replaces it where it is used next.
-            image.flags |= ImageFlagBits::CpuModified | ImageFlagBits::Remapped;
+        MarkImageWritten(image_id, image, cpu_addr, size);
+    });
+}
+
+template <class P>
+void TextureCache<P>::MarkImageWritten(ImageId image_id, Image& image, DAddr cpu_addr,
+                                       size_t size) {
+    ++bindings_epoch;
+    if (False(image.flags & ImageFlagBits::CpuModified)) {
+        // Each branch below leaves it CPU modified: binding memos of it need the upload.
+        BumpBindingSerial(image_id);
+    }
+    VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Invalidation);
+    if (True(image.flags & ImageFlagBits::UnwrittenSparse)) {
+        // Written at last: a backed image replaces it where it is used next.
+        image.flags |= ImageFlagBits::CpuModified | ImageFlagBits::Remapped;
+        return;
+    }
+    if (True(image.flags & ImageFlagBits::SparseTiles)) {
+        MarkRangeWritten(image, cpu_addr, size);
+        return;
+    }
+    if (UploadsByLayer(image)) {
+        MarkLayersWritten(image, cpu_addr, size);
+        return;
+    }
+    if (True(image.flags & ImageFlagBits::CpuModified)) {
+        return;
+    }
+    image.flags |= ImageFlagBits::CpuModified;
+    if (True(image.flags & ImageFlagBits::Tracked)) {
+        UntrackImage(image, image_id);
+    }
+}
+
+template <class P>
+void TextureCache<P>::WriteDmaCopy(GPUVAddr src_addr, GPUVAddr dest_addr, size_t size,
+                                   std::span<const std::pair<DAddr, size_t>> gpu_written_dest) {
+    const std::optional<DAddr> src = gpu_memory->GpuToCpuAddress(src_addr);
+    const std::optional<DAddr> dest = gpu_memory->GpuToCpuAddress(dest_addr);
+    if (!src || !dest) {
+        return;
+    }
+    if (!async_overlap_downloads.empty()) {
+        KeepGuestWrite(*dest, size);
+    }
+    // Destination bytes guest memory doesn't hold yet: the buffer cache's GPU writes and the
+    // bytes of images the GPU wrote over the source.
+    boost::container::small_vector<std::pair<DAddr, size_t>, 8> unheld(gpu_written_dest.begin(),
+                                                                       gpu_written_dest.end());
+    ForEachImageInRegion(*src, size, [&](ImageId, Image& image) {
+        if (False(image.flags & ImageFlagBits::GpuModified)) {
             return;
         }
-        if (True(image.flags & ImageFlagBits::SparseTiles)) {
-            MarkRangeWritten(image, cpu_addr, size);
-            return;
+        const DAddr begin = (std::max)(static_cast<DAddr>(image.cpu_addr), *src);
+        const DAddr end = (std::min)(static_cast<DAddr>(image.cpu_addr_end), *src + size);
+        unheld.emplace_back(*dest + (begin - *src), end - begin);
+    });
+    std::ranges::sort(unheld);
+    DAddr held = *dest;
+    for (const auto& [begin, length] : unheld) {
+        if (begin > held) {
+            ClearStale(held, begin - held);
         }
-        if (UploadsByLayer(image)) {
-            MarkLayersWritten(image, cpu_addr, size);
-            return;
-        }
-        if (True(image.flags & ImageFlagBits::CpuModified)) {
-            return;
-        }
-        image.flags |= ImageFlagBits::CpuModified;
-        if (True(image.flags & ImageFlagBits::Tracked)) {
-            UntrackImage(image, image_id);
+        held = (std::max)(held, begin + length);
+    }
+    const DAddr dest_end = *dest + size;
+    if (held < dest_end) {
+        ClearStale(held, dest_end - held);
+    }
+    ForEachImageInRegion(*dest, size, [&](ImageId image_id, Image& image) {
+        // An upload would take bytes guest memory doesn't hold.
+        const bool takes_unheld = std::ranges::any_of(unheld, [&image](const auto& range) {
+            return range.first < image.cpu_addr_end && image.cpu_addr < range.first + range.second;
+        });
+        // GPU-written contents outside the copy are only in the image.
+        const bool keeps_gpu_contents = True(image.flags & ImageFlagBits::GpuModified) &&
+                                        (image.cpu_addr < *dest || image.cpu_addr_end > dest_end);
+        if (!takes_unheld && !keeps_gpu_contents) {
+            MarkImageWritten(image_id, image, *dest, size);
         }
     });
 }
@@ -2082,6 +2999,22 @@ bool TextureCache<P>::IsDownloadable(const ImageBase& image) const noexcept {
 template <class P>
 void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureCache};
+    // Write-backs landed for this read: an older image downloaded below leaves their ranges as
+    // they are, newest data winning as between write-backs. A range a write-back left to newer
+    // data (or to the guest's writes) holds that data, at its own tick.
+    using WritebackRanges::TickedRange;
+    boost::container::small_vector<TickedRange, 8> landed;
+    if (WritebackPendingOver(cpu_addr, size)) {
+        for (const AsyncOverlapDownload& download : async_overlap_downloads) {
+            if (!download.cancelled) {
+                WritebackRanges::AppendLanded(landed, download.cpu_addr, download.size,
+                                              download.tick, download.keep, download.keep_ticks);
+            }
+        }
+        // A write-back still on the GPU holds this memory's data: land it before the guest reads
+        // (waiting as the downloads below do, on the flushing thread with the cache's lock).
+        FinishAsyncOverlapDownloads(true);
+    }
     boost::container::small_vector<ImageId, 16> images;
     ForEachImageInRegion(cpu_addr, size, [this, &images](ImageId image_id, ImageBase& image) {
         if (!IsDownloadable(image)) {
@@ -2117,9 +3050,22 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
         runtime.Finish();
         for (Pending& entry : pending) {
             Image& image = slot_images[entry.image_id];
-            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, entry.copies,
-                         entry.map.mapped_span, swizzle_data_buffer);
-            ClearStaleImage(image);
+            KeepRanges keep;
+            KeepNewerLanded(image, image.modification_tick, keep);
+            if (!landed.empty()) {
+                ForEachWrittenRange(image, [&](DAddr begin, DAddr end) {
+                    for (const TickedRange& range : landed) {
+                        if (range.tick > image.modification_tick && range.begin < end &&
+                            begin < range.end) {
+                            keep.emplace_back((std::max)(range.begin, begin),
+                                              (std::min)(range.end, end));
+                        }
+                    }
+                });
+            }
+            if (WriteBackImage(image, entry.copies, entry.map.mapped_span, keep)) {
+                NoteFlushed(image);
+            }
         }
         pending.clear();
         pending_bytes = 0;
@@ -2161,11 +3107,29 @@ std::optional<VideoCore::RasterizerDownloadArea> TextureCache<P>::GetFlushArea(D
         area->preemtive &= image.info.forced_flushed;
         image.info.forced_flushed = true;
     });
+    // Write-backs still on the GPU: DownloadMemory lands them.
+    for (const AsyncOverlapDownload& download : async_overlap_downloads) {
+        if (download.cancelled || download.cpu_addr + download.size <= cpu_addr ||
+            cpu_addr + size <= download.cpu_addr) {
+            continue;
+        }
+        if (!area) {
+            area.emplace();
+            area->start_address = cpu_addr;
+            area->end_address = cpu_addr + size;
+            area->preemtive = true;
+        }
+        area->start_address = (std::min)(area->start_address, download.cpu_addr);
+        area->end_address = (std::max)(area->end_address, download.cpu_addr + download.size);
+    }
     return area;
 }
 
 template <class P>
 void TextureCache<P>::UnmapMemory(DAddr cpu_addr, size_t size) {
+    if (!async_overlap_downloads.empty()) {
+        CancelAsyncOverlapDownloads(cpu_addr, size);
+    }
     boost::container::small_vector<ImageId, 16> deleted_images;
     ForEachImageInRegion(cpu_addr, size, [&](ImageId id, Image&) { deleted_images.push_back(id); });
     for (const ImageId id : deleted_images) {
@@ -2182,6 +3146,9 @@ void TextureCache<P>::UnmapMemory(DAddr cpu_addr, size_t size) {
 
 template <class P>
 void TextureCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size) {
+    if (!async_overlap_downloads.empty()) {
+        CancelAsyncOverlapDownloadsGpu(as_id, gpu_addr, size);
+    }
     boost::container::small_vector<ImageId, 16> deleted_images;
     ForEachImageInRegionGPU(as_id, gpu_addr, size,
                             [&](ImageId id, Image&) { deleted_images.push_back(id); });
@@ -2698,10 +3665,12 @@ void TextureCache<P>::CommitAsyncFlushes() {
         bool any_none_dma = false;
         for (PendingDownload& download_info : download_ids) {
             if (download_info.is_swizzle) {
-                total_size_bytes +=
-                    Common::AlignUp(download_info.GetImage(slot_images).unswizzled_size_bytes, 64);
+                const ImageBase& image = download_info.GetImage(slot_images);
+                total_size_bytes += Common::AlignUp(image.unswizzled_size_bytes, 64);
                 any_none_dma = true;
                 download_info.async_buffer_id = last_async_buffer_id;
+                // Staged below: the flush writes these contents, however the image changes.
+                download_info.tick = image.modification_tick;
             }
         }
 
@@ -2763,15 +3732,20 @@ void TextureCache<P>::PopAsyncFlushes() {
                 download_buffer.offset -= Common::AlignUp(image.unswizzled_size_bytes, 64);
                 std::span<u8> download_span =
                     download_buffer.mapped_span.subspan(download_buffer.offset);
-                SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span, swizzle_data_buffer);
-                ClearStaleImage(image);
+                // Newer data written meanwhile stays: a write-back queued after this flush was
+                // committed can land before it pops, and the snapshot is older.
+                KeepRanges keep;
+                KeepNewerLanded(image, download_info.tick, keep);
+                if (WriteBackImage(image, copies, download_span, keep)) {
+                    NoteFlushed(image, download_info.tick);
+                }
             } else {
                 const BufferDownload& buffer_info = slot_buffer_downloads[download_info.object_id];
                 std::span<u8> download_span =
                     download_buffer.mapped_span.subspan(download_buffer.offset);
                 gpu_memory->WriteBlockUnsafe(buffer_info.address, download_span.data(),
                                              buffer_info.size);
-                ClearStaleGpu(buffer_info.address, buffer_info.size);
+                ClearStaleGpu(*gpu_memory, buffer_info.address, buffer_info.size);
                 slot_buffer_downloads.erase(download_info.object_id);
             }
         }
@@ -2813,8 +3787,9 @@ void TextureCache<P>::PopAsyncFlushes() {
             }
             const ImageBase& image = download_info.GetImage(slot_images);
             const auto copies = FullDownloadCopies(image.info);
-            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span, swizzle_data_buffer);
-            ClearStaleImage(image);
+            if (WriteBackImage(image, copies, download_span)) {
+                NoteFlushed(image);
+            }
             download_map.offset += image.unswizzled_size_bytes;
             download_span = download_span.subspan(image.unswizzled_size_bytes);
         }
@@ -2874,7 +3849,7 @@ bool TextureCache<P>::IsRegionGpuModified(DAddr addr, size_t size) {
         is_modified = true;
         return true;
     });
-    return is_modified;
+    return is_modified || WritebackPendingOver(addr, size);
 }
 
 template <class P>
@@ -2956,6 +3931,8 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
 
     image.flags &= ~ImageFlagBits::CpuModified;
+    image.load_tick = modification_tick;
+    image.storage_written_levels = 0;
 
     // Images uploaded by layer stay tracked while some of their layers are dirty.
     if (False(image.flags & ImageFlagBits::Tracked)) {
@@ -2969,19 +3946,35 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
                              ImageFlagBits::SparseTiles | ImageFlagBits::Unbacked)) &&
         stale_pages.IsAll(image.cpu_addr, image.guest_size_bytes)) {
         if (!Tegra::Nx2MayBeGpuWritten(image.cpu_addr, image.guest_size_bytes)) {
-            if (TextureCacheTrace()) {
-                LOG_WARNING(HW_GPU,
-                            "TCTRACE stale-skip gpu={:#x} fmt={} {}x{}x{} guest={}KiB frame={}",
-                            image.gpu_addr, static_cast<u32>(image.info.format),
-                            image.info.size.width, image.info.size.height, image.info.size.depth,
-                            image.guest_size_bytes / 1024, frame_tick);
+            const bool upload = WritebackSwitches::UploadStale();
+            if (Common::DkbFrameTrace::Enabled()) {
+                static u64 stale_images{};
+                if (stale_images++ % 32 == 0) {
+                    LOG_INFO(HW_GPU,
+                             "DKB stale image #{} gpu={:#x} device={:#x} size={:#x} {}x{} "
+                             "format={} levels={} uploaded={}",
+                             stale_images, image.gpu_addr, image.cpu_addr,
+                             image.guest_size_bytes, image.info.size.width,
+                             image.info.size.height, static_cast<u32>(image.info.format),
+                             image.info.resources.levels, upload);
+                }
             }
-            ++tc_stale_skips;
-            tc_stale_skip_bytes += image.guest_size_bytes;
-            runtime.TransitionImageLayout(image);
-            return;
+            if (!upload) {
+                if (TextureCacheTrace()) {
+                    LOG_WARNING(HW_GPU,
+                                "TCTRACE stale-skip gpu={:#x} fmt={} {}x{}x{} guest={}KiB frame={}",
+                                image.gpu_addr, static_cast<u32>(image.info.format),
+                                image.info.size.width, image.info.size.height,
+                                image.info.size.depth, image.guest_size_bytes / 1024, frame_tick);
+                }
+                ++tc_stale_skips;
+                tc_stale_skip_bytes += image.guest_size_bytes;
+                runtime.TransitionImageLayout(image);
+                return;
+            }
+        } else {
+            ++tc_stale_gpu_written;
         }
-        ++tc_stale_gpu_written;
     }
 
     if (True(image.flags & ImageFlagBits::SparseLayers)) {
@@ -3049,15 +4042,15 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         using Ms = std::chrono::duration<double, std::milli>;
         LOG_WARNING(HW_GPU,
                     "TCTRACE upload gpu={:#x} fmt={} {}x{}x{} lv={} ly={} guest={}KiB host={}KiB "
-                    "ms={:.2f} staging={:.2f} read={:.2f} untile={:.2f} faults={} chunked={} "
-                    "frame={}",
+                    "ms={:.2f} staging={:.2f} prefault={:.2f} read={:.2f} untile={:.2f} faults={} "
+                    "chunked={} frame={}",
                     image.gpu_addr, static_cast<u32>(image.info.format), image.info.size.width,
                     image.info.size.height, image.info.size.depth, image.info.resources.levels,
                     image.info.resources.layers, image.guest_size_bytes / 1024,
                     MapSizeBytes(image) / 1024, Ms(TraceClock::now() - trace_begin).count(),
-                    Ms(trace_staged - trace_begin).count(), upload_trace.read_ms,
-                    upload_trace.untile_ms, Common::GetProcessPageFaults() - trace_faults, chunked,
-                    frame_tick);
+                    Ms(trace_staged - trace_begin).count(), upload_trace.prefault_ms,
+                    upload_trace.read_ms, upload_trace.untile_ms,
+                    Common::GetProcessPageFaults() - trace_faults, chunked, frame_tick);
     }
     // The host GPU has its own copy now and the guest rarely reads this memory again: TickFrame
     // marks it cold, so the OS pages it out before anything else when it needs RAM (title 1
@@ -3103,6 +4096,14 @@ bool TextureCache<P>::UploadInChunks(Image& image) {
             continue; // padding between levels or layers
         }
         auto staging = runtime.UploadStagingBuffer(plan.total_host_bytes);
+        const auto prefault_begin = std::chrono::steady_clock::now();
+        PrefaultGuestMemory(*gpu_memory, image.gpu_addr + range[0].first,
+                            range[0].second - range[0].first);
+        if (TextureCacheTrace()) {
+            upload_trace.prefault_ms += std::chrono::duration<double, std::milli>(
+                                            std::chrono::steady_clock::now() - prefault_begin)
+                                            .count();
+        }
         ExecuteUnswizzlePlan(*gpu_memory, plan, staging.mapped_span);
         image.UploadMemory(staging, plan.copies);
     }
@@ -3375,6 +4376,16 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
         runtime.AccelerateImageUpload(image, staging, uploads, 0, 0);
         return;
     }
+
+    using TraceClock = std::chrono::steady_clock;
+    const bool tc_trace = TextureCacheTrace();
+    const auto prefault_begin = tc_trace ? TraceClock::now() : TraceClock::time_point{};
+    PrefaultGuestMemory(*gpu_memory, gpu_addr, image.guest_size_bytes);
+    const auto read_begin = tc_trace ? TraceClock::now() : TraceClock::time_point{};
+    if (tc_trace) {
+        upload_trace.prefault_ms =
+            std::chrono::duration<double, std::milli>(read_begin - prefault_begin).count();
+    }
     if (True(image.flags & ImageFlagBits::AcceleratedUpload)) {
         gpu_memory->ReadBlock(gpu_addr, mapped_span.data(), mapped_span.size_bytes(),
                               VideoCommon::CacheType::NoTextureCache);
@@ -3383,9 +4394,6 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
         return;
     }
 
-    using TraceClock = std::chrono::steady_clock;
-    const bool tc_trace = TextureCacheTrace();
-    const auto read_begin = tc_trace ? TraceClock::now() : TraceClock::time_point{};
     Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead> swizzle_data(
         *gpu_memory, gpu_addr, image.guest_size_bytes, &swizzle_data_buffer);
     const auto untile_begin = tc_trace ? TraceClock::now() : TraceClock::time_point{};
@@ -3924,52 +4932,7 @@ ImageId TextureCache<P>::InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
 
 template <class P>
 bool TextureCache<P>::ClearOverwritesWhole(const ImageInfo& new_info, GPUVAddr gpu_addr) const {
-    if (!clearing_render_targets || new_info.type != ImageType::e2D ||
-        new_info.resources.levels != 1 || new_info.resources.layers != 1 ||
-        new_info.num_samples != 1) {
-        return false;
-    }
-    const auto& regs = maxwell3d->regs;
-    const auto& surface = regs.clear_surface;
-    if (surface.layer != 0) {
-        return false;
-    }
-    const u32 width = new_info.size.width;
-    const u32 height = new_info.size.height;
-    if (!ClearCovers(width, height)) {
-        return false;
-    }
-    // The clear covers the framebuffer's render area, the smallest bound target.
-    for (u32 index = 0; index < regs.rt_control.count && index < NUM_RT; ++index) {
-        const auto& rt = regs.rt[index];
-        if (rt.Address() != 0 && rt.format != Tegra::RenderTargetFormat::NONE &&
-            (rt.width < width || rt.height < height)) {
-            return false;
-        }
-    }
-    if (regs.zeta_enable && regs.zeta.Address() != 0 &&
-        (regs.zeta_size.width < width || regs.zeta_size.height < height)) {
-        return false;
-    }
-    const bool is_depth_target = regs.zeta_enable && regs.zeta.Address() == gpu_addr;
-    const bool full_stencil = surface.S && regs.stencil_front_mask == 0xFF;
-    switch (VideoCore::Surface::GetFormatType(new_info.format)) {
-    case VideoCore::Surface::SurfaceType::ColorTexture: {
-        // OpenGL clears draw buffer RT, which writes target rt_control.Map(RT).
-        const u32 index = surface.RT;
-        return surface.R && surface.G && surface.B && surface.A && index < NUM_RT &&
-               index < regs.rt_control.count && regs.rt_control.Map(index) == index &&
-               regs.rt[index].Address() == gpu_addr;
-    }
-    case VideoCore::Surface::SurfaceType::Depth:
-        return is_depth_target && surface.Z;
-    case VideoCore::Surface::SurfaceType::Stencil:
-        return is_depth_target && full_stencil;
-    case VideoCore::Surface::SurfaceType::DepthStencil:
-        return is_depth_target && surface.Z && full_stencil;
-    default:
-        return false;
-    }
+    return clearing_render_targets && ClearWritesWhole(new_info, gpu_addr);
 }
 
 template <class P>
@@ -4107,6 +5070,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
     }
     const ImageId new_image_id = slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
+    slot_images[new_image_id].load_tick = modification_tick;
     if constexpr (requires(const Image& image) { image.OutOfMemory(); }) {
         if (slot_images[new_image_id].OutOfMemory()) {
             // Left out of the cache: lookups see no image (a null view) and make it again once
@@ -4168,7 +5132,8 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     // image) needs no upload from guest memory first: Ocarina of Time creates ~4 such targets a
     // frame outdoors, and uploading them was ~15% of the GPU back thread.
     const auto overwritten_by_clear = [&] {
-        return join_copies_to_do.empty() && ClearOverwritesWhole(new_info, gpu_addr);
+        return clearing_render_targets && join_copies_to_do.empty() &&
+               ClearWritesWhole(new_info, gpu_addr);
     };
     std::ranges::sort(join_copies_to_do, [this](const JoinCopy& lhs, const JoinCopy& rhs) {
         const ImageBase& lhs_image = slot_images[lhs.id];
@@ -4278,6 +5243,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
         runtime.TransitionImageLayout(new_image);
     } else {
+        if (True(new_image.flags & ImageFlagBits::CpuModified)) {
+            WriteBackBadOverlaps(new_image_id);
+        }
         // TODO: Only upload what we need
         RefreshContents(new_image, new_image_id);
     }
@@ -4914,6 +5882,10 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
     image.flags &= ~ImageFlagBits::Registered;
     image.flags &= ~ImageFlagBits::BadOverlap;
     lru_cache.Free(image.lru_index);
+    const std::optional<size_t> storage_id = getStorageID(image.address_space);
+    ASSERT(storage_id);
+    TextureCacheGPUMap& gpu_page_table = gpu_page_table_storage[*storage_id * 2];
+    TextureCacheGPUMap& sparse_page_table = gpu_page_table_storage[*storage_id * 2 + 1];
     bool reported_missing_page = false;
     const auto& clear_page_table =
         [this, image_id, &image, &reported_missing_page](u64 page, ::Common::unordered_map<u64, std::vector<ImageId>, Common::IdentityHash<u64>>& selected_page_table) {
@@ -4934,9 +5906,10 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
             }
             image_ids.erase(vector_it);
         };
-    ForEachGPUPage(image.gpu_addr, image.guest_size_bytes, [this, &clear_page_table](u64 page) {
-        clear_page_table(page, (*channel_state->gpu_page_table));
-    });
+    ForEachGPUPage(image.gpu_addr, image.guest_size_bytes,
+                   [&clear_page_table, &gpu_page_table](u64 page) {
+                       clear_page_table(page, gpu_page_table);
+                   });
     if (False(image.flags & ImageFlagBits::Sparse)) {
         const auto map_id = image.map_view_id;
         ForEachCPUPage(image.cpu_addr, image.guest_size_bytes, [this, map_id](u64 page) {
@@ -4957,9 +5930,10 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
         slot_map_views.erase(map_id);
         return;
     }
-    ForEachGPUPage(image.gpu_addr, image.guest_size_bytes, [this, &clear_page_table](u64 page) {
-        clear_page_table(page, (*channel_state->sparse_page_table));
-    });
+    ForEachGPUPage(image.gpu_addr, image.guest_size_bytes,
+                   [&clear_page_table, &sparse_page_table](u64 page) {
+                       clear_page_table(page, sparse_page_table);
+                   });
     auto it = sparse_views.find(image_id);
     ASSERT(it != sparse_views.end());
     auto& sparse_maps = it->second;
@@ -5230,6 +6204,7 @@ template <class P>
 void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
     NoteGpuModified(image);
     image.flags |= ImageFlagBits::GpuModified;
+    image.storage_written_levels = 0;
     SetModificationTick(slot_images, image, ++modification_tick);
 }
 
@@ -5284,6 +6259,7 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
     }
     SetModificationTick(slot_images, image, most_recent_tick);
     image.newest_alias_tick = most_recent_tick;
+    image.storage_written_levels = 0;
     if (any_modified) {
         NoteGpuModified(image);
         image.flags |= ImageFlagBits::GpuModified;
@@ -5313,6 +6289,13 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
 template <class P>
 void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool invalidate) {
     Image& image = slot_images[image_id];
+    if (is_modification && !invalidate && !async_overlap_downloads.empty() &&
+        WritebackWouldReload(image)) {
+        // Its write-back landing would reload it, but not once the GPU has written to it: a
+        // partial render now would keep guest memory's stale bytes where it doesn't draw. Land
+        // the write-backs first (they mark it for the upload below).
+        FinishAsyncOverlapDownloads(true);
+    }
     if (invalidate) {
         image.flags &= ~(ImageFlagBits::CpuModified | ImageFlagBits::GpuModified);
         if (False(image.flags & ImageFlagBits::Tracked)) {
@@ -5362,6 +6345,9 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
             VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Invalidation);
         }
         MarkModification(image);
+        if (drawing_render_targets && image.first_written_frame == 0) {
+            image.first_written_frame = frame_tick + 1;
+        }
     }
     lru_cache.Touch(image.lru_index, frame_tick);
     image.last_use_frame = frame_tick;
@@ -5534,6 +6520,74 @@ bool TextureCache<P>::IsFullClear(ImageViewId id) {
     }
     // Make sure the clear covers all texels in the subresource
     return ClearCovers(size.width, size.height);
+}
+
+template <class P>
+bool TextureCache<P>::ClearWritesWhole(const ImageInfo& info, GPUVAddr gpu_addr) const {
+    if (info.type != ImageType::e2D || info.resources.levels != 1 ||
+        info.resources.layers != 1 || info.num_samples != 1) {
+        return false;
+    }
+    const auto& regs = maxwell3d->regs;
+    const auto& surface = regs.clear_surface;
+    if (surface.layer != 0) {
+        return false;
+    }
+    const u32 width = info.size.width;
+    const u32 height = info.size.height;
+    if (!ClearCovers(width, height)) {
+        return false;
+    }
+    // The clear covers the framebuffer's render area, the smallest bound target.
+    for (u32 index = 0; index < regs.rt_control.count && index < NUM_RT; ++index) {
+        const auto& rt = regs.rt[index];
+        if (rt.Address() != 0 && rt.format != Tegra::RenderTargetFormat::NONE &&
+            (rt.width < width || rt.height < height)) {
+            return false;
+        }
+    }
+    if (regs.zeta_enable && regs.zeta.Address() != 0 &&
+        (regs.zeta_size.width < width || regs.zeta_size.height < height)) {
+        return false;
+    }
+    const bool is_depth_target = regs.zeta_enable && regs.zeta.Address() == gpu_addr;
+    const bool full_stencil = surface.S && regs.stencil_front_mask == 0xFF;
+    switch (VideoCore::Surface::GetFormatType(info.format)) {
+    case VideoCore::Surface::SurfaceType::ColorTexture: {
+        // OpenGL clears draw buffer RT, which writes target rt_control.Map(RT).
+        const u32 index = surface.RT;
+        return surface.R && surface.G && surface.B && surface.A && index < NUM_RT &&
+               index < regs.rt_control.count && regs.rt_control.Map(index) == index &&
+               regs.rt[index].Address() == gpu_addr;
+    }
+    case VideoCore::Surface::SurfaceType::Depth:
+        return is_depth_target && surface.Z;
+    case VideoCore::Surface::SurfaceType::Stencil:
+        return is_depth_target && full_stencil;
+    case VideoCore::Surface::SurfaceType::DepthStencil:
+        return is_depth_target && surface.Z && full_stencil;
+    default:
+        return false;
+    }
+}
+
+template <class P>
+void TextureCache<P>::NoteClearedWhole() {
+    // A clear that writes all of a target replaces its contents: write-backs noted before it are
+    // no newer than what it holds (OverlapHasNewerData's smaller newer write-backs).
+    const auto note = [&](ImageViewId id) {
+        if (!PreparesImage(slot_image_views, id)) {
+            return;
+        }
+        ImageBase& image = slot_images[slot_image_views[id].image_id];
+        if (ClearWritesWhole(image.info, image.gpu_addr)) {
+            image.load_tick = image.modification_tick;
+        }
+    };
+    for (const ImageViewId id : render_targets.color_buffer_ids) {
+        note(id);
+    }
+    note(render_targets.depth_buffer_id);
 }
 
 template <class P>

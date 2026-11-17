@@ -1371,10 +1371,15 @@ void RasterizerOpenGL::SyncLineState() {
 
 void RasterizerOpenGL::SyncPolygonOffset() {
     auto& flags = maxwell3d->dirty.flags;
-    if (!flags[Dirty::PolygonOffset]) {
+    const float slope_scale =
+        texture_cache.IsRescaling() && maxwell3d->regs.viewport_scale_offset_enabled
+            ? Settings::values.resolution_info.up_factor
+            : 1.0f;
+    if (!flags[Dirty::PolygonOffset] && slope_scale == polygon_offset_slope_scale) {
         return;
     }
     flags[Dirty::PolygonOffset] = false;
+    polygon_offset_slope_scale = slope_scale;
 
     const auto& regs = maxwell3d->regs;
     if (far_plane_draw) {
@@ -1393,7 +1398,7 @@ void RasterizerOpenGL::SyncPolygonOffset() {
     if (regs.polygon_offset_fill_enable || regs.polygon_offset_line_enable ||
         regs.polygon_offset_point_enable) {
         // Hardware divides polygon offset units by two
-        glPolygonOffsetClamp(regs.slope_scale_depth_bias, regs.depth_bias / 2.0f,
+        glPolygonOffsetClamp(regs.slope_scale_depth_bias * slope_scale, regs.depth_bias / 2.0f,
                              regs.depth_bias_clamp);
     }
 }
@@ -1492,8 +1497,14 @@ AccelerateDMA::AccelerateDMA(BufferCache& buffer_cache_, TextureCache& texture_c
     : buffer_cache{buffer_cache_}, texture_cache{texture_cache_} {}
 
 bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount) {
-    std::scoped_lock lock{buffer_cache.mutex};
-    return buffer_cache.DMACopy(src_address, dest_address, amount);
+    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    // DMACopy copies guest memory without telling the texture cache (see the Vulkan rasterizer).
+    boost::container::small_vector<std::pair<DAddr, size_t>, 4> gpu_written;
+    if (!buffer_cache.DMACopy(src_address, dest_address, amount, &gpu_written)) {
+        return false;
+    }
+    texture_cache.WriteDmaCopy(src_address, dest_address, amount, gpu_written);
+    return true;
 }
 
 bool AccelerateDMA::BufferClear(GPUVAddr src_address, u64 amount, u32 value) {

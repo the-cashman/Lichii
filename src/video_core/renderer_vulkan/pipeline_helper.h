@@ -710,7 +710,9 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
                 view_index = static_cast<size_t>(view - record->views_begin);
                 if (const TextureCache::BindingMemo* const memo = record->memos[view_index]) {
                     if (desc.is_written) {
-                        texture_cache.MarkModification(memo->image);
+                        // memo->view == view->id (FindImageBindings): the storage-write history
+                        // of #2104 needs the view's range.
+                        texture_cache.MarkStorageWrite(view->id);
                     }
                     guest_descriptor_queue.AddPayload(memo->payload.data());
                     is_rescaled |= memo->rescaled != 0;
@@ -721,7 +723,7 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
             const VkImageView vk_image_view{
                 image_view.StorageView(desc.type, desc.format, desc.is_byte_addressed)};
             if (desc.is_written) {
-                texture_cache.MarkModification(image_view.image_id);
+                texture_cache.MarkStorageWrite(view->id);
             }
             guest_descriptor_queue.AddImage(vk_image_view);
             const bool element_rescaled{texture_cache.IsRescaling(image_view)};

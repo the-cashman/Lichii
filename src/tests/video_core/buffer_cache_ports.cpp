@@ -2660,3 +2660,30 @@ TEST_CASE("A DMA clear finds buffers past the first quarter of its range", "[buf
     REQUIRE_FALSE(f.cache->DMAClear(0x200000, 0x200, 0x09090909));
     REQUIRE(f.cache->DMAClear(0x200000, 0x201, 0x09090909));
 }
+
+TEST_CASE("A DMA copy names the destination ranges whose GPU-written bytes guest memory lacks",
+          "[buffer_ports]") {
+    KeepFixture f{nullptr};
+    f.Draw(nullptr); // Binds the channel DMACopy uses.
+    auto& buffer = Access::Get(*f.cache, f.id);
+    // The GPU wrote the first half of the source; guest memory holds older bytes there.
+    std::memset(f.bytes + 0x4000, 1, 0x40);
+    std::fill_n(buffer.bytes.begin() + 0x4000, 0x20, u8{9});
+    Access::MarkWritten(*f.cache, f.id, 0x14000, 0x20);
+    boost::container::small_vector<std::pair<DAddr, size_t>, 4> gpu_written;
+    REQUIRE(f.cache->DMACopy(0x104000, 0x106000, 0x40, &gpu_written));
+    REQUIRE(gpu_written.size() == 1);
+    REQUIRE(gpu_written[0] == std::pair<DAddr, size_t>{0x16000, 0x20});
+    // An image over the first half uploading now would take the older bytes.
+    REQUIRE(std::all_of(f.bytes + 0x6000, f.bytes + 0x6040, [](u8 b) { return b == 1; }));
+    f.cache->DownloadMemory(0x16000, 0x40);
+    REQUIRE(std::all_of(f.bytes + 0x6000, f.bytes + 0x6020, [](u8 b) { return b == 9; }));
+    REQUIRE(std::all_of(f.bytes + 0x6020, f.bytes + 0x6040, [](u8 b) { return b == 1; }));
+
+    // A source only the CPU wrote: the destination's guest memory has its bytes at once.
+    std::memset(f.bytes + 0x5000, 7, 0x20);
+    f.cache->WriteMemory(0x15000, 0x20);
+    REQUIRE(f.cache->DMACopy(0x105000, 0x107000, 0x20, &gpu_written));
+    REQUIRE(gpu_written.empty());
+    REQUIRE(std::all_of(f.bytes + 0x7000, f.bytes + 0x7020, [](u8 b) { return b == 7; }));
+}

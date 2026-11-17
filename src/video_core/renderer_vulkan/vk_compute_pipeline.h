@@ -6,10 +6,12 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
 #include <span>
+#include <utility>
 
 #include <boost/container/small_vector.hpp>
 
@@ -33,6 +35,7 @@ namespace Vulkan {
 
 class Device;
 class PipelineBinaries;
+class PipelineCache;
 class PipelineStatistics;
 class Scheduler;
 
@@ -61,12 +64,22 @@ public:
 
     using BindCommand = std::function<void(vk::CommandBuffer)>;
 
-    [[nodiscard]] bool Configure(Tegra::Engines::KeplerCompute& kepler_compute,
-                                 Tegra::MemoryManager& gpu_memory, Scheduler& scheduler,
-                                 BufferCache& buffer_cache, TextureCache& texture_cache,
-                                 TextureCacheRuntime& texture_runtime,
-                                 std::optional<ByteAddressedShadow>& shadow,
-                                 BindCommand* deferred_bind = nullptr);
+    enum class ConfigureResult {
+        Ready,
+        Failed,
+        /// The pipeline is still building and the dispatch is skipped
+        /// (PipelineCache::SkipUnbuiltDispatch); nothing was bound or marked written.
+        Skipped,
+    };
+
+    [[nodiscard]] ConfigureResult Configure(Tegra::Engines::KeplerCompute& kepler_compute,
+                                            Tegra::MemoryManager& gpu_memory,
+                                            Scheduler& scheduler, BufferCache& buffer_cache,
+                                            TextureCache& texture_cache,
+                                            TextureCacheRuntime& texture_runtime,
+                                            PipelineCache& pipelines,
+                                            std::optional<ByteAddressedShadow>& shadow,
+                                            BindCommand* deferred_bind = nullptr);
 
     /// Whether the bindings fit an Ocarina upscale pass: one written image, no other writes.
     [[nodiscard]] bool CanReplaceOcarinaUpscale() const;
@@ -85,9 +98,18 @@ public:
         return is_built.load(std::memory_order_acquire);
     }
 
+    /// Raises its build to NeedNow and waits up to `timeout` for it.
+    /// @return True when the pipeline is built.
+    [[nodiscard]] bool WaitBuilt(std::chrono::microseconds timeout);
+
     /// The SPIR-V (zstd) the pipeline was built from; read it only once IsBuilt().
     [[nodiscard]] const std::vector<u8>& KeptSpirv() const noexcept {
         return kept_spirv;
+    }
+
+    /// True the first time it is called, so a dispatch's wait for this build is logged once
+    [[nodiscard]] bool FirstWaitForBuild() noexcept {
+        return !std::exchange(wait_logged, true);
     }
 
     /// Storage images written by the last configured dispatch
@@ -133,6 +155,7 @@ private:
     u64 shader_hash{};
     u32 num_descriptor_entries{};
     boost::container::small_vector<VideoCommon::ImageViewId, 8> written_images;
+    bool wait_logged{};
     std::vector<SampledImage> sampled_images;
 
     VideoCommon::ComputeUniformBufferSizes uniform_buffer_sizes{};

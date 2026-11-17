@@ -13,6 +13,7 @@
 #include "common/logging.h"
 #include "video_core/vulkan_common/vk_enum_string_helper.h"
 #include "video_core/vulkan_common/vma.h"
+#include "video_core/vulkan_common/vulkan_address_map.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Vulkan::vk {
@@ -305,6 +306,9 @@ void SetObjectName(const DeviceDispatch* dld, VkDevice device, T handle, VkObjec
     };
     if (dld->vkSetDebugUtilsObjectNameEXT) {
         Check(dld->vkSetDebugUtilsObjectNameEXT(device, &name_info));
+    }
+    if (Vulkan::AddressMap::Wanted()) {
+        Vulkan::AddressMap::Get().Name(reinterpret_cast<u64>(handle), name);
     }
 }
 
