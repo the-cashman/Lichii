@@ -128,8 +128,8 @@ private:
     std::jthread thread;
 };
 
-/// EDEN_NX2_LAZY_UNTRACK=1: a page the GPU back thread untracks keeps its cached count (and so its
-/// write protection) for up to two frames. When the buffer cache tracks it again in that time
+/// EDEN_NX2_LAZY_UNTRACK (on unless =0): a page the GPU back thread untracks keeps its cached
+/// count (and so its write protection) for up to two frames. When the buffer cache tracks it again in that time
 /// (the next draw's sync uploads the guest's write and re-protects it: Ocarina's usual cycle), the
 /// held count is used instead of a new one: no unprotect and no protect, two mprotects saved.
 /// Pages not tracked again are released at the frame tick (TickFrame), and any range is released
@@ -149,8 +149,13 @@ public:
 
     [[nodiscard]] static int Level() noexcept {
         static const int level = [] {
+            // On (1) by default: Ocarina village/Kokiri +5-6 % fps (GPUBack -1 ms/frame), pacing
+            // and images unchanged. =0 turns it off, =2 also holds guest-trap untracks.
             const char* value = std::getenv("EDEN_NX2_LAZY_UNTRACK");
-            return value != nullptr && (value[0] == '1' || value[0] == '2') ? value[0] - '0' : 0;
+            if (value == nullptr || value[0] == '\0') {
+                return 1;
+            }
+            return value[0] == '1' || value[0] == '2' ? value[0] - '0' : 0;
         }();
         return level;
     }
