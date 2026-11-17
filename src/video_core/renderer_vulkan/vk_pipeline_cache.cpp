@@ -1060,13 +1060,12 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     }
     const bool mesh_draw =
         maxwell3d->GetNativeMacroEngine().native_turing && maxwell3d->regs.IsMeshEnabled();
-    // The key holds vertex input a mesh key lent it (#2012), not the registers': refresh it in full.
-    bool vertex_input_returned = false;
     if (vertex_input_lent && !mesh_draw) {
-        // Refresh keeps the key's vertex input until the registers change it.
+        // Refresh keeps the key's vertex input until the registers change it (#2012). The state
+        // watch below sees the flag too: it patches the dynamic attribute types from the
+        // registers, or without dynamic vertex input sends the key to a full Refresh.
         vertex_input_lent = false;
         maxwell3d->dirty.flags[Dirty::VertexInput] = true;
-        vertex_input_returned = true;
     }
     // EDEN_NX2_PIPE_SKIP: when nothing Refresh reads changed, the state part of the key stands;
     // with the same shaders too, so does the pipeline the last lookup found for it.
@@ -1074,7 +1073,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     bool state_same = false;
     // EDEN_NX2_PIPE_PATCH: blending or attribute types alone moved: redo only those parts.
     PipelineStateWatch::Patch patch{};
-    if (skip && !vertex_input_returned) {
+    if (skip) {
         if (graphics_key.state.xfb_enabled != 0) {
             Memo::Note(Stat::PipeMissXfb);
         } else {
