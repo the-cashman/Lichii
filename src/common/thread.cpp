@@ -180,6 +180,26 @@ const IsolationPlan& Isolation() {
             }
             p.reserved.push_back(core);
         }
+        // EDEN_NX2_ISOLATE_SPARE=<n>: also keep the process off the n lowest physical cores, so
+        // the system's own tasks (compositor, Steam, overlays) find a fully idle core to wake on
+        // instead of an idle SMT sibling, such as the isolated GPUBack's (which runs about a third
+        // slower while its sibling is busy).
+        if (const char* spare_text = std::getenv("EDEN_NX2_ISOLATE_SPARE")) {
+            int spare = std::atoi(spare_text);
+            for (int c = 0; c < CPU_SETSIZE && spare > 0; ++c) {
+                if (!CPU_ISSET(c, &p.rest)) {
+                    continue;
+                }
+                cpu_set_t core;
+                SiblingsOf(c, &core);
+                for (int s = 0; s < CPU_SETSIZE; ++s) {
+                    if (CPU_ISSET(s, &core)) {
+                        CPU_CLR(s, &p.rest);
+                    }
+                }
+                --spare;
+            }
+        }
         // Leave at least four CPUs to everything else, or don't isolate at all.
         if (p.reserved.size() != p.names.size() || CPU_COUNT(&p.rest) < 4) {
             p.names.clear();
