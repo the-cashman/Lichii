@@ -121,3 +121,43 @@ workaround succeeded. Compare screenshots from the same camera motion and save.
 The log also rejects a separate `SURED.D.3D.ADD` compute program at 117.963 seconds.
 That is a real unsupported shader form, but the evidence does not connect it to
 the temporal trails. This change does not hide or alter that rejection.
+
+## FSR 4 in place of the network (bazzite)
+
+With `EDEN_NX2_FSR4_LIB` naming an FFX API upscaler library (the fsr4-vk port on Linux):
+
+- `EDEN_NX2_STARFOX_FSR4=1`: AMD FSR 4 replaces the spatial de-jitter at the scene's size, 1:1
+  (native anti-aliasing): its output goes into the network's own output, which the game's later
+  passes and its 4K upscale read as before.
+- `EDEN_NX2_STARFOX_FSR4=4k`: FSR 4 upscales the scene to 3840x2160 into the image the game's own
+  4K upscale stores, and that dispatch is skipped; the spatial result still goes into the
+  network's output for the passes after it. HUD, subtitles and letterbox draw on top as usual.
+  The upscale is one program per ratio: `4027797e061f5eb4` (2x from 1920x1080) and
+  `3ce869c4af978538` (1.5x from 2560x1440, `render.resolution_scale_console` 0.6667).
+- `EDEN_NX2_FE_FSR4=1` (Fire Emblem: Fortune's Weave): FSR 4 in place of FSR 3.1 on its temporal
+  path, with HDR colour and automatic exposure as FSR 3.1 takes it; FSR 3.1 takes over if FSR 4
+  can't start or dispatch.
+- Without the library, or if FSR 4 fails, each game keeps its previous replacement.
+
+Contract of the prepass (`ebab31dd6f0fc08d`), from a contract trace:
+
+| cbuf0 | Image | Use |
+| --- | --- | --- |
+| `+0x278` | A8B8G8R8 sRGB, scene size | colour (tonemapped, jittered) |
+| `+0x290` | R16G16 float | motion, UV units, the sign Fire Emblem's has |
+| `+0x298` | Z32_X24S8 | depth, reversed (near 1; the letterbox is cleared to 1) |
+| `+0x2b0` | R8 | DLSS bias mask (not passed on yet) |
+| `+0x280`, `+0x350` | RGBA16 float | the network's history |
+| `+0x1b0` | two floats | jitter in input pixels |
+
+fsr4-vk takes neither 8-bit sRGB nor B10G11R11 colour, nor a D32S8 depth view: the colour goes
+through `vkCmdBlitImage` into an RGBA16F image (an sRGB image's texels are decoded to linear, the
+values the spatial path writes) and the depth aspect is copied through a buffer into a D32 image.
+FFX knows no packed ABGR Vulkan formats; they are passed as their R8G8B8A8 equivalent.
+
+The network runs only in cutscenes, menus and the title. In gameplay (the training flight and the
+first mission) no network pass and no motion-vector pass run, at a 1080p and at a 1440p scene
+(`EDEN_NX2_SF_TRACE=1` logs the native compute programs of every 10 s), so neither replacement
+reaches gameplay. The game picks its anti-aliasing mode per scene from scripts
+(`render/antialiasing.vscript`, `temporal_antialiasing_settings.vscript`,
+`draw.antialiasing_mode`).

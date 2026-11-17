@@ -17,6 +17,7 @@
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_dlss_network_probe.h"
 #include "video_core/renderer_vulkan/vk_fsr3_upscaler.h"
+#include "video_core/renderer_vulkan/vk_fsr4_upscaler.h"
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/renderer_vulkan/vk_streamline_dlss.h"
 #endif
@@ -270,6 +271,24 @@ public:
                          std::array<f32, 2> motion_scale);
     std::unique_ptr<Fsr3Upscaler> fsr3_upscaler;
     bool fsr3_unsupported{};
+
+    /// bazzite: Star Fox's DLSS evaluation through AMD FSR 4 (EDEN_NX2_STARFOX_FSR4=1 and an FFX
+    /// API upscaler library in EDEN_NX2_FSR4_LIB), created on first use. False to fall back.
+    bool UpscaleWithFsr4(Framebuffer* dst_framebuffer, ImageView& input_color,
+                         ImageView& motion_vectors, ImageView& depth,
+                         std::array<u32, 2> render_size, std::array<f32, 2> jitter,
+                         std::array<f32, 2> motion_scale);
+    std::unique_ptr<Fsr4Upscaler> fsr4_upscaler;
+    vk::Sampler fsr4_point_sampler;
+    vk::Image fsr4_color_copy;   ///< RGBA16F (linear) copy of an 8-bit sRGB colour
+    VkExtent2D fsr4_color_extent{};
+    bool fsr4_color_fresh{};
+    vk::Image fsr4_depth_copy;   ///< D32 copy of a D32S8 depth's depth aspect
+    vk::Buffer fsr4_depth_buffer;
+    VkExtent2D fsr4_depth_extent{};
+    bool fsr4_depth_fresh{};
+    bool fsr4_unsupported{};
+    std::optional<std::chrono::steady_clock::time_point> fsr4_last_evaluation;
 
     /// The LOD bias Ocarina's FSR adds to mipmapped samplers this session (0 for other games or
     /// upscalers), resolved on first use.

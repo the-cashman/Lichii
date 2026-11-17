@@ -23,6 +23,16 @@ constexpr u64 StarFoxProgramId = 0x0400E88025B1A000ULL;
 constexpr u64 StarFoxPrepassProgramKey = 0xd686ca0b9fad9e6dULL;
 constexpr u64 StarFoxCutscenePrepassProgramKey = 0xebab31dd6f0fc08dULL;
 constexpr u64 StarFoxOutputProgramKey = 0x7d3764ff101bec27ULL;
+// The game's own upscale to 3840x2160: one sampled image, one stored A8B8G8R8 sRGB image, every
+// frame (gameplay and cutscenes). One program per ratio: 2x from 1920x1080 (translated
+// a2884a1f4cd841e7) and 1.5x from 2560x1440 (render.resolution_scale_console 0.6667, translated
+// b2dc199d950e9440).
+constexpr u64 StarFoxUpscaleProgramKey = 0x4027797e061f5eb4ULL;
+constexpr u64 StarFoxUpscale1440ProgramKey = 0x3ce869c4af978538ULL;
+
+constexpr bool IsStarFoxUpscale(u64 key) {
+    return key == StarFoxUpscaleProgramKey || key == StarFoxUpscale1440ProgramKey;
+}
 constexpr u64 DuskbloodsProgramId = 0x0400D1D02399A000ULL;
 constexpr u64 DuskbloodsPrepassProgramKey = 0xe5efe04581720f15ULL;
 constexpr u64 DuskbloodsOutputProgramKey = 0x50e47e31c31fc1f8ULL;

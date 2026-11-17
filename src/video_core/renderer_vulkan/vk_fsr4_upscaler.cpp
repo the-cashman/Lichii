@@ -224,8 +224,12 @@ bool Fsr4Upscaler::IsWanted(const Device& device) {
 
 Fsr4Upscaler::Fsr4Upscaler(const Device& device_, Scheduler& scheduler_,
                            MemoryAllocator& memory_allocator_, bool hdr_)
+    : Fsr4Upscaler(device_, scheduler_, memory_allocator_, Options{.hdr = hdr_}) {}
+
+Fsr4Upscaler::Fsr4Upscaler(const Device& device_, Scheduler& scheduler_,
+                           MemoryAllocator& memory_allocator_, Options options_)
     : device{device_}, scheduler{scheduler_}, memory_allocator{memory_allocator_},
-      api{FfxRuntime::Acquire()}, hdr{hdr_} {
+      api{FfxRuntime::Acquire()}, hdr{options_.hdr}, options{options_} {
     const auto provider = api ? FindFsr4(*api, device) : std::nullopt;
     if (!provider) {
         throw vk::Exception(VK_ERROR_FEATURE_NOT_PRESENT);
@@ -278,7 +282,12 @@ bool Fsr4Upscaler::CreateContext(VkExtent2D render_size, VkExtent2D upscale_size
     create.header.pNext = &api_version.header;
     // Tonemapped LDR colour (linear HDR in bazzite's HDR mode), standard (not reversed) finite
     // depth, exposure given (unit).
-    create.flags = hdr ? FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE : 0;
+    create.flags = (hdr ? FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE : 0) |
+                   (options.depth_inverted ? FFX_UPSCALE_ENABLE_DEPTH_INVERTED : 0) |
+                   (options.depth_infinite ? FFX_UPSCALE_ENABLE_DEPTH_INFINITE : 0) |
+                   (options.jitter_in_motion ? FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION
+                                             : 0) |
+                   (options.auto_exposure ? FFX_UPSCALE_ENABLE_AUTO_EXPOSURE : 0);
     create.maxRenderSize = {render_size.width, render_size.height};
     create.maxUpscaleSize = {upscale_size.width, upscale_size.height};
     create.fpMessage = Message;
@@ -409,8 +418,10 @@ bool Fsr4Upscaler::Upscale(const Inputs& in) {
                               FFX_API_RESOURCE_STATE_COMPUTE_READ);
     dispatch.motionVectors = Resource(in.motion_vectors.image, in.motion_vectors.format,
                                       in.render_size, 0, FFX_API_RESOURCE_STATE_COMPUTE_READ);
-    dispatch.exposure = Resource(*exposure_image, VK_FORMAT_R32_SFLOAT, {1, 1}, 0,
-                                 FFX_API_RESOURCE_STATE_COMPUTE_READ);
+    if (!options.auto_exposure) {
+        dispatch.exposure = Resource(*exposure_image, VK_FORMAT_R32_SFLOAT, {1, 1}, 0,
+                                     FFX_API_RESOURCE_STATE_COMPUTE_READ);
+    }
     if (in.reactive) {
         dispatch.reactive = Resource(in.reactive->image, in.reactive->format, in.render_size, 0,
                                      FFX_API_RESOURCE_STATE_COMPUTE_READ);
@@ -418,7 +429,7 @@ bool Fsr4Upscaler::Upscale(const Inputs& in) {
     dispatch.output = Resource(*output_image, OUTPUT_FORMAT, in.upscale_size,
                                FFX_API_RESOURCE_USAGE_UAV, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
     dispatch.jitterOffset = {in.jitter[0], in.jitter[1]};
-    dispatch.motionVectorScale = {1.0f, 1.0f};
+    dispatch.motionVectorScale = {in.motion_vector_scale[0], in.motion_vector_scale[1]};
     dispatch.renderSize = {in.render_size.width, in.render_size.height};
     dispatch.upscaleSize = {in.upscale_size.width, in.upscale_size.height};
     dispatch.enableSharpening = in.sharpen;
