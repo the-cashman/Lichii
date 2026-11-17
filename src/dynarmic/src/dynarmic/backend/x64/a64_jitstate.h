@@ -71,6 +71,16 @@ struct A64JitState {
     u64 host_stack_limit = 0;  // a call below this drops all frames
     u8 check_bit = 0;
 
+    // This Jit's own objects, read by emitted code so one block serves every Jit.
+    u64 callbacks = 0;  // UserCallbacks*
+    u64 jit_impl = 0;
+    u64 user_config = 0;  // const UserConfig*
+    u64 tpidr_el0 = 0;
+    u64 tpidrro_el0 = 0;
+    u64 exclusive_address = 0;  // this processor's slot in the global monitor
+    u64 exclusive_value = 0;
+    u64 fast_dispatch_table = 0;
+
     u32 GetPstate() const {
         return NZCV::FromX64(cpsr_nzcv);
     }

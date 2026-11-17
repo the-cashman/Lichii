@@ -28,6 +28,9 @@ enum class PrecompileResult {
     Full,       ///< Less code space left than asked to keep free: nothing was emitted
 };
 
+/// An empty code cache for UserConfig::shared_code_cache (x64 backend only).
+std::shared_ptr<SharedCodeCache> MakeSharedCodeCache();
+
 class Jit final {
 public:
     explicit Jit(UserConfig conf);

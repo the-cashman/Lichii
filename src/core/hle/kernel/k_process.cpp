@@ -3,6 +3,7 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <random>
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -1320,10 +1321,22 @@ void KProcess::InitializeInterfaces(KernelCore& kernel) {
     } else
 #endif
         if (this->Is64Bit()) {
+        // One JIT code cache for all cores; MakeJit falls back to a cache per core where it can't.
+        std::shared_ptr<Dynarmic::A64::SharedCodeCache> code_cache;
+#ifdef ARCHITECTURE_x86_64
+        // EDEN_NX2_SHARED_JIT=0: a cache per core, as before (pace-up A/B switch).
+        static const bool shared_jit = [] {
+            const char* const value = std::getenv("EDEN_NX2_SHARED_JIT");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (kernel.IsMulticore() && shared_jit) {
+            code_cache = Dynarmic::A64::MakeSharedCodeCache();
+        }
+#endif
         for (size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; i++) {
             m_arm_interfaces[i] = std::make_unique<Core::ArmDynarmic64>(
                 kernel.System(), kernel.IsMulticore(), this,
-                static_cast<Core::DynarmicExclusiveMonitor&>(*m_exclusive_monitor), i);
+                static_cast<Core::DynarmicExclusiveMonitor&>(*m_exclusive_monitor), i, code_cache);
         }
     } else {
         for (size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; i++) {

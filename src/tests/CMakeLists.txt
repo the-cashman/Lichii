@@ -324,6 +324,18 @@ add_test(NAME ncz_tests COMMAND ncz_tests)
 if (TARGET dynarmic::dynarmic)
     target_sources(tests PRIVATE core/jit_codegen_options.cpp core/jit_ordered_loads.cpp core/jit_warmup.cpp core/window_trace.cpp)
     target_link_libraries(tests PRIVATE dynarmic::dynarmic)
+
+    # The shared code cache is x64 only.
+    if (ARCHITECTURE_x86_64)
+        target_sources(tests PRIVATE core/jit_shared_cache.cpp)
+
+        # The shared code cache test on its own for ThreadSanitizer: configure a separate build with
+        # -DCMAKE_C_FLAGS=-fsanitize=thread -DCMAKE_CXX_FLAGS=-fsanitize=thread (dynarmic must be
+        # instrumented too), then build and run jit_shared_cache_tests.
+        add_executable(jit_shared_cache_tests EXCLUDE_FROM_ALL core/jit_shared_cache.cpp)
+        target_link_libraries(jit_shared_cache_tests PRIVATE common dynarmic::dynarmic
+            Catch2::Catch2WithMain Threads::Threads)
+    endif()
 endif()
 
 target_compile_definitions(tests PRIVATE

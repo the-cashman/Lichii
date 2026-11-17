@@ -23,6 +23,8 @@ class ExclusiveMonitor;
 namespace Dynarmic {
 namespace A64 {
 
+struct SharedCodeCache;
+
 using VAddr = std::uint64_t;
 
 using Vector = std::array<std::uint64_t, 2>;
@@ -214,6 +216,11 @@ struct UserConfig {
     // Minimum size is about 8MiB. Maximum size is about 128MiB (arm64 host) or 2GiB (x64 host).
     // Maximum size is limited by the maximum length of a x86_64 / arm64 jump.
     std::uint32_t code_cache_size = 128 * 1024 * 1024;  // bytes
+
+    /// x64 backend: Jits made with the same cache (MakeSharedCodeCache) run each other's code.
+    /// They must emulate one process (same page table and fastmem arena), count no cycles, use
+    /// compact_block_exits and be destroyed together. The first Jit's config sizes the cache.
+    std::shared_ptr<SharedCodeCache> shared_code_cache;
 
     /// Diagnostics: when set, the x64 backend counts here the dispatcher's C++ block lookups,
     /// the blocks it compiles and full code cache clears; the arm64 backend counts compiled
