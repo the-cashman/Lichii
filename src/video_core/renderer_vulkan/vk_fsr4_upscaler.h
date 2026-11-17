@@ -85,6 +85,11 @@ public:
     /// layout). False when FSR 4 can't run (the caller then uses FSR 3.1 from now on).
     bool Upscale(const Inputs& inputs);
 
+    /// Creates the context for these sizes and runs one evaluation of throwaway images, then waits
+    /// for it: FSR 4 builds its pipelines at its first dispatch (seconds on a cold shader cache),
+    /// which then happens here instead of in the middle of play.
+    void Prewarm(VkExtent2D render_size, VkExtent2D upscale_size);
+
     [[nodiscard]] bool Failed() const noexcept {
         return failed.load();
     }

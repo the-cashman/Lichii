@@ -433,6 +433,7 @@ private:
     /// upscale dispatch is skipped then).
     std::optional<Texture::TICEntry> sf_upscale_target;
     bool sf_upscale_written{};
+    bool sf_fsr4_prewarmed{};
     bool ProcessNativeMethod(Core::System& system, u32 method, u32 argument, bool is_last_call);
     NativeQmdScheduler native_qmd;
     std::array<u32, 0xc00>* native_data_ram{};

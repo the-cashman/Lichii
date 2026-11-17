@@ -6,6 +6,7 @@
 // and records into our command buffer. Picking the FSR 4 provider by version follows
 // CheezerWheezer's FSR 4 integration for CheezyEmu.
 
+#include <chrono>
 #include <cstdlib>
 #include <optional>
 #include <string>
@@ -390,6 +391,81 @@ void Fsr4Upscaler::CreateOutput(VkExtent2D upscale_size) {
                                        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
                                        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL));
     });
+}
+
+void Fsr4Upscaler::Prewarm(VkExtent2D render_size, VkExtent2D upscale_size) {
+    if (failed.load()) {
+        return;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    const auto make = [&](VkFormat format) {
+        return memory_allocator.CreateImage(VkImageCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .imageType = VK_IMAGE_TYPE_2D,
+            .format = format,
+            .extent = {render_size.width, render_size.height, 1},
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = 0,
+            .pQueueFamilyIndices = nullptr,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        });
+    };
+    vk::Image color = make(VK_FORMAT_R16G16B16A16_SFLOAT);
+    vk::Image depth = make(VK_FORMAT_D32_SFLOAT);
+    vk::Image motion = make(VK_FORMAT_R16G16_SFLOAT);
+    static constexpr VkImageSubresourceRange DEPTH_RANGE{
+        .aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
+        .baseMipLevel = 0,
+        .levelCount = 1,
+        .baseArrayLayer = 0,
+        .layerCount = 1,
+    };
+    // Contents don't matter (the result is thrown away and the first real evaluation resets the
+    // history); Upscale expects its inputs in GENERAL.
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record([c = *color, d = *depth, m = *motion](vk::CommandBuffer cmdbuf) {
+        const std::array barriers{
+            Barrier(c, COLOR_RANGE, 0, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                    VK_IMAGE_LAYOUT_GENERAL),
+            Barrier(d, DEPTH_RANGE, 0, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                    VK_IMAGE_LAYOUT_GENERAL),
+            Barrier(m, COLOR_RANGE, 0, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                    VK_IMAGE_LAYOUT_GENERAL),
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, {}, {}, barriers);
+    });
+    const bool done = Upscale({
+        .color = {*color, VK_FORMAT_R16G16B16A16_SFLOAT, COLOR_RANGE, VK_IMAGE_ASPECT_COLOR_BIT},
+        .depth = {*depth, VK_FORMAT_D32_SFLOAT, DEPTH_RANGE, VK_IMAGE_ASPECT_DEPTH_BIT},
+        .motion_vectors = {*motion, VK_FORMAT_R16G16_SFLOAT, COLOR_RANGE,
+                           VK_IMAGE_ASPECT_COLOR_BIT},
+        .reactive = std::nullopt,
+        .render_size = render_size,
+        .upscale_size = upscale_size,
+        .frame_time_ms = 1000.0f / 60.0f,
+        .reset = true,
+        .sharpen = false,
+        .sharpness = 0.0f,
+        .vertical_fov = 1.0f,
+    });
+    scheduler.InvalidateState();
+    // The dispatch is recorded on the scheduler's thread: wait for it here (the throwaway images
+    // must outlive it).
+    scheduler.Finish();
+    LOG_INFO(Render_Vulkan, "FSR 4: prewarmed {}x{} -> {}x{} in {} ms{}", render_size.width,
+             render_size.height, upscale_size.width, upscale_size.height,
+             std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - start)
+                 .count(),
+             done && !failed.load() ? "" : " (failed)");
 }
 
 bool Fsr4Upscaler::Upscale(const Inputs& in) {

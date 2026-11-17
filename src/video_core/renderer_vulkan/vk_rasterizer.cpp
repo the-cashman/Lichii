@@ -4262,6 +4262,12 @@ std::optional<VideoCore::GameDlssProbe> RasterizerVulkan::ProbeGameDlssOutput(
     return texture_cache.ProbeGameDlssOutput(dst, src, src_region);
 }
 
+void RasterizerVulkan::PrewarmTemporalUpscale(std::array<u32, 2> render_size,
+                                              std::array<u32, 2> upscale_size) {
+    std::scoped_lock lock{texture_cache.mutex};
+    texture_cache_runtime.PrewarmFsr4(render_size, upscale_size);
+}
+
 bool RasterizerVulkan::AccelerateTemporalUpscale(
     const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst,
     const Tegra::Engines::Fermi2D::Surface& motion_vectors, const Tegra::Texture::TICEntry* depth,

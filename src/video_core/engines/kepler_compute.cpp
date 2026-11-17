@@ -1105,12 +1105,29 @@ bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
     if (!passes) {
         return false;
     }
-    if (program_id == StarFoxProgramId && IsStarFoxUpscale(native_key) && StarFoxFsr4At4k()) {
+    if (program_id == StarFoxProgramId && IsStarFoxUpscale(native_key) && StarFoxFsr4()) {
         // Remember where the game's 4K upscale stores; skip it when FSR 4 drew there already.
         const auto [reads, stores] = NativeImageHandles(regs.code_loc.Address());
         std::optional<Texture::TICEntry> target;
+        std::optional<Texture::TICEntry> source;
         if (reads.size() == 1 && stores.size() == 1) {
             target = ConstBuffer0Image(stores.front());
+            source = ConstBuffer0Image(reads.front());
+        }
+        // The upscale runs from the boot logos on, long before the first DLSS evaluation (the
+        // title): build FSR 4's pipelines now, at the sizes this upscale shows (its input is the
+        // scene's size), not as a multi-second stall at the first evaluation.
+        if (!sf_fsr4_prewarmed && target && source && source->Width() >= 64 &&
+            source->Height() >= 64 && target->Width() >= source->Width() &&
+            target->Height() >= source->Height()) {
+            sf_fsr4_prewarmed = true;
+            const std::array<u32, 2> scene{source->Width(), source->Height()};
+            rasterizer->PrewarmTemporalUpscale(
+                scene, StarFoxFsr4At4k() ? std::array<u32, 2>{target->Width(), target->Height()}
+                                         : scene);
+        }
+        if (!StarFoxFsr4At4k()) {
+            return false;
         }
         const bool written = std::exchange(sf_upscale_written, false);
         const bool same = target && sf_upscale_target &&

@@ -159,6 +159,10 @@ public:
                          std::array<u32, 2> render_size, std::array<f32, 2> jitter,
                          std::array<f32, 2> motion_scale, bool use_history);
 
+    /// bazzite: builds the FSR 4 replacement's pipelines ahead of its first use (once; only when a
+    /// game's FSR 4 replacement is requested).
+    void PrewarmFsr4(std::array<u32, 2> render_size, std::array<u32, 2> upscale_size);
+
     /// True when TemporalUpscale would use the depth (FSR 3.1 not forced off and not failed).
     [[nodiscard]] bool WantsTemporalUpscaleDepth() const;
 
@@ -278,7 +282,14 @@ public:
                          ImageView& motion_vectors, ImageView& depth,
                          std::array<u32, 2> render_size, std::array<f32, 2> jitter,
                          std::array<f32, 2> motion_scale);
+    /// Creates the FSR 4 upscaler on first use; false when it can't run.
+    bool EnsureFsr4();
+    bool UpscaleWithFsr4Ready(Framebuffer* dst_framebuffer, ImageView& input_color,
+                              ImageView& motion_vectors, ImageView& depth,
+                              std::array<u32, 2> render_size, std::array<f32, 2> jitter,
+                              std::array<f32, 2> motion_scale);
     std::unique_ptr<Fsr4Upscaler> fsr4_upscaler;
+    bool fsr4_prewarmed{};
     vk::Sampler fsr4_point_sampler;
     vk::Image fsr4_color_copy;   ///< RGBA16F (linear) copy of an 8-bit sRGB colour
     VkExtent2D fsr4_color_extent{};

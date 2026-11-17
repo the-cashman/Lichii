@@ -2149,11 +2149,31 @@ f32 EnvFloat(const char* name, f32 fallback) {
 }
 } // Anonymous namespace
 
+void TextureCacheRuntime::PrewarmFsr4(std::array<u32, 2> render_size,
+                                      std::array<u32, 2> upscale_size) {
+    if (fsr4_prewarmed || !(StarFoxFsr4Requested() || FireEmblemFsr4Requested())) {
+        return;
+    }
+    fsr4_prewarmed = true;
+    if (!EnsureFsr4()) {
+        return;
+    }
+    fsr4_upscaler->Prewarm({render_size[0], render_size[1]}, {upscale_size[0], upscale_size[1]});
+}
+
 bool TextureCacheRuntime::UpscaleWithFsr4(Framebuffer* dst_framebuffer, ImageView& input_color,
                                           ImageView& motion_vectors, ImageView& depth,
                                           std::array<u32, 2> render_size,
                                           std::array<f32, 2> jitter,
                                           std::array<f32, 2> motion_scale) {
+    if (!EnsureFsr4()) {
+        return false;
+    }
+    return UpscaleWithFsr4Ready(dst_framebuffer, input_color, motion_vectors, depth, render_size,
+                                jitter, motion_scale);
+}
+
+bool TextureCacheRuntime::EnsureFsr4() {
     if (fsr4_unsupported) {
         return false;
     }
@@ -2211,6 +2231,14 @@ bool TextureCacheRuntime::UpscaleWithFsr4(Framebuffer* dst_framebuffer, ImageVie
                  inverted ? "inverted (infinite far)" : "standard", jitter_in_motion ? "in" : "ex",
                  hdr ? "HDR (auto exposure)" : "tonemapped");
     }
+    return true;
+}
+
+bool TextureCacheRuntime::UpscaleWithFsr4Ready(Framebuffer* dst_framebuffer,
+                                               ImageView& input_color, ImageView& motion_vectors,
+                                               ImageView& depth, std::array<u32, 2> render_size,
+                                               std::array<f32, 2> jitter,
+                                               std::array<f32, 2> motion_scale) {
     const VkExtent2D extent = dst_framebuffer->RenderArea();
     const auto now = std::chrono::steady_clock::now();
     const f32 frame_time_ms =

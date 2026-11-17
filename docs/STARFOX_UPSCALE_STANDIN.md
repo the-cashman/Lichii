@@ -138,6 +138,10 @@ With `EDEN_NX2_FSR4_LIB` naming an FFX API upscaler library (the fsr4-vk port on
   path, with HDR colour and automatic exposure as FSR 3.1 takes it; FSR 3.1 takes over if FSR 4
   can't start or dispatch.
 - Without the library, or if FSR 4 fails, each game keeps its previous replacement.
+- FSR 4 builds its pipelines at its first dispatch, 3-4 s on a cold shader cache. For Star Fox
+  this happens when the game's 4K upscale is first seen (the boot logos, ~7 s in): a throwaway
+  evaluation at the scene's size (`FSR 4: prewarmed ... in N ms` in the log), not at the first
+  DLSS evaluation on the title screen.
 
 Contract of the prepass (`ebab31dd6f0fc08d`), from a contract trace:
 
