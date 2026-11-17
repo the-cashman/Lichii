@@ -1,0 +1,3 @@
+# ExclusiveMonitor's SpinLock runs code dynarmic emits (spin_lock_x64.cpp), which ThreadSanitizer
+# does not see, so every access it guards looks unsynchronized.
+race:Dynarmic::ExclusiveMonitor::

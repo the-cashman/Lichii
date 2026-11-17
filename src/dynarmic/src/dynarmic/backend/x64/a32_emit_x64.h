@@ -100,6 +100,12 @@ public:
     void AddFastmemPatch(CodePtr location, CodePtr resume_location, void (*callback)(), const DoNotFastmemMarker& marker, bool recompile);
     std::optional<FakeCall> FastmemCallback(u64 rip);
 
+    // Per-Jit objects used by the shared memory emitters
+    ArgCallback JitCallback(const ArgCallback& cb) const { return cb; }
+    void EmitUserConfigPointer(Xbyak::Reg64 reg);
+    void EmitExclusiveAddressPointer(Xbyak::Reg64 reg);
+    void EmitExclusiveValuePointer(Xbyak::Reg64 reg);
+
     // Memory access helpers
     void EmitCheckMemoryAbort(A32EmitContext& ctx, IR::Inst* inst, Xbyak::Label* end = nullptr);
     template<std::size_t bitsize, auto callback>

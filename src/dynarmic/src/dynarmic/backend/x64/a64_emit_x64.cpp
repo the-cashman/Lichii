@@ -9,6 +9,7 @@
 #include "dynarmic/backend/x64/a64_emit_x64.h"
 
 #include <algorithm>
+#include <atomic>
 #include <fmt/format.h>
 #include <fmt/ostream.h>
 #include "common/assert.h"
@@ -62,7 +63,7 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
         size_t bits = conf.fast_dispatch_table_bits != 0 ? conf.fast_dispatch_table_bits : default_fast_dispatch_table_bits;
         bits = std::clamp<size_t>(bits, 8, 24);
         fast_dispatch_set_size = conf.fast_dispatch_set_associative ? fast_dispatch_ways : 1;
-        fast_dispatch_table.resize(size_t(1) << bits);
+        fast_dispatch_table_size = size_t(1) << bits;
         fast_dispatch_table_mask = u32(((size_t(1) << bits) - 1) * sizeof(FastDispatchEntry)) & ~u32(fast_dispatch_set_size * sizeof(FastDispatchEntry) - 1);
     }
     code.elide_redundant_zext = conf.elide_redundant_zext;
@@ -73,7 +74,6 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
     GenFastmemFallbacks();
     GenTerminalHandlers();
     code.PreludeComplete();
-    ClearFastDispatchTable();
 
     if (conf.fastmem_pointer.has_value()) {
         exception_handler.SetFastmemCallback([this](u64 rip_) {
@@ -266,18 +266,13 @@ void A64EmitX64::ClearCache() {
     exit_stubs.clear();
     pending_exit_stubs.clear();
     block_ranges.ClearCache();
-    ClearFastDispatchTable();
     fastmem_patch_info.clear();
 }
 
-void A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges) {
-    InvalidateBasicBlocks(block_ranges.InvalidateRanges(ranges));
-}
-
-void A64EmitX64::ClearFastDispatchTable() {
-    if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
-        std::fill(fast_dispatch_table.begin(), fast_dispatch_table.end(), FastDispatchEntry{});
-    }
+bool A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges) {
+    const auto blocks = block_ranges.InvalidateRanges(ranges);
+    InvalidateBasicBlocks(blocks);
+    return !blocks.empty();
 }
 
 void A64EmitX64::GenTerminalHandlers() {
@@ -331,7 +326,7 @@ void A64EmitX64::GenTerminalHandlers() {
         check_halt();
         calculate_location_descriptor();
         code.L(rsb_cache_miss);
-        code.mov(r8, u64(fast_dispatch_table.data()));
+        code.mov(r8, qword[code.ABI_JIT_PTR + offsetof(A64JitState, fast_dispatch_table)]);
         //code.mov(r12, qword[code.ABI_JIT_PTR + offsetof(A64JitState, pc)]);
         code.mov(r12, rbx);
         if (code.HasHostFeature(HostFeature::SSE42)) {
@@ -369,8 +364,7 @@ void A64EmitX64::GenTerminalHandlers() {
         PerfMapRegister(terminal_handler_fast_dispatch_hint, code.getCurr(), "a64_terminal_handler_fast_dispatch_hint");
 
         code.align();
-        fast_dispatch_table_lookup = code.getCurr<FastDispatchEntry& (*)(u64)>();
-        code.mov(code.ABI_PARAM2, u64(fast_dispatch_table.data()));
+        fast_dispatch_table_lookup = code.getCurr<FastDispatchEntry* (*)(u64, FastDispatchEntry*)>();
         if (code.HasHostFeature(HostFeature::SSE42)) {
             code.crc32(code.ABI_PARAM1, code.ABI_PARAM2);
         }
@@ -688,7 +682,7 @@ void A64EmitX64::EmitA64CallSupervisor(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     ASSERT(args[0].IsImmediate());
     const u32 imm = args[0].GetImmediateU32();
-    Devirtualize<&A64::UserCallbacks::CallSVC>(conf.callbacks).EmitCall(code, [&](RegList param) {
+    JitCallback(Devirtualize<&A64::UserCallbacks::CallSVC>(conf.callbacks)).EmitCall(code, [&](RegList param) {
         code.mov(param[0], imm);
     });
     // The kernel would have to execute ERET to get here, which would clear exclusive state.
@@ -701,7 +695,7 @@ void A64EmitX64::EmitA64ExceptionRaised(A64EmitContext& ctx, IR::Inst* inst) {
     ASSERT(args[0].IsImmediate() && args[1].IsImmediate());
     const u64 pc = args[0].GetImmediateU64();
     const u64 exception = args[1].GetImmediateU64();
-    Devirtualize<&A64::UserCallbacks::ExceptionRaised>(conf.callbacks).EmitCall(code, [&](RegList param) {
+    JitCallback(Devirtualize<&A64::UserCallbacks::ExceptionRaised>(conf.callbacks)).EmitCall(code, [&](RegList param) {
         code.mov(param[0], pc);
         code.mov(param[1], exception);
     });
@@ -710,13 +704,13 @@ void A64EmitX64::EmitA64ExceptionRaised(A64EmitContext& ctx, IR::Inst* inst) {
 void A64EmitX64::EmitA64DataCacheOperationRaised(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     ctx.reg_alloc.HostCall(code, nullptr, {}, args[1], args[2]);
-    Devirtualize<&A64::UserCallbacks::DataCacheOperationRaised>(conf.callbacks).EmitCall(code);
+    JitCallback(Devirtualize<&A64::UserCallbacks::DataCacheOperationRaised>(conf.callbacks)).EmitCall(code);
 }
 
 void A64EmitX64::EmitA64InstructionCacheOperationRaised(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     ctx.reg_alloc.HostCall(code, nullptr, {}, args[0], args[1]);
-    Devirtualize<&A64::UserCallbacks::InstructionCacheOperationRaised>(conf.callbacks).EmitCall(code);
+    JitCallback(Devirtualize<&A64::UserCallbacks::InstructionCacheOperationRaised>(conf.callbacks)).EmitCall(code);
 }
 
 void A64EmitX64::EmitA64DataSynchronizationBarrier(A64EmitContext&, IR::Inst*) {
@@ -734,7 +728,7 @@ void A64EmitX64::EmitA64InstructionSynchronizationBarrier(A64EmitContext& ctx, I
     }
 
     ctx.reg_alloc.HostCall(code, nullptr);
-    Devirtualize<&A64::UserCallbacks::InstructionSynchronizationBarrierRaised>(conf.callbacks).EmitCall(code);
+    JitCallback(Devirtualize<&A64::UserCallbacks::InstructionSynchronizationBarrierRaised>(conf.callbacks)).EmitCall(code);
 }
 
 void A64EmitX64::EmitA64GetCNTFRQ(A64EmitContext& ctx, IR::Inst* inst) {
@@ -748,7 +742,7 @@ void A64EmitX64::EmitA64GetCNTPCT(A64EmitContext& ctx, IR::Inst* inst) {
     if (!conf.wall_clock_cntpct) {
         code.UpdateTicks();
     }
-    Devirtualize<&A64::UserCallbacks::GetCNTPCT>(conf.callbacks).EmitCall(code);
+    JitCallback(Devirtualize<&A64::UserCallbacks::GetCNTPCT>(conf.callbacks)).EmitCall(code);
 }
 
 void A64EmitX64::EmitA64GetCTR(A64EmitContext& ctx, IR::Inst* inst) {
@@ -766,7 +760,7 @@ void A64EmitX64::EmitA64GetDCZID(A64EmitContext& ctx, IR::Inst* inst) {
 void A64EmitX64::EmitA64GetTPIDR(A64EmitContext& ctx, IR::Inst* inst) {
     const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr(code);
     if (conf.tpidr_el0) {
-        code.mov(result, u64(conf.tpidr_el0));
+        code.mov(result, qword[code.ABI_JIT_PTR + offsetof(A64JitState, tpidr_el0)]);
         code.mov(result, qword[result]);
     } else {
         code.xor_(result.cvt32(), result.cvt32());
@@ -777,7 +771,7 @@ void A64EmitX64::EmitA64GetTPIDR(A64EmitContext& ctx, IR::Inst* inst) {
 void A64EmitX64::EmitA64GetTPIDRRO(A64EmitContext& ctx, IR::Inst* inst) {
     const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr(code);
     if (conf.tpidrro_el0) {
-        code.mov(result, u64(conf.tpidrro_el0));
+        code.mov(result, qword[code.ABI_JIT_PTR + offsetof(A64JitState, tpidrro_el0)]);
         code.mov(result, qword[result]);
     } else {
         code.xor_(result.cvt32(), result.cvt32());
@@ -790,7 +784,7 @@ void A64EmitX64::EmitA64SetTPIDR(A64EmitContext& ctx, IR::Inst* inst) {
     const Xbyak::Reg64 value = ctx.reg_alloc.UseGpr(code, args[0]);
     const Xbyak::Reg64 addr = ctx.reg_alloc.ScratchGpr(code);
     if (conf.tpidr_el0) {
-        code.mov(addr, u64(conf.tpidr_el0));
+        code.mov(addr, qword[code.ABI_JIT_PTR + offsetof(A64JitState, tpidr_el0)]);
         code.mov(qword[addr], value);
     }
 }
@@ -1036,28 +1030,42 @@ void A64EmitX64::EmitUnlinkedExit(const IR::LocationDescriptor& target) {
     code.ForceReturnFromRunCode();
 }
 
-// Compact exits: a 5/6-byte rel32 jump to the target block, or to the target's shared exit stub
-// while unlinked. Every site gets its stub at first emission, so Unpatch always finds one.
-#define COMPACT_PATCH(JCC, SIZE)                                                                    \
-    if (conf.compact_block_exits) {                                                                 \
-        if (emitting_block) {                                                                       \
-            EnsureExitStub(target_desc);                                                            \
-        }                                                                                           \
-        if (target_code_ptr) {                                                                      \
-            code.JCC(target_code_ptr);                                                              \
-        } else if (const auto it = exit_stubs.find(target_desc.Value()); it != exit_stubs.end()) { \
-            code.JCC(it->second);                                                                   \
-        } else {                                                                                    \
-            ASSERT(emitting_block);                                                                 \
-            code.JCC(*PendingExitStub(target_desc), code.T_NEAR);                                   \
-        }                                                                                           \
-        code.EnsurePatchLocationSize(patch_location, SIZE);                                         \
-        return;                                                                                     \
+void A64EmitX64::RelinkCompactPatch(const u8* displacement, const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr) {
+    if (!target_code_ptr) {
+        target_code_ptr = exit_stubs.at(target_desc.Value());
+    }
+    const s64 rel = static_cast<const u8*>(target_code_ptr) - (displacement + 4);
+    ASSERT(rel == s64(s32(rel)));
+    std::atomic_ref<u32>{*reinterpret_cast<u32*>(const_cast<u8*>(displacement))}.store(u32(s32(rel)), std::memory_order_relaxed);
+}
+
+// Compact exits: a rel32 jump to the target block, or to the target's shared exit stub while
+// unlinked. Every site gets its stub at first emission, so Unpatch always finds one. Nops in front
+// align the displacement to 4 bytes: relinking stores only it, in one store that code running on
+// other threads sees whole.
+#define COMPACT_PATCH(JCC, OPCODE_SIZE, ...)                                                                        \
+    if (conf.compact_block_exits) {                                                                              \
+        const size_t pad = (4 - (reinterpret_cast<uintptr_t>(patch_location) + OPCODE_SIZE) % 4) % 4;            \
+        if (!emitting_block) {                                                                                   \
+            RelinkCompactPatch(static_cast<const u8*>(patch_location) + pad + OPCODE_SIZE, target_desc, target_code_ptr); \
+            return;                                                                                              \
+        }                                                                                                        \
+        EnsureExitStub(target_desc);                                                                             \
+        code.nop(pad);                                                                                           \
+        if (target_code_ptr) {                                                                                   \
+            code.JCC(target_code_ptr __VA_OPT__(,) __VA_ARGS__);                                                           \
+        } else if (const auto it = exit_stubs.find(target_desc.Value()); it != exit_stubs.end()) {              \
+            code.JCC(it->second __VA_OPT__(,) __VA_ARGS__);                                                                \
+        } else {                                                                                                 \
+            code.JCC(*PendingExitStub(target_desc), code.T_NEAR);                                                \
+        }                                                                                                        \
+        ASSERT(code.getCurr<const u8*>() == static_cast<const u8*>(patch_location) + pad + OPCODE_SIZE + 4);    \
+        return;                                                                                                  \
     }
 
 void A64EmitX64::EmitPatchJg(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr) {
     const CodePtr patch_location = code.getCurr();
-    COMPACT_PATCH(jg, 6)
+    COMPACT_PATCH(jg, 2)
     if (target_code_ptr) {
         code.jg(target_code_ptr);
     } else {
@@ -1070,7 +1078,7 @@ void A64EmitX64::EmitPatchJg(const IR::LocationDescriptor& target_desc, CodePtr 
 
 void A64EmitX64::EmitPatchJz(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr) {
     const CodePtr patch_location = code.getCurr();
-    COMPACT_PATCH(jz, 6)
+    COMPACT_PATCH(jz, 2)
     if (target_code_ptr) {
         code.jz(target_code_ptr);
     } else {
@@ -1083,7 +1091,7 @@ void A64EmitX64::EmitPatchJz(const IR::LocationDescriptor& target_desc, CodePtr 
 
 void A64EmitX64::EmitPatchJmp(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr) {
     const CodePtr patch_location = code.getCurr();
-    COMPACT_PATCH(jmp, 5)
+    COMPACT_PATCH(jmp, 1, code.T_NEAR)
     if (target_code_ptr) {
         code.jmp(target_code_ptr);
     } else {
@@ -1103,20 +1111,6 @@ void A64EmitX64::EmitPatchMovRcx(CodePtr target_code_ptr) {
     const CodePtr patch_location = code.getCurr();
     code.mov(code.rcx, u64(target_code_ptr));
     code.EnsurePatchLocationSize(patch_location, 10);
-}
-
-void A64EmitX64::Unpatch(const IR::LocationDescriptor& location) {
-    EmitX64::Unpatch(location);
-    if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
-        code.DisableWriting();
-        FastDispatchEntry* const set = &(*fast_dispatch_table_lookup)(location.Value());
-        for (size_t way = 0; way < fast_dispatch_set_size; ++way) {
-            if (set[way].location_descriptor == location.Value()) {
-                set[way] = {};
-            }
-        }
-        code.EnableWriting();
-    }
 }
 
 }  // namespace Dynarmic::Backend::X64

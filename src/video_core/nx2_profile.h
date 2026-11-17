@@ -211,6 +211,9 @@ enum class Counter : u32 {
     RingEntries,    ///< Split back: ring entries executed
     FusedWrites,    ///< Split back: compute writes in Kind::Writes entries (EDEN_NX2_COMPUTE_FUSE)
     MergedUploads,  ///< Split back: inline upload flushes joined to the one before (I2M_MERGE)
+    ListCopies,     ///< Command list pages copied back after the work that wrote them
+    ListCopiesReused, ///< Of ListCopies: into the page's copy from earlier in the open tick
+    StagingCreates, ///< Vulkan staging buffers created
     Count,
 };
 
@@ -424,6 +427,11 @@ inline bool Report(const char* thread_name = "GPU thread", bool report_all_conte
                             per_second(Counter::CbWriteWords), per_second(Counter::BatchRepeats),
                             per_second(Counter::FusedWrites), per_second(Counter::MergedUploads));
     }
+    line += fmt::format(" | list copies {:.0f} ({:.0f} into the open tick's copy) | staging "
+                        "buffers created {:.0f}",
+                        static_cast<double>(data.counters[static_cast<size_t>(Counter::ListCopies)]) * 1e9 / window,
+                        static_cast<double>(data.counters[static_cast<size_t>(Counter::ListCopiesReused)]) * 1e9 / window,
+                        static_cast<double>(data.counters[static_cast<size_t>(Counter::StagingCreates)]) * 1e9 / window);
     std::string drains;
     for (size_t i = 0; i < data.drain_count.size(); ++i) {
         if (data.drain_count[i] != 0) {

@@ -59,11 +59,15 @@ public:
     void AddTicks(u64 ticks) override;
     u64 GetTicksRemaining() override;
     u64 GetCNTPCT() override;
+    void BlockCompiled(u64 location) override;
     bool CheckMemoryAccess(u64 addr, u64 size, Kernel::DebugWatchpointType type);
     void ReturnException(u64 pc, Dynarmic::HaltReason hr);
 
     Dynarmic::CodePage cached_code_page;
     u64 last_code_addr = u64(-1);
+    /// g_code_invalidations when cached_code_page was read: with a shared code cache, a core
+    /// may translate code another core invalidated.
+    u64 code_invalidations = 0;
     ArmDynarmic64& m_parent;
     Core::Memory::Memory& m_memory;
     u64 m_tpidrro_el0{};
@@ -79,8 +83,10 @@ public:
 
 class ArmDynarmic64 final : public ArmInterface {
 public:
+    /// `shared_code_cache`: the process's cores share one JIT code cache, where supported.
     ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProcess* process,
-                  DynarmicExclusiveMonitor& exclusive_monitor, std::size_t core_index);
+                  DynarmicExclusiveMonitor& exclusive_monitor, std::size_t core_index,
+                  std::shared_ptr<Dynarmic::A64::SharedCodeCache> shared_code_cache = {});
     ~ArmDynarmic64() override;
 
     Architecture GetArchitecture() const override {
@@ -102,6 +108,10 @@ public:
     void ClearInstructionCache() override;
     void InvalidateCacheRange(u64 addr, std::size_t size) override;
 
+    bool SupportsJitWarmup() const override;
+    void SetJitWarmup(std::shared_ptr<JitWarmup> warmup) override;
+    bool WarmUp(const std::atomic<u32>& stop) override;
+
 protected:
     const Kernel::DebugWatchpoint* HaltedWatchpoint() const override;
     void RewindBreakpointInstruction() override;
@@ -116,8 +126,10 @@ private:
     void MakeJit(Common::PageTable* page_table, std::size_t address_space_bits);
     std::optional<DynarmicCallbacks64> m_cb{};
     std::size_t m_core_index{};
+    std::shared_ptr<Dynarmic::A64::SharedCodeCache> m_shared_code_cache;
 
     std::optional<Dynarmic::A64::Jit> m_jit{};
+    std::shared_ptr<JitWarmup> m_warmup;
 
     // SVC callback
     u32 m_svc{};
