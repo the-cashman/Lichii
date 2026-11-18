@@ -626,9 +626,9 @@ private:
     u64 kept_scale_epoch{};
     bool kept_images_valid{};
 
-    VkDescriptorSetLayout descriptor_set_layout{}; ///< Owned by the PipelineLayoutCache
+    vk::DescriptorSetLayout descriptor_set_layout;
     DescriptorAllocator descriptor_allocator;
-    VkPipelineLayout pipeline_layout{}; ///< Owned by the PipelineLayoutCache
+    vk::PipelineLayout pipeline_layout;
     vk::DescriptorUpdateTemplate descriptor_update_template;
     vk::Pipeline pipeline;
 
