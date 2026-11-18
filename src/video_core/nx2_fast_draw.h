@@ -116,7 +116,16 @@ alignas(64) inline std::atomic<u64> g_sync_serial{1};
 inline thread_local bool t_reads_sync_serial{};
 inline thread_local bool t_sync_serial_bumped{};
 
+/// Set by the first read of the sync serial. This tree has no reader (its uniform keeps don't use
+/// it), so until one reads it the adds are skipped: they only made the front's puller and the back
+/// contend for the serial's cache line. A reader compares against what it read, so adds before its
+/// first read never mattered. On its own cache line, read by every NoteSync.
+alignas(64) inline std::atomic<bool> g_sync_serial_read{};
+
 inline void NoteSync() {
+    if (!g_sync_serial_read.load(std::memory_order_relaxed)) [[likely]] {
+        return;
+    }
     if (!(t_reads_sync_serial && t_sync_serial_bumped)) {
         g_sync_serial.fetch_add(1, std::memory_order_relaxed);
         t_sync_serial_bumped = t_reads_sync_serial;
@@ -124,6 +133,9 @@ inline void NoteSync() {
 }
 
 [[nodiscard]] inline u64 SyncSerial() {
+    if (!g_sync_serial_read.load(std::memory_order_relaxed)) [[unlikely]] {
+        g_sync_serial_read.store(true, std::memory_order_seq_cst);
+    }
     t_reads_sync_serial = true;
     t_sync_serial_bumped = false;
     return g_sync_serial.load(std::memory_order_acquire);
