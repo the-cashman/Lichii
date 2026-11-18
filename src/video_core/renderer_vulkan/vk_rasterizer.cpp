@@ -3696,9 +3696,19 @@ void RasterizerVulkan::TrackOcarinaCamera() {
         !gpu_memory->IsContinuousRange(binding.address, VideoCommon::OcarinaCameraBytes)) {
         return;
     }
+    const auto refuse = [&](const char* reason, f32 width, f32 height) {
+        if (oot_camera_refusal && oot_camera_refusal->frame == render_trace_frame &&
+            u64{color.size.width} * color.size.height <
+                u64{oot_camera_refusal->target_width} * oot_camera_refusal->target_height) {
+            return;
+        }
+        oot_camera_refusal = OcarinaCameraRefusal{render_trace_frame, reason, width, height,
+                                                  color.size.width, color.size.height};
+    };
     const auto device_address = gpu_memory->GpuToCpuAddress(binding.address);
     if (!device_address ||
         buffer_cache.IsRegionGpuModified(*device_address, VideoCommon::OcarinaCameraBytes)) {
+        refuse("no scene camera: its buffer is GPU-written", 0.0f, 0.0f);
         return;
     }
     VideoCommon::OcarinaCameraBuffer values;
@@ -3707,6 +3717,10 @@ void RasterizerVulkan::TrackOcarinaCamera() {
         values, color.size.width, color.size.height,
         oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss);
     if (camera.issue != VideoCommon::OcarinaCameraIssue::None) {
+        refuse(camera.issue == VideoCommon::OcarinaCameraIssue::Extent
+                   ? "no scene camera: its size does not match the scene target"
+                   : "no scene camera: unexpected projection",
+               values[0x120 / sizeof(f32)], values[0x124 / sizeof(f32)]);
         return;
     }
     oot_camera_sample_frame = render_trace_frame;
@@ -3890,10 +3904,10 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, u64 na
         return false;
     }
     // Logs why the game's own upscale draws, when the reason changes and every 120th repeat.
-    const auto fail = [this](const char* reason) {
+    const auto fail = [this](const char* reason, std::string_view detail = {}) {
         if (reason != oot_fallback_reason || ++oot_fallback_repeats % 120 == 0) {
-            LOG_INFO(Render_Vulkan, "Ocarina temporal: the game's upscale draws frame {} ({})",
-                     render_trace_frame, reason);
+            LOG_INFO(Render_Vulkan, "Ocarina temporal: the game's upscale draws frame {} ({}{})",
+                     render_trace_frame, reason, detail);
         }
         if (reason != oot_fallback_reason) {
             oot_fallback_reason = reason;
@@ -3902,7 +3916,13 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, u64 na
         return false;
     };
     if (oot_camera_sample_frame != render_trace_frame) {
-        return fail("no scene camera this frame");
+        if (!oot_camera_refusal || oot_camera_refusal->frame != render_trace_frame) {
+            return fail("no scene camera this frame");
+        }
+        const auto& refusal = *oot_camera_refusal;
+        return fail(refusal.reason, fmt::format(": camera {}x{}, scene target {}x{}",
+                                                refusal.camera_width, refusal.camera_height,
+                                                refusal.target_width, refusal.target_height));
     }
     if (oot_motion.depth_frame != render_trace_frame) {
         return fail("no scene depth this frame");

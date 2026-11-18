@@ -962,7 +962,9 @@ private:
     void NoteFlushed(const ImageBase& image, u64 tick);
     /// Fills `keep` with the bytes of the image's guest memory that landed write-backs and
     /// flushes with contents newer than `tick` hold (an asynchronous flush's snapshot leaves them).
-    void KeepNewerLanded(const ImageBase& image, u64 tick, KeepRanges& keep);
+    /// Not those of `queued` write-backs, which have yet to land.
+    void KeepNewerLanded(const ImageBase& image, u64 tick, KeepRanges& keep,
+                         std::span<const WritebackRanges::TickedRange> queued = {});
     /// Whether the collector's or joins' write-backs are on (writeback_switches.h).
     [[nodiscard]] static bool OverlapWritebacksEnabled();
     u64 join_writeback_reuses{};

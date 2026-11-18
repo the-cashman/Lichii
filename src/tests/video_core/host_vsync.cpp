@@ -27,7 +27,7 @@ TEST_CASE("HostVsync counts timer starts against the FPS limit", "[video_core][h
     REQUIRE(starts == 2);
 
     // A frame reaching the display right after waits out the limit from the timer's start.
-    const auto next = HostVsync::NextStart(HostVsync::Clock::now());
+    const auto next = HostVsync::NextStart(before_timer);
     REQUIRE(next.has_value());
     REQUIRE(*next >= before_timer + 50ms);
 

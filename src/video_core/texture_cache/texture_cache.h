@@ -368,9 +368,19 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
                     landing_begin, landing_end, VideoCore::DownloadLanding::Source::TextureCache};
                 written_by_cpu = IsWrittenByCpu(landing_begin, landing_end);
                 if (!written_by_cpu) {
+                    // Newer data that landed over it stays; overlap write-backs this pass queued
+                    // land after it (upstream #2134).
+                    boost::container::small_vector<WritebackRanges::TickedRange, 8> queued;
+                    for (const auto& download : overlap_downloads) {
+                        queued.push_back({download.cpu_addr, download.cpu_addr + download.size,
+                                          download.tick});
+                    }
+                    KeepRanges newer;
+                    KeepNewerLanded(image, image.modification_tick, newer, queued);
                     // Through the image's own address space (WriteBackImage), not the bound
                     // channel's; false when none maps it any more.
-                    written_back = WriteBackImage(image, entry.copies, entry.map.mapped_span);
+                    written_back =
+                        WriteBackImage(image, entry.copies, entry.map.mapped_span, newer);
                 }
             }
             runtime.FreeDeferredStagingBuffer(entry.map);
@@ -1150,12 +1160,19 @@ void TextureCache<P>::NoteFlushed(const ImageBase& image, u64 tick) {
 }
 
 template <class P>
-void TextureCache<P>::KeepNewerLanded(const ImageBase& image, u64 tick, KeepRanges& keep) {
+void TextureCache<P>::KeepNewerLanded(const ImageBase& image, u64 tick, KeepRanges& keep,
+                                      std::span<const WritebackRanges::TickedRange> queued) {
     keep.clear();
     if (overlap_writeback_ranges.empty()) {
         return;
     }
-    const auto waiting = [this](const WritebackRange& range) {
+    const auto waiting = [this, queued](const WritebackRange& range) {
+        if (std::ranges::any_of(queued, [&](const WritebackRanges::TickedRange& download) {
+                return download.tick == range.tick && download.begin == range.begin &&
+                       download.end == range.end;
+            })) {
+            return true;
+        }
         return std::ranges::any_of(
             async_overlap_downloads, [&](const AsyncOverlapDownload& download) {
                 return !download.cancelled && download.tick == range.tick &&
@@ -1260,8 +1277,11 @@ template <class P>
 std::shared_ptr<Tegra::MemoryManager> TextureCache<P>::WriteBackMemory(const ImageBase& image) {
     // The garbage collector and CPU-side downloads reach images of every address space, so the
     // bound channel's memory may map image.gpu_addr to other memory. The image's own address
-    // space writes it; once nvdrv has closed that one, another address space that still maps
-    // image.gpu_addr to the image's device memory does (FindImage shares images between them).
+    // space writes it; once nvdrv has closed that one, another address space that maps all of
+    // the image's GPU range to its device memory does (FindImage shares images between them).
+    // Only for an image its own address space mapped to one device range and has not remapped
+    // since: the device pages of any other are no longer known, so it is not written back
+    // (MarkStale) rather than risk writing other memory.
     // The returned reference keeps the memory manager alive while the image is written.
     boost::container::small_vector<std::shared_ptr<Tegra::MemoryManager>, 4> others;
     {
@@ -1277,11 +1297,13 @@ std::shared_ptr<Tegra::MemoryManager> TextureCache<P>::WriteBackMemory(const Ima
             others.push_back(std::move(memory));
         }
     }
-    if (True(image.flags & ImageFlagBits::Sparse)) {
+    if (True(image.flags &
+             (ImageFlagBits::Sparse | ImageFlagBits::NonContiguous | ImageFlagBits::Remapped))) {
         return nullptr;
     }
     for (std::shared_ptr<Tegra::MemoryManager>& memory : others) {
-        if (memory->GpuToCpuAddress(image.gpu_addr) == image.cpu_addr) {
+        if (memory->GpuToCpuAddress(image.gpu_addr) == image.cpu_addr &&
+            memory->IsContinuousRange(image.gpu_addr, image.guest_size_bytes)) {
             return std::move(memory);
         }
     }
@@ -5107,9 +5129,11 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         churn.joins += join_overlap_ids.empty() ? 0 : 1;
     }
 
-    if (!gpu_memory->IsContinuousRange(new_image.gpu_addr, new_image.guest_size_bytes) &&
-        new_info.is_sparse) {
-        new_image.flags |= ImageFlagBits::Sparse;
+    if (!gpu_memory->IsContinuousRange(new_image.gpu_addr, new_image.guest_size_bytes)) {
+        new_image.flags |= ImageFlagBits::NonContiguous;
+        if (new_info.is_sparse) {
+            new_image.flags |= ImageFlagBits::Sparse;
+        }
     }
 
     for (const ImageId overlap_id : join_ignore_textures) {

@@ -124,6 +124,32 @@ TEST_CASE("Ampere TLD.B.LL takes the handle, then the level, after the coordinat
     }
 }
 
+TEST_CASE("Ampere TLD.B keeps its value and result spans below the uniform registers",
+          "[video_core][ampere]") {
+    // UMOV UR0, 0x0 makes R216 and up hold uniform registers. Each TLD.B.LL 2D below has its
+    // base registers under R216, but a span reaches R216: Rb = R215 (level in R216), Ra = R215
+    // (y in R216), Rd = R215 with two results, and a second destination R215 with two results.
+    constexpr Instruction uniform_move{{0x00007c02, 0, 0x08000f00, 0}};
+    const std::array crossing{
+        Instruction{{0x0c047367, 0x380000d7, 0x019e03ff, 0x004f4200}},
+        Instruction{{0xd7047367, 0x38000004, 0x019e03ff, 0x004f4200}},
+        Instruction{{0x0cd77367, 0x38000004, 0x019e03ff, 0x004f4200}},
+        Instruction{{0x04007367, 0x38000008, 0x059e0fd7, 0x104fc200}},
+    };
+    for (const Instruction& insn : crossing) {
+        CHECK_FALSE(LowerToMaxwell(std::array{uniform_move, insn, EXIT}));
+        // Without uniform registers R216 is an ordinary register.
+        const auto plain = LowerToMaxwell(std::array{insn, EXIT});
+        INFO(plain.error);
+        CHECK(static_cast<bool>(plain));
+    }
+    // Rb = R214 keeps the level in R215.
+    const auto kept = LowerToMaxwell(std::array{uniform_move,
+        Instruction{{0x0c047367, 0x380000d6, 0x019e03ff, 0x004f4200}}, EXIT});
+    INFO(kept.error);
+    CHECK(static_cast<bool>(kept));
+}
+
 TEST_CASE("Ampere TXQ takes its handle from a uniform register", "[video_core][ampere]") {
     // Cyberpunk 2077 (#1084): a dimension query, mask 0x7, of the handle in UR6 at the level
     // in R3, the third component going to R3 -> Maxwell TXQ.B with the handle, then the level.
@@ -583,6 +609,35 @@ TEST_CASE("Ampere constant banks 24-31 read the root tables from bank 17", "[vid
         CHECK(field(ldc, 36, 5) == 17);
         CHECK(field(ldc, 20, 16) == offset);
     }
+}
+
+TEST_CASE("Ampere indexed root-table displacements stay in the signed LDC field",
+          "[video_core][ampere]") {
+    const auto lower = [](const Instruction& instruction) {
+        return LowerToMaxwell(std::array{instruction, EXIT});
+    };
+    // ULDC.U8 UR8, c[bank][UR6+displacement] and LDC R20, c[bank][R2+displacement]. Table 1's base
+    // (256) takes 0x7f00 to 0x8000, which Maxwell would read as -0x8000: rejected, as is 0x7ffc.
+    // 0x7efc still fits, and bank 24 has no base. LDC.IS wraps its sum at 16 bits, so it is kept.
+    const auto uniform = [](u32 bank, u32 displacement) {
+        return Instruction{{0x06087abb, (bank << 22) | (displacement << 6), 0x08000000, 0x000fe400}};
+    };
+    const auto load = [](u32 bank, u32 displacement, u32 mode) {
+        return Instruction{{0x02147b82, (bank << 22) | (displacement << 6), mode << 14, 0}};
+    };
+    for (const u32 displacement : {0x7f00U, 0x7ffcU}) {
+        CHECK_FALSE(lower(uniform(25, displacement)));
+        CHECK_FALSE(lower(load(25, displacement, 0)));
+        CHECK(static_cast<bool>(lower(load(25, displacement, 2))));
+        CHECK(static_cast<bool>(lower(uniform(24, displacement))));
+        CHECK(static_cast<bool>(lower(load(24, displacement, 0))));
+    }
+    CHECK_FALSE(lower(load(31, 0x7900, 0)));
+    CHECK(static_cast<bool>(lower(load(31, 0x78fc, 0))));
+    const auto kept = lower(uniform(25, 0x7efc));
+    INFO(kept.error);
+    REQUIRE(static_cast<bool>(kept));
+    CHECK(((FindMaxwell(kept, 0xef9, 52) >> 20) & 0xffff) == 0x7ffc);
 }
 
 TEST_CASE("Ampere Ocarina byte constant loads, ULEA carries to UP3 and two-source F2IP",

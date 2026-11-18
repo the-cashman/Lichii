@@ -395,15 +395,18 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         const auto base = [&](u64 opcode_bits) { return opcode_bits | predicate | dest; };
         // Banks 24-31 are NVN2's 256-byte root tables (Maxwell3D::RootTables). Maxwell has 18 banks,
         // so they are read from bank 17, which games never bind, one after another: bank 24 + n at
-        // byte n * 256 (Cyberpunk 2077 reads banks 25 and 31). An indexed form's offset is a signed
-        // displacement, so the sum wraps at 16 bits; a direct offset past its table is rejected.
+        // byte n * 256 (Cyberpunk 2077 reads banks 25 and 31). A direct offset past its table is
+        // rejected. An indexed form's offset is a signed displacement, as is Maxwell LDC's, which
+        // adds the index without wrapping outside .IS, so the displacement plus the table's base
+        // must stay at most 0x7fff.
         const auto root_bank = [&] { return insn.Bits(54, 5) >= 24; };
         const auto bank = [&]() -> u32 { return root_bank() ? 17U : insn.Bits(54, 5); };
-        const auto cbuf_offset = [&]() -> u32 {
-            const u32 table_base = root_bank() ? (insn.Bits(54, 5) - 24) * 256 : 0U;
-            return (insn.Bits(38, 16) + table_base) & 0xffff;
-        };
+        const auto table_base = [&]() -> u32 { return root_bank() ? (insn.Bits(54, 5) - 24) * 256 : 0U; };
+        const auto cbuf_offset = [&]() -> u32 { return (insn.Bits(38, 16) + table_base()) & 0xffff; };
         const auto direct_cbuf_in_table = [&] { return !root_bank() || insn.Bits(38, 16) < 256; };
+        const auto indexed_cbuf_in_range = [&] {
+            return static_cast<s16>(insn.Bits(38, 16)) + static_cast<s32>(table_base()) <= 0x7fff;
+        };
         const auto cbuf = [&]() -> u64 {
             return (u64{cbuf_offset() / 4} << 20) | (u64{bank()} << 34);
         };
@@ -1175,6 +1178,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 // An index register can align the offset; the host reads the aligned word either way.
                 bank() >= 18 || insn.Bits(62, 2) ||
                 (opcode == 0xab9 && (offset % alignment || !direct_cbuf_in_table())) ||
+                (opcode == 0xabb && !indexed_cbuf_in_range()) ||
                 (insn.words[2] & ~0xe00U) != (opcode == 0xab9 ? 0U : 0x08000000U) ||
                 index_target == ~0U)
                 return fail(index, "native uniform constant load mode");
@@ -1237,7 +1241,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const u32 width = insn.Bits(73, 3), mode = insn.Bits(78, 2);
             if (width > 5 || (mode != 0 && mode != 2) ||
                 (insn.words[2] & ~0xce00U) || (insn.words[1] & 0xf800003fU) ||
-                bank() >= 18 ||
+                bank() >= 18 || (mode == 0 && !indexed_cbuf_in_range()) ||
                 (width == 5 && ((dest & 1) || dest >= 254)))
                 return fail(index, "native indexed constant load mode");
             emit(base(0xef90000000000000ULL) | (u64{insn.Bits(24, 8)} << 8) |
@@ -2474,10 +2478,17 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const u32 dimension = insn.Bits(61, 3), coordinates = coordinate_count[dimension];
             const bool level = insn.Bits(87, 3) == 3;
             const u32 count = coordinates + 1 + (level ? 1 : 0), in_a = (count + 1) / 2;
+            const u32 components = static_cast<u32>(std::popcount(mask));
+            const bool split = second_dest != 255;
+            // Every value and result register stays below the uniform registers (R216 and up, or
+            // the UR28+ block below them), not just the base registers the shadow check sees.
+            const u32 limit = uses_uniform_bank ? high_uniform_base : 246U;
             if (coordinates == 0 || count > 4 || !insn.Bits(59, 1) || !insn.Bits(60, 1) || insn.Bits(40, 19) ||
                 insn.Bits(76, 5) || insn.Bits(81, 3) != 7 || (insn.Bits(87, 3) != 1 && !level) || insn.Bits(91, 1) ||
-                mask == 0 || source_a == 255 || source_a + in_a > 246 || source_b == 255 ||
-                source_b + (count - in_a) > 246)
+                mask == 0 || source_a == 255 || source_a + in_a > limit || source_b == 255 ||
+                source_b + (count - in_a) > limit ||
+                (uses_uniform_bank && dest != 255 && dest + (split ? (std::min)(components, 2U) : components) > limit) ||
+                (uses_uniform_bank && split && components > 2 && second_dest + components - 2 > limit))
                 return fail(index, "native bindless texel fetch mode");
             const auto value = [&](u32 i) { return i < in_a ? source_a + i : source_b + (i - in_a); };
             const auto copy = [&](u32 target, u32 source) {
@@ -2489,8 +2500,6 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             emit(0xdd00000000000000ULL | predicate | 250 | (u64{250} << 8) | (u64{246} << 20) |
                  (u64{maxwell_type[dimension]} << 28) | (u64{mask} << 31) | (u64{insn.Bits(90, 1)} << 49) |
                  (u64{7} << 51) | (u64{level} << 55));
-            const u32 components = static_cast<u32>(std::popcount(mask));
-            const bool split = second_dest != 255;
             for (u32 i = 0; i < components; ++i) {
                 u32 target = 255;
                 if (!split || i < 2) target = dest == 255 ? 255U : static_cast<u32>(dest) + i;
