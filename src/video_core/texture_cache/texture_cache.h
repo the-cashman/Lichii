@@ -315,7 +315,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool at_critical) 
     // Not const, here and below: with OpenGL both would be constant expressions, which the
     // lambda below must then not capture (-Wunused-lambda-capture), while Vulkan's must be.
     bool download_overlaps = std::is_trivially_destructible_v<DownloadMap> &&
-                             WritebackSwitches::DuskbloodsDefault();
+                             WritebackSwitches::WritebackTitle();
     // The collector does not wait for its
     // write-backs (each wait was 5-10 ms, several a second in combat); they reach guest memory
     // when the GPU is done with them.
@@ -1011,7 +1011,7 @@ void TextureCache<P>::WriteBackBadOverlaps(ImageId new_image_id) {
     // memory without their data. The Duskbloods renders its characters' 64x64 detail maps through
     // other render targets at the same addresses and samples them through new images, which
     // showed the memory's fill pattern (purple enemies) or zeros (black outfits).
-    if (!WritebackSwitches::DuskbloodsDefault()) {
+    if (!WritebackSwitches::WritebackTitle()) {
         return;
     }
     const bool async = AsyncOverlapDownloadsEnabled();

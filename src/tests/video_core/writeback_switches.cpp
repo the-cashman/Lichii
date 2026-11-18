@@ -5,11 +5,13 @@
 
 #include "video_core/texture_cache/writeback_switches.h"
 
-TEST_CASE("Overlap write-backs retain the tested Duskbloods default",
+TEST_CASE("Overlap write-backs are on for the tested titles only",
           "[video_core][texture_cache][writeback]") {
     using namespace VideoCommon::WritebackSwitches;
-    REQUIRE(DuskbloodsDefault(DuskbloodsNetworkTestProgramId));
-    REQUIRE_FALSE(DuskbloodsDefault(0));
-    REQUIRE_FALSE(DuskbloodsDefault(0x04007EF01F8AE000ULL));
-    REQUIRE_FALSE(DuskbloodsDefault(0x0400486024DEC000ULL));
+    REQUIRE(WritebackTitle(DuskbloodsNetworkTestProgramId));
+    REQUIRE(WritebackTitle(FireEmblemFortunesWeaveProgramId));
+    REQUIRE_FALSE(WritebackTitle(0));
+    // Ocarina of Time: write-backs regress Castle Town (#2038), and #818's stale-upload skip is
+    // its frame rate.
+    REQUIRE_FALSE(WritebackTitle(0x0400486024DEC000ULL));
 }
