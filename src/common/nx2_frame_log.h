@@ -64,6 +64,10 @@ enum class Counter : u32 {
     FrontDelayNs,
     WorkerCpuNs,
     WorkerDelayNs,
+    CpuReads,         ///< [fe60] guest CPU reads of GPU-written memory (GPU::OnCPURead calls)
+    CpuReadNs,        ///< [fe60] time spent in them (any thread)
+    SyncWaits,        ///< [fe60] waits for a GPU-thread sync operation (WaitForSyncOperation)
+    SyncWaitNs,       ///< [fe60] time spent in them
     Count,
 };
 

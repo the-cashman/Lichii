@@ -235,6 +235,16 @@ struct GPU::Impl {
     /// Returns once the request of `fence` ran, or once the GPU threads stopped for good
     /// (NotifyShutdown): then it never runs.
     void WaitForSyncOperation(const u64 fence) {
+        const u64 log_start = Common::Nx2FrameLog::Enabled() ? Common::Nx2FrameLog::Now() : 0;
+        WaitForSyncOperationImpl(fence);
+        if (log_start != 0) [[unlikely]] {
+            Common::Nx2FrameLog::Count(Common::Nx2FrameLog::Counter::SyncWaits);
+            Common::Nx2FrameLog::Count(Common::Nx2FrameLog::Counter::SyncWaitNs,
+                                       Common::Nx2FrameLog::Now() - log_start);
+        }
+    }
+
+    void WaitForSyncOperationImpl(const u64 fence) {
         std::unique_lock lck{sync_request_mutex};
         sync_request_cv.wait(lck, [this, fence] {
             return CurrentSyncRequestFence() >= fence || sync_requests_dropped;
@@ -903,6 +913,14 @@ void GPU::PushGPUEntries(s32 channel, Tegra::CommandList&& entries) {
 }
 
 VideoCore::RasterizerDownloadArea GPU::OnCPURead(PAddr addr, u64 size) {
+    if (Common::Nx2FrameLog::Enabled()) [[unlikely]] {
+        const u64 start = Common::Nx2FrameLog::Now();
+        auto area = impl->OnCPURead(addr, size);
+        Common::Nx2FrameLog::Count(Common::Nx2FrameLog::Counter::CpuReads);
+        Common::Nx2FrameLog::Count(Common::Nx2FrameLog::Counter::CpuReadNs,
+                                   Common::Nx2FrameLog::Now() - start);
+        return area;
+    }
     return impl->OnCPURead(addr, size);
 }
 
