@@ -14,6 +14,7 @@
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/svc.h"
 #include "core/hle/kernel/svc/svc_nx2_oot_poll.h"
+#include "core/hle/kernel/svc/svc_nx2_oot_probe.h"
 #include "core/hle/kernel/svc/svc_nx2_zstd.h"
 #include "core/hle/kernel/k_readable_event.h"
 #include "core/hle/service/kernel_helpers.h"
@@ -2546,6 +2547,8 @@ void Call(Core::System& system, u32 imm) {
         // Ocarina of Time native zstd (svc 0xF0-0xF2, svc_nx2_zstd.cpp).
     } else if (CallNx2OotPollBackoff(system, imm)) {
         // Ocarina of Time resource poll backoff (svc 0xF3, svc_nx2_oot_poll.cpp).
+    } else if (CallNx2OotProbe(system, imm)) {
+        // Ocarina of Time debug probes (svc 0xF4, EDEN_NX2_OOT_PROBE, svc_nx2_oot_probe.cpp).
     } else if (imm == 0x80) {
         // Switch 2 only: svcSetGpuMemoryAttribute(address, size, mask, attr). nn::gpu::sdk and
         // nn::gs native memory set the new "GPU accessible" attribute (0x20) before registering

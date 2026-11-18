@@ -17,7 +17,47 @@
 #include "audio_core/renderer/splitter/splitter_context.h"
 #include "audio_core/renderer/voice/voice_context.h"
 
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstdlib>
+#include <mutex>
+#include <string>
+#include <fmt/format.h>
+#include "common/logging.h"
+
 namespace AudioCore::Renderer {
+
+namespace {
+// EDEN_NX2_AUDIO_VOICE_LOG=1 (debug, off when unset): once a second per renderer, the voices in use,
+// how many the game started (is_new) and how many play, and the voices that have played for more
+// than 3 s (music, ambience: id:format/rate/channels/volume).
+struct VoiceLogState {
+    const void* context{};
+    s64 window_ns{};
+    u64 updates{};
+    u64 new_voices{};
+    u32 max_in_use{};
+    u32 max_playing{};
+    std::array<s64, 512> first_play_ns{};
+};
+std::mutex g_voice_log_mutex;
+std::array<VoiceLogState, 4> g_voice_logs{};
+
+bool VoiceLogEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("EDEN_NX2_AUDIO_VOICE_LOG");
+        return v != nullptr && v[0] != 0 && v[0] != '0';
+    }();
+    return enabled;
+}
+
+s64 VoiceLogNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+} // namespace
 
 InfoUpdater::InfoUpdater(std::span<const u8> input_, std::span<u8> output_,
                          Kernel::KProcess* process_handle_, BehaviorInfo& behaviour_)
@@ -72,6 +112,23 @@ Result InfoUpdater::UpdateVoices(VoiceContext& voice_context,
     }
 
     u32 new_voice_count{0};
+    const bool voice_log = VoiceLogEnabled();
+    u32 log_in_use{0};
+    u32 log_playing{0};
+    u32 log_new{0};
+    std::string log_long;
+    const s64 log_now = voice_log ? VoiceLogNowNs() : 0;
+    VoiceLogState* log_state = nullptr;
+    if (voice_log) {
+        std::scoped_lock lock{g_voice_log_mutex};
+        for (auto& s : g_voice_logs) {
+            if (s.context == &voice_context || s.context == nullptr) {
+                s.context = &voice_context;
+                log_state = &s;
+                break;
+            }
+        }
+    }
 
     // Two input formats exist: legacy (0x170) and v2 with float biquad (0x188).
     const bool use_v2 = behaviour.IsVoiceInParameterV2Supported();
@@ -183,7 +240,31 @@ Result InfoUpdater::UpdateVoices(VoiceContext& voice_context,
         std::array<VoiceState*, MaxChannels> voice_states{};
 
         if (!in_param.in_use) {
+            if (log_state != nullptr && in_param.id < log_state->first_play_ns.size()) {
+                log_state->first_play_ns[in_param.id] = 0;
+            }
             continue;
+        }
+        if (log_state != nullptr) {
+            ++log_in_use;
+            log_new += in_param.is_new ? 1 : 0;
+            if (in_param.id < log_state->first_play_ns.size()) {
+                s64& first = log_state->first_play_ns[in_param.id];
+                if (in_param.is_new || in_param.play_state != PlayState::Started) {
+                    first = 0;
+                }
+                if (in_param.play_state == PlayState::Started) {
+                    ++log_playing;
+                    if (first == 0) {
+                        first = log_now;
+                    } else if (log_now - first > 3'000'000'000) {
+                        log_long += fmt::format(" {}:{}/{}/{}/{:.2f}", in_param.id,
+                                                static_cast<u32>(in_param.sample_format),
+                                                in_param.sample_rate, in_param.channel_count,
+                                                in_param.volume);
+                    }
+                }
+            }
         }
 
         auto& voice_info{voice_context.GetInfo(in_param.id)};
@@ -229,6 +310,29 @@ Result InfoUpdater::UpdateVoices(VoiceContext& voice_context,
 
         voice_info.WriteOutStatus(out_params[i], in_param, voice_states);
         new_voice_count += in_param.channel_count;
+    }
+
+    if (log_state != nullptr) {
+        if (log_state->window_ns == 0) {
+            log_state->window_ns = log_now;
+        }
+        ++log_state->updates;
+        log_state->new_voices += log_new;
+        log_state->max_in_use = std::max(log_state->max_in_use, log_in_use);
+        log_state->max_playing = std::max(log_state->max_playing, log_playing);
+        if (log_now - log_state->window_ns >= 1'000'000'000) {
+            LOG_INFO(Service_Audio,
+                     "Voices r{}: {} updates, in use max {} (now {}), playing max {} (now {}), "
+                     "new {}; playing >3 s:{}",
+                     static_cast<const void*>(&voice_context), log_state->updates,
+                     log_state->max_in_use, log_in_use, log_state->max_playing, log_playing,
+                     log_state->new_voices, log_long);
+            log_state->window_ns = log_now;
+            log_state->updates = 0;
+            log_state->new_voices = 0;
+            log_state->max_in_use = 0;
+            log_state->max_playing = 0;
+        }
     }
 
     auto consumed_input_size{voice_count * in_stride};

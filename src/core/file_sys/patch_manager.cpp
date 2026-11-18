@@ -33,6 +33,7 @@
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/hle/service/ns/language.h"
 #include "core/hle/service/set/settings_server.h"
+#include "core/hle/kernel/svc/svc_nx2_oot_probe.h"
 #include "core/loader/loader.h"
 #include "core/loader/nso.h"
 #include "core/memory/cheat_engine.h"
@@ -252,6 +253,17 @@ constexpr std::array<u8, 124> SOUND_GATE{
 constexpr std::array<u8, 16> SOUND_FEED{
     0x00, 0x11, 0x40, 0xBD, 0x10, 0x10, 0x2E, 0x1E, 0x00, 0x68, 0x30, 0x1E, 0xC0, 0x03, 0x5F, 0xD6,
 };
+// EDEN_NX2_OOT_SOUND_GATE=whole: the sound manager job runs every frame (no gate), and its step
+// load returns the whole steps built up in an accumulator (timer state + 0xA0) below a step of 1:
+// 0 on most frames above 60 fps, 1 once a whole 60 Hz step has passed. At 60 fps and below it
+// returns the step as it is. ldr s0, [x8, #0x10] ; fmov s16, #1.0 ; fcmp s0, s16 ; b.ge ret ;
+// adrp x16, state ; add x16, x16, #0xea0 ; ldr s17, [x16] ; fadd s17, s17, s0 ; frintz s0, s17 ;
+// fsub s17, s17, s0 ; str s17, [x16] ; ret. x16 and s16/s17 are dead at main+0x415334.
+constexpr std::array<u8, 48> SOUND_FEED_WHOLE{
+    0x00, 0x11, 0x40, 0xBD, 0x10, 0x10, 0x2E, 0x1E, 0x00, 0x20, 0x30, 0x1E, 0x0A, 0x01, 0x00, 0x54,
+    0xD0, 0x92, 0x00, 0xB0, 0x10, 0x82, 0x3A, 0x91, 0x11, 0x02, 0x40, 0xBD, 0x31, 0x2A, 0x20, 0x1E,
+    0x20, 0xC2, 0x25, 0x1E, 0x31, 0x3A, 0x20, 0x1E, 0x11, 0x02, 0x00, 0xBD, 0xC0, 0x03, 0x5F, 0xD6,
+};
 constexpr std::array DYNAMIC_FPS_RECORDS{
     BuiltinPatchRecord{0x6E6CC4, DYNAMIC_FPS_CALL, DYNAMIC_FPS_ORIGINAL},
     BuiltinPatchRecord{0x3C46200, DYNAMIC_FPS_ROUTINE, {}, true},
@@ -321,6 +333,35 @@ constexpr std::array<u8, 128> STEP_SHARED_ROUTINE{
     0xC0, 0x09, 0x00, 0xBD, 0x2D, 0x00, 0x38, 0x1E, 0xE0, 0x07, 0xC1, 0xAC, 0xC0, 0x03,
     0x5F, 0xD6,
 };
+// EDEN_NX2_OOT_STEP_TABLE=1 (opt-in; measured in Dodongo's Cavern at 120 fps: 5 live counters, no
+// eviction with the original): the shared helper with a table that doesn't thrash. The original keeps
+// 16 slots that are never freed and replaces them in turn, so once more than 16 counters have been
+// seen, a counter whose slot was taken gets max(trunc(step), 1) = 1 whole tick on every call: twice
+// its rate at 120 fps. This one keeps 256 slots of {u64 counter, f32 remainder, u32 stamp} at
+// main+0x4E9C000. A counter is looked up in an 8-slot window from a hash of its address; a miss
+// takes the window's first empty slot, else the one used longest ago (stamp = a call counter kept
+// after the table), and returns max(trunc(step), 1) with the difference kept as a (negative) remainder, so even a new
+// counter follows real time from its first call. Same interface: x13 = counter address, s0 = step,
+// w13 = ticks; saves the other registers it uses (x9-x12, x17, q0/q1), sets NZCV.
+constexpr std::array<u8, 212> STEP_SHARED_ROUTINE_V2{
+    0xE0, 0x87, 0xBD, 0xAD, 0xF1, 0x27, 0x02, 0xA9, 0xEA, 0x2F, 0x03, 0xA9, 0xEC, 0x23, 0x00, 0xF9,
+    0xAE, 0x92, 0x00, 0xD0, 0xD1, 0x01, 0x50, 0xB9, 0x31, 0x06, 0x00, 0x11, 0xD1, 0x01, 0x10, 0xB9,
+    0x2F, 0x36, 0x8F, 0x52, 0xEF, 0xC6, 0xB3, 0x72, 0xB0, 0xFD, 0x42, 0xD3, 0x10, 0x7E, 0x0F, 0x9B,
+    0x10, 0x7E, 0x58, 0xD3, 0x0F, 0x01, 0x80, 0x52, 0xEA, 0x03, 0x0E, 0xAA, 0x0B, 0x00, 0x80, 0x52,
+    0xC9, 0x11, 0x10, 0x8B, 0x2C, 0x01, 0x40, 0xF9, 0x9F, 0x01, 0x0D, 0xEB, 0xC0, 0x02, 0x00, 0x54,
+    0x8C, 0x01, 0x00, 0xB4, 0x2C, 0x0D, 0x40, 0xB9, 0x2C, 0x02, 0x0C, 0x4B, 0x9F, 0x01, 0x0B, 0x6B,
+    0x63, 0x00, 0x00, 0x54, 0xEA, 0x03, 0x09, 0xAA, 0xEB, 0x03, 0x0C, 0x2A, 0x10, 0x06, 0x00, 0x11,
+    0x10, 0x1E, 0x00, 0x12, 0xEF, 0x05, 0x00, 0x71, 0x41, 0xFE, 0xFF, 0x54, 0xE9, 0x03, 0x0A, 0xAA,
+    0x2D, 0x01, 0x00, 0xF9, 0x31, 0x0D, 0x00, 0xB9, 0x0D, 0x00, 0x38, 0x1E, 0xBF, 0x05, 0x00, 0x71,
+    0xAD, 0xA5, 0x9F, 0x1A, 0xA1, 0x01, 0x22, 0x1E, 0x01, 0x38, 0x21, 0x1E, 0x21, 0x09, 0x00, 0xBD,
+    0x08, 0x00, 0x00, 0x14, 0x31, 0x0D, 0x00, 0xB9, 0x21, 0x09, 0x40, 0xBD, 0x00, 0x28, 0x21, 0x1E,
+    0x01, 0xC0, 0x25, 0x1E, 0x00, 0x38, 0x21, 0x1E, 0x20, 0x09, 0x00, 0xBD, 0x2D, 0x00, 0x38, 0x1E,
+    0xEC, 0x23, 0x40, 0xF9, 0xEA, 0x2F, 0x43, 0xA9, 0xF1, 0x27, 0x42, 0xA9, 0xE0, 0x87, 0xC2, 0xAC,
+    0xC0, 0x03, 0x5F, 0xD6,
+};
+constexpr size_t STEP_SHARED_SIZE = 212;
+constexpr size_t STEP_TABLE_OFFSET = 0x4E9C000;
+constexpr size_t STEP_TABLE_SIZE = 0x1010;
 constexpr std::array<u8, 4> STEP_AMBIENT_ORIGINAL{
     0x7A, 0x07, 0x00, 0x11,
 };
@@ -456,16 +497,66 @@ constexpr std::array FPS_UNLOCK_HOOKS{
                      0x3C46480, SOLVER_STEPS_ROUTINE},
 };
 
+template <size_t N, size_t M>
+constexpr std::array<u8, N> PadTo(const std::array<u8, M>& bytes) {
+    static_assert(M <= N);
+    std::array<u8, N> out{};
+    for (size_t i = 0; i < M; ++i) {
+        out[i] = bytes[i];
+    }
+    return out;
+}
+
+// FPS Unlock's sound and step-counter records take their bytes from these, which
+// SelectFpsUnlockVariant fills from EDEN_NX2_OOT_SOUND_GATE / EDEN_NX2_OOT_STEP_TABLE before the
+// patch is applied. They start as the upstream records. Unused cave bytes stay zero.
+std::array<u8, 4> SOUND_ENTRY_WORD = SOUND_ENTRY_BRANCH;
+std::array<u8, 4> SOUND_STEP_WORD = SOUND_STEP_CALL;
+std::array<u8, 124> SOUND_GATE_BYTES = SOUND_GATE;
+std::array<u8, 48> SOUND_FEED_BYTES = PadTo<48>(SOUND_FEED);
+std::array<u8, STEP_SHARED_SIZE> STEP_SHARED_BYTES = PadTo<STEP_SHARED_SIZE>(STEP_SHARED_ROUTINE);
+
+// EDEN_NX2_OOT_SOUND_GATE: unset or "1" = upstream's gate (#1660: the sound manager job at 60 Hz
+// above 60 fps); "0" = no gate and the raw step (before #1660); "feed" = no gate, every frame
+// max(step, 1); "whole" = no gate, every frame the whole steps of an accumulator (SOUND_FEED_WHOLE).
+// EDEN_NX2_OOT_STEP_TABLE: unset or "0" = upstream's 16-slot step helper, "1" = the 256-slot one.
+bool SelectFpsUnlockVariant() {
+    static const bool selected = [] {
+        const char* gate = std::getenv("EDEN_NX2_OOT_SOUND_GATE");
+        const std::string_view mode = gate != nullptr ? gate : "";
+        if (mode == "0") {
+            SOUND_ENTRY_WORD = SOUND_ENTRY_ORIGINAL;
+            SOUND_STEP_WORD = SOUND_STEP_ORIGINAL;
+            SOUND_GATE_BYTES = {};
+            SOUND_FEED_BYTES = {};
+        } else if (mode == "feed" || mode == "whole") {
+            SOUND_ENTRY_WORD = SOUND_ENTRY_ORIGINAL;
+            SOUND_GATE_BYTES = {};
+            SOUND_FEED_BYTES =
+                mode == "feed" ? PadTo<48>(SOUND_FEED) : PadTo<48>(SOUND_FEED_WHOLE);
+        }
+        if (!mode.empty() && mode != "1") {
+            LOG_INFO(Loader, "FPS Unlock: sound gate mode {} (EDEN_NX2_OOT_SOUND_GATE)", mode);
+        }
+        if (OotEnvSwitch("EDEN_NX2_OOT_STEP_TABLE", false)) {
+            STEP_SHARED_BYTES = STEP_SHARED_ROUTINE_V2;
+            LOG_INFO(Loader, "FPS Unlock: 256-slot step counter table (EDEN_NX2_OOT_STEP_TABLE)");
+        }
+        return true;
+    }();
+    return selected;
+}
+
 constexpr std::array FPS_UNLOCK_RECORDS{
     BuiltinPatchRecord{0x6E6CC4, DYNAMIC_FPS_CALL, DYNAMIC_FPS_ORIGINAL},
     BuiltinPatchRecord{0x3C46200, FPS_UNLOCK_ROUTINE, {}, true},
     BuiltinPatchRecord{0x475F8, WATER_STEPS_CALL, WATER_STEPS_ORIGINAL},
     BuiltinPatchRecord{0x4760C, WATER_MUL_NOP, WATER_MUL_ORIGINAL},
     BuiltinPatchRecord{0x3C46300, WATER_STEPS_ROUTINE, {}, true},
-    BuiltinPatchRecord{0x415300, SOUND_ENTRY_BRANCH, SOUND_ENTRY_ORIGINAL},
-    BuiltinPatchRecord{0x415334, SOUND_STEP_CALL, SOUND_STEP_ORIGINAL},
-    BuiltinPatchRecord{0x3C46800, SOUND_GATE, {}, true},
-    BuiltinPatchRecord{0x3C46280, SOUND_FEED, {}, true},
+    BuiltinPatchRecord{0x415300, SOUND_ENTRY_WORD, SOUND_ENTRY_ORIGINAL},
+    BuiltinPatchRecord{0x415334, SOUND_STEP_WORD, SOUND_STEP_ORIGINAL},
+    BuiltinPatchRecord{0x3C46800, SOUND_GATE_BYTES, {}, true},
+    BuiltinPatchRecord{0x3C46280, SOUND_FEED_BYTES, {}, true},
     BuiltinPatchRecord{0xA68300, STEP_HUD_HOOK, STEP_HUD_ORIGINAL},
     BuiltinPatchRecord{0x3C46900, STEP_HUD_ROUTINE, {}, true},
     BuiltinPatchRecord{0x3293410, STEP_REPLAY_HOOK, STEP_REPLAY_ORIGINAL},
@@ -474,7 +565,7 @@ constexpr std::array FPS_UNLOCK_RECORDS{
     BuiltinPatchRecord{0x3C46950, STEP_HITSTOP_ROUTINE, {}, true},
     BuiltinPatchRecord{0x53F914, STEP_AMBIENT_HOOK, STEP_AMBIENT_ORIGINAL},
     BuiltinPatchRecord{0x3C46B60, STEP_AMBIENT_ROUTINE, {}, true},
-    BuiltinPatchRecord{0x3C46980, STEP_SHARED_ROUTINE, {}, true},
+    BuiltinPatchRecord{0x3C46980, STEP_SHARED_BYTES, {}, true},
     BuiltinPatchRecord{0x13A070, GROUND_VELOCITY_NOP, GROUND_VELOCITY_ORIGINAL_A},
     BuiltinPatchRecord{0x13D710, GROUND_VELOCITY_NOP, GROUND_VELOCITY_ORIGINAL_B},
     BuiltinPatchRecord{0x389AC2C, GROUND_VELOCITY_NOP, GROUND_VELOCITY_ORIGINAL_C},
@@ -686,6 +777,7 @@ constexpr std::array DYNAMIC_FPS_STATES{BuiltinPatchState{0x4E9FE00, 0x98}};
 constexpr std::array FPS_UNLOCK_STATES{
     BuiltinPatchState{0x4E9FE00, 0xA8},
     BuiltinPatchState{0x4E9EE00, 0x110},
+    BuiltinPatchState{STEP_TABLE_OFFSET, STEP_TABLE_SIZE},
 };
 
 // Text speed (port of NotRexed/Hookshot#402): main+0xAFE140 steps a text pane's letter
@@ -718,6 +810,67 @@ constexpr std::array TEXT_SPEED_INSTANT_RECORDS{
     BuiltinPatchRecord{TEXT_SPEED_CAVE, TEXT_SPEED_INSTANT_CAVE, {}, true},
 };
 
+// EDEN_NX2_OOT_PROBE (debug, off when unset; svc_nx2_oot_probe.h): each listed main instruction
+// becomes a branch to a 16-byte cave at Nx2OotProbeCave(i): svc #0xf4 ; the instruction ;
+// b back ; tag. b/bl and adrp are re-encoded for the cave; other PC-relative instructions are
+// refused. Applied after the built-ins, so a probe may sit on a built-in's code.
+void ApplyOotProbes(std::vector<u8>& out, const Loader::NSOHeader& header) {
+    const auto offsets = Kernel::Svc::Nx2OotProbeOffsets();
+    const auto text_end = u64{header.segments[0].location} + header.segments[0].size;
+    // Sites may also be in the built-ins' code caves (the text's executable padding).
+    const auto exec_end = (text_end + 0xFFF) & ~u64{0xFFF};
+    const auto word = [&](u64 off) {
+        u32 w{};
+        std::memcpy(&w, out.data() + sizeof(Loader::NSOHeader) + off, 4);
+        return w;
+    };
+    const auto put = [&](u64 off, u32 w) {
+        std::memcpy(out.data() + sizeof(Loader::NSOHeader) + off, &w, 4);
+    };
+    const auto branch = [](u64 from, u64 to, bool link) {
+        const s64 delta = (static_cast<s64>(to) - static_cast<s64>(from)) >> 2;
+        return (link ? 0x94000000U : 0x14000000U) | (static_cast<u32>(delta) & 0x03FFFFFFU);
+    };
+    for (size_t i = 0; i < offsets.size(); ++i) {
+        const u64 site = offsets[i];
+        const u64 cave = Kernel::Svc::Nx2OotProbeCave(i);
+        if (i >= Kernel::Svc::kNx2OotProbeMax || cave < text_end ||
+            out.size() < sizeof(Loader::NSOHeader) + cave + 16 || (site & 3) != 0 ||
+            site + 4 > exec_end || word(cave) != 0 || word(cave + 4) != 0 || word(cave + 8) != 0 ||
+            word(cave + 12) != 0) {
+            LOG_WARNING(Loader, "OoT probe {:#x}: no room (cave {:#x} used or site outside text)",
+                        site, cave);
+            continue;
+        }
+        u32 insn = word(site);
+        if ((insn & 0x7C000000U) == 0x14000000U) { // b / bl
+            const s64 imm = static_cast<s64>(static_cast<s32>(insn << 6) >> 6) * 4;
+            insn = branch(cave + 4, site + imm, (insn & 0x80000000U) != 0);
+        } else if ((insn & 0x9F000000U) == 0x90000000U) { // adrp
+            const s64 immhi = static_cast<s64>(static_cast<s32>((insn >> 5) << 13) >> 13);
+            const s64 imm = (immhi << 2) | ((insn >> 29) & 3);
+            const s64 page = static_cast<s64>(site & ~u64{0xFFF}) + (imm << 12);
+            const s64 rel = (page - static_cast<s64>((cave + 4) & ~u64{0xFFF})) >> 12;
+            insn = 0x90000000U | (insn & 31) | ((static_cast<u32>(rel) & 3) << 29) |
+                   (((static_cast<u32>(rel) >> 2) & 0x7FFFF) << 5);
+        } else if ((insn & 0x1F000000U) == 0x10000000U || // adr
+                   (insn & 0xFF000010U) == 0x54000000U || // b.cond
+                   (insn & 0x7E000000U) == 0x34000000U || // cbz/cbnz
+                   (insn & 0x7E000000U) == 0x36000000U || // tbz/tbnz
+                   (insn & 0x3B000000U) == 0x18000000U) { // ldr literal
+            LOG_WARNING(Loader, "OoT probe {:#x}: PC-relative instruction {:#010x}, not probed",
+                        site, insn);
+            continue;
+        }
+        put(cave, 0xD4000001U | (Kernel::Svc::kNx2OotProbeSvc << 5)); // svc #0xf4
+        put(cave + 4, insn);
+        put(cave + 8, branch(cave + 8, site + 4, false));
+        put(cave + 12, Kernel::Svc::kNx2OotProbeTag | static_cast<u32>(i));
+        put(site, branch(site, cave, false));
+        LOG_INFO(Loader, "    - OoT probe {} at main+{:#x} (cave {:#x})", i, site, cave);
+    }
+}
+
 constexpr std::array BUILTIN_PATCHES{
     // Ocarina of Time takes its "dynamic resolution disabled" path, so the 3D renders at full scale
     // instead of following the GPU-time controller down to its 480p floor.
@@ -746,6 +899,7 @@ constexpr std::array BUILTIN_PATCHES{
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = FPS_UNLOCK_RECORDS,
         .states = FPS_UNLOCK_STATES,
+        .env_enabled = SelectFpsUnlockVariant,
         .hooks = FPS_UNLOCK_HOOKS,
         .replaces = "Dynamic FPS by Dark (built-in)",
     },
@@ -1592,6 +1746,11 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         if (!patch.group.empty()) {
             applied_groups.push_back(patch.group);
         }
+    }
+
+    if (title_id == 0x0400486024DEC000 && name == "main" &&
+        build_id == "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348") {
+        ApplyOotProbes(out, header);
     }
 
     if (!applied.empty()) {

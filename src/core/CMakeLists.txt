@@ -391,6 +391,8 @@ add_library(core STATIC
     hle/kernel/svc/svc_nx2_zstd.h
     hle/kernel/svc/svc_nx2_oot_poll.cpp
     hle/kernel/svc/svc_nx2_oot_poll.h
+    hle/kernel/svc/svc_nx2_oot_probe.cpp
+    hle/kernel/svc/svc_nx2_oot_probe.h
     hle/kernel/svc/svc_physical_memory.cpp
     hle/kernel/svc/svc_port.cpp
     hle/kernel/svc/svc_power_management.cpp
