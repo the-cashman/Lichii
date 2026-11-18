@@ -16,6 +16,7 @@ find_package(Qt6 REQUIRED COMPONENTS Widgets)
 
 if(LICHII_TESTS)
     add_subdirectory(../tests/qt_compatibility ${CMAKE_BINARY_DIR}/qt_compatibility_tests)
+    add_subdirectory(../tests/qt_iidb ${CMAKE_BINARY_DIR}/qt_iidb_tests)
 endif()
 
 add_executable(lichii
@@ -152,6 +153,8 @@ add_executable(lichii
     configuration/configure_ui.ui
     configuration/configure_hd_rumble.cpp
     configuration/configure_hd_rumble.h
+    configuration/iidb_artwork_dialog.cpp configuration/iidb_artwork_dialog.h
+    configuration/iidb_key_dialog.cpp configuration/iidb_key_dialog.h
     configuration/configure_vibration.cpp
     configuration/configure_vibration.h
     configuration/configure_vibration.ui
@@ -167,6 +170,8 @@ add_executable(lichii
     debugger/controller.cpp
     debugger/controller.h
 
+    game/artwork_image.cpp game/artwork_image.h
+    game/iidb_client.cpp game/iidb_client.h
     game/game_list.cpp game/game_list.h
     game/game_grid.cpp game/game_grid.h
 
@@ -433,7 +438,7 @@ target_link_libraries(lichii PRIVATE Boost::headers Qt6::Widgets Qt6::Concurrent
 # Unpacks NVIDIA's files from the Streamline release (nvidia_dlss_panel.cpp).
 target_link_libraries(lichii PRIVATE ZLIB::ZLIB)
 if (WIN32)
-    target_link_libraries(lichii PRIVATE QuaZip::QuaZip)
+    target_link_libraries(lichii PRIVATE QuaZip::QuaZip advapi32)
 endif()
 target_link_libraries(lichii PRIVATE ${PLATFORM_LIBRARIES} Threads::Threads)
 if (ENABLE_OPENGL)

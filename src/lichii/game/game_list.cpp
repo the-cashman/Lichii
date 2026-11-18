@@ -991,7 +991,7 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
             });
 #endif
     connect(properties, &QAction::triggered, this,
-            [this, path]() { emit OpenPerGameGeneralRequested(path); });
+            [this, program_id, path]() { emit OpenPerGameGeneralRequested(program_id, path); });
     connect(lookup_artwork, &QAction::triggered, this, [this, program_id] {
         QueueArtworkLookup(program_id, GameTitle(program_id), true);
     });

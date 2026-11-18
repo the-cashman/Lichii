@@ -682,6 +682,8 @@ add_library(core STATIC
     hle/service/filesystem/fsp/fsp_pr.cpp
     hle/service/filesystem/fsp/fsp_pr.h
     hle/service/filesystem/fsp/fsp_srv.cpp
+    hle/service/filesystem/fsp/fsp_system_archive.cpp
+    hle/service/filesystem/fsp/fsp_system_archive.h
     hle/service/filesystem/fsp/fsp_srv.h
     hle/service/filesystem/fsp/fsp_types.h
     hle/service/filesystem/fsp/save_data_transfer_prohibiter.cpp
@@ -1090,6 +1092,7 @@ add_library(core STATIC
     hle/service/nx2_video_ready.h
     hle/service/services.cpp
     hle/service/services.h
+    hle/service/system_data_view.h
     hle/service/set/factory_settings_server.cpp
     hle/service/set/factory_settings_server.h
     hle/service/set/firmware_debug_settings_server.cpp

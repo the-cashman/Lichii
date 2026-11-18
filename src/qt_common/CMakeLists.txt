@@ -19,6 +19,7 @@ add_library(qt_common STATIC
 
     util/path.h util/path.cpp
     util/game.h util/game.cpp
+    util/custom_game_metadata.cpp
     util/meta.h util/meta.cpp
     util/content.h util/content.cpp
     util/rom.h util/rom.cpp

@@ -3539,13 +3539,14 @@ void MainWindow::OnGameListShowList(bool show) {
     game_list_placeholder->setVisible(!show);
 };
 
-void MainWindow::OnGameListOpenPerGameProperties(const std::string& file) {
-    u64 title_id{};
+void MainWindow::OnGameListOpenPerGameProperties(u64 title_id, const std::string& file) {
     {
         const auto v_file = Core::GetGameFileFromPath(QtCommon::vfs, file);
-        const auto loader = Loader::GetLoader(*QtCommon::system, v_file);
+        const auto loader = Loader::GetLoader(*QtCommon::system, v_file, title_id);
 
-        if (loader == nullptr || loader->ReadProgramId(title_id) != Loader::ResultStatus::Success) {
+        u64 loaded_id{};
+        if (!loader || loader->ReadProgramId(loaded_id) != Loader::ResultStatus::Success ||
+            loaded_id != title_id) {
             QMessageBox::information(this, tr("Properties"),
                                      tr("The game properties could not be loaded."));
             return;

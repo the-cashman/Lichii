@@ -50,8 +50,10 @@ constexpr Result ERROR_ARGUMENT_IS_NULL(ErrorModule::Account, 20);
 
 constexpr char ACC_SAVE_AVATORS_BASE_PATH[] = "system/save/8000000000000010/su/avators";
 
-ProfileManager::ProfileManager() {
-    ParseUserSaveFile();
+ProfileManager::ProfileManager(ProfileStorage storage_) : storage{storage_} {
+    if (!IsScratch()) {
+        ParseUserSaveFile();
+    }
     OpenCurrentUser();
 }
 
@@ -60,6 +62,11 @@ void ProfileManager::OpenCurrentUser() {
     if (user_count == 0) {
         CreateNewUser(UUID::MakeRandom(), "Eden");
         WriteUserSaveFile();
+    }
+
+    if (IsScratch()) {
+        OpenUser(*GetUser(0));
+        return;
     }
 
     auto current =
@@ -92,10 +99,15 @@ bool ProfileManager::RemoveProfileAtIndex(std::size_t index) {
         return false;
     }
 
-    Common::Nextendo::ClearAccount(profiles[index].user_uuid);
+    if (!IsScratch()) {
+        Common::Nextendo::ClearAccount(profiles[index].user_uuid);
+    }
     profiles[index] = ProfileInfo{};
     std::stable_partition(profiles.begin(), profiles.end(),
                           [](const ProfileInfo& profile) { return profile.user_uuid.IsValid(); });
+    if (IsScratch()) {
+        --user_count;
+    }
 
     is_save_needed = true;
     WriteUserSaveFile();
@@ -437,7 +449,7 @@ void ProfileManager::ParseUserSaveFile() {
 }
 
 void ProfileManager::WriteUserSaveFile() {
-    if (!is_save_needed) {
+    if (IsScratch() || !is_save_needed) {
         return;
     }
 
@@ -490,7 +502,12 @@ void ProfileManager::WriteUserSaveFile() {
 void ProfileManager::ResetUserSaveFile()
 {
     RemoveAllProfiles();
-    ParseUserSaveFile();
+    if (IsScratch()) {
+        stored_opened_profiles = {};
+        last_opened_user = {};
+    } else {
+        ParseUserSaveFile();
+    }
     // ParseUserSaveFile adds every user closed: open the current one as the constructor does, or
     // the eden-cli, which resets once the config names the NAND, left games no open user.
     OpenCurrentUser();
@@ -524,6 +541,10 @@ std::vector<std::string> ProfileManager::FindExistingProfileStrings()
 
 std::vector<std::string> ProfileManager::FindGoodProfiles()
 {
+    if (IsScratch()) {
+        return FindExistingProfileStrings();
+    }
+
     namespace fs = std::filesystem;
 
     std::vector<std::string> good_uuids;
@@ -548,6 +569,10 @@ std::vector<std::string> ProfileManager::FindGoodProfiles()
 
 std::vector<std::string> ProfileManager::FindOrphanedProfiles()
 {
+    if (IsScratch()) {
+        return {};
+    }
+
     std::vector<std::string> good_uuids = FindGoodProfiles();
 
     namespace fs = std::filesystem;

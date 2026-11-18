@@ -63,6 +63,7 @@
 #include "core/hle/service/filesystem/fsp/fs_read_trace.h"
 #include "core/hle/service/glue/glue_manager.h"
 #include "core/hle/service/glue/time/static.h"
+#include "core/hle/service/glue/time/time_zone_binary.h"
 #include "core/hle/service/psc/time/static.h"
 #include "core/hle/service/psc/time/steady_clock.h"
 #include "core/hle/service/psc/time/system_clock.h"
@@ -223,9 +224,13 @@ std::optional<u64> FindSwitch2Program(const FileSys::VirtualFile& file, u64 prog
 }
 
 struct System::Impl {
-    explicit Impl(System& system)
+    explicit Impl(System& system, Service::Account::ProfileStorage profile_storage)
         : kernel{system}, fs_controller{system}, hid_core{kernel}, cpu_manager{system},
-          reporter{system}, applet_manager{system}, frontend_applets{system}, profile_manager{} {}
+          reporter{system, profile_storage == Service::Account::ProfileStorage::Scratch
+                               ? Reporter::FSAccessLogPolicy::Disabled
+                               : Reporter::FSAccessLogPolicy::Disk},
+          applet_manager{system}, frontend_applets{system},
+          profile_manager{std::make_shared<Service::Account::ProfileManager>(profile_storage)} {}
 
     u64 program_id;
 
@@ -436,7 +441,33 @@ struct System::Impl {
         return SystemResultStatus::Success;
     }
 
-    SystemResultStatus SetupForApplicationProcess(System& system, Frontend::EmuWindow& emu_window) {
+    SystemResultStatus SetupForApplicationProcess(
+        System& system, Frontend::EmuWindow& emu_window,
+        std::shared_ptr<const Service::SystemDataView> isolated_system_data = {}) {
+        if (profile_manager->IsScratch() != (isolated_system_data != nullptr)) {
+            LOG_ERROR(Core, "Isolated system data and a scratch profile must be selected together");
+            return SystemResultStatus::ErrorSystemFiles;
+        }
+
+        std::shared_ptr<Service::Glue::Time::TimeZoneBinary> isolated_time_zone;
+        u64 isolated_process_id{};
+        if (isolated_system_data) {
+            constexpr u64 NativeHomeProgramId = 0x0400000000001000;
+            const auto* process = kernel.ApplicationProcess();
+            if (!process || !process->IsSwitch2() || process->IsApplication() ||
+                process->GetProgramId() != NativeHomeProgramId || process->GetProcessId() == 0) {
+                LOG_ERROR(Core, "Isolated system data requires the native HOME process");
+                return SystemResultStatus::ErrorSystemFiles;
+            }
+            isolated_process_id = process->GetProcessId();
+            isolated_time_zone = std::make_shared<Service::Glue::Time::TimeZoneBinary>(system);
+            const auto result = isolated_time_zone->Mount(isolated_system_data);
+            if (result.IsFailure()) {
+                LOG_ERROR(Core, "Cannot mount isolated time-zone data: {:#x}", result.raw);
+                return SystemResultStatus::ErrorSystemFiles;
+            }
+        }
+
         host1x_core.emplace(system);
         VideoCore::CreateGPU(gpu_core, emu_window, system);
         if (!gpu_core)
@@ -445,7 +476,9 @@ struct System::Impl {
         audio_core.emplace(system);
 
         service_manager = std::make_shared<Service::SM::ServiceManager>(kernel);
-        services.emplace(service_manager, system, stop_event.get_token());
+        services.emplace(service_manager, system, stop_event.get_token(),
+                         std::move(isolated_system_data), std::move(isolated_time_zone),
+                         isolated_process_id);
 
         is_powered_on = true;
         exit_locked = false;
@@ -461,6 +494,10 @@ struct System::Impl {
     }
 
     SystemResultStatus Load(System& system, Frontend::EmuWindow& emu_window, const std::string& filepath, Service::AM::FrontendAppletParameters& params) {
+        if (profile_manager->IsScratch()) {
+            return SystemResultStatus::ErrorSystemFiles;
+        }
+
         VideoCommon::StutterTrace::BootMarker("boot_start");
         if (params.launch_type == Service::AM::LaunchType::FrontendInitiated) {
             fs_controller.InitTempStorage();
@@ -776,7 +813,7 @@ struct System::Impl {
     Service::APM::Controller apm_controller{core_timing};
     /// Service State
     Service::Glue::ARPManager arp_manager;
-    Service::Account::ProfileManager profile_manager;
+    std::shared_ptr<Service::Account::ProfileManager> profile_manager;
     /// Network instance
     Network::NetworkInstance network_instance;
     Core::SpeedLimiter speed_limiter;
@@ -844,7 +881,10 @@ struct System::Impl {
     }
 };
 
-System::System() : impl{std::make_unique<Impl>(*this)} {}
+System::System() : System{Service::Account::ProfileStorage::Shared} {}
+
+System::System(Service::Account::ProfileStorage profile_storage)
+    : impl{std::make_unique<Impl>(*this, profile_storage)} {}
 
 System::~System() = default;
 
@@ -1179,11 +1219,15 @@ const Service::APM::Controller& System::GetAPMController() const {
 }
 
 Service::Account::ProfileManager& System::GetProfileManager() {
-    return impl->profile_manager;
+    return *impl->profile_manager;
 }
 
 const Service::Account::ProfileManager& System::GetProfileManager() const {
-    return impl->profile_manager;
+    return *impl->profile_manager;
+}
+
+std::shared_ptr<Service::Account::ProfileManager> System::GetScratchProfileManager() const {
+    return impl->profile_manager->IsScratch() ? impl->profile_manager : nullptr;
 }
 
 void System::SetExitLocked(bool locked) {

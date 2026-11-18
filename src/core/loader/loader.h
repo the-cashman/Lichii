@@ -161,6 +161,7 @@ enum class ResultStatus : u16 {
     ErrorIntegrityVerificationFailed,
     ErrorNUPBadFormat,
     ErrorNUPNoBasePackage,
+    ErrorNativeHomeProgramMismatch,
 };
 
 std::string GetResultStatusString(ResultStatus status);
