@@ -14,6 +14,7 @@
 #include "video_core/buffer_cache/usage_tracker.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
+#include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/renderer_vulkan/vk_multi_range_buffer.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
@@ -129,7 +130,11 @@ public:
         return vertex_repack_mask != 0;
     }
 
-    u64 CurrentTick();
+    /// Scheduler::CurrentTick, inline: the stream uniform reuse asks for it on every small
+    /// uniform buffer bind.
+    u64 CurrentTick() const noexcept {
+        return master_semaphore.CurrentTick();
+    }
 
     bool IsFree(u64 tick);
 
@@ -378,6 +383,7 @@ private:
     const Device& device;
     MemoryAllocator& memory_allocator;
     Scheduler& scheduler;
+    const MasterSemaphore& master_semaphore; ///< The scheduler's, for CurrentTick
     StagingBufferPool& staging_pool;
     GuestDescriptorQueue& guest_descriptor_queue;
 

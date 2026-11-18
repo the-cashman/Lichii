@@ -411,7 +411,8 @@ BufferCacheRuntime::BufferCacheRuntime(const Device& device_, MemoryAllocator& m
                                        ComputePassDescriptorQueue& compute_pass_descriptor_queue,
                                        DescriptorPool& descriptor_pool)
     : device{device_}, memory_allocator{memory_allocator_}, scheduler{scheduler_},
-      staging_pool{staging_pool_}, guest_descriptor_queue{guest_descriptor_queue_},
+      master_semaphore{scheduler_.GetMasterSemaphore()}, staging_pool{staging_pool_},
+      guest_descriptor_queue{guest_descriptor_queue_},
       quad_index_pass(device, scheduler, descriptor_pool, staging_pool,
                       compute_pass_descriptor_queue),
       multi_range_buffers(device_) {
@@ -505,10 +506,6 @@ void BufferCacheRuntime::TickFrame(Common::SlotVector<Buffer>& slot_buffers) noe
             it->ResetUsageTracking();
         }
     }
-}
-
-u64 BufferCacheRuntime::CurrentTick() {
-    return scheduler.CurrentTick();
 }
 
 bool BufferCacheRuntime::IsFree(u64 tick) {
