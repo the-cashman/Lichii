@@ -107,9 +107,8 @@ public:
     // - IPS
     // - IPSwitch
     // - Built-in patches, keyed by title and build id
-    // frame_rate_unlocked is set when one of the built-in patches applied lets the game run
-    // faster than its console frame rate (Ocarina of Time's FPS Unlock); it is left as it is
-    // otherwise.
+    // frame_rate_unlocked is set when an applied built-in opts into display-driven pacing;
+    // it is left as it is otherwise.
     [[nodiscard]] std::vector<u8> PatchNSO(const std::vector<u8>& nso, const std::string& name,
                                            bool* frame_rate_unlocked = nullptr) const;
 

@@ -103,6 +103,19 @@ Normal and an unscaled counter are prerequisites for evaluating its timing;
 the Add-On does not change global clock behavior or automatically override
 the user's settings. Correct gameplay speed with the Add-On is unverified.
 
+## Default frame pacing
+
+Both Ocarina FPS built-ins use the vsync timer, whose `nx2_frame_rate_limit`
+defaults to 60 Hz. FPS Unlock does not opt into display-driven pacing, so a
+high-refresh monitor cannot raise the default game rate when `fps_limit` is 0.
+Explicit timer-rate overrides still apply; existing settings are not reset.
+
+In #2049, keeping FPS Unlock enabled and limiting the emulator to 60 FPS resolved
+stuck battle music, skipped song notes and Epona's missing jump animation. Keeping
+the default at 60 is a mitigation for those high-frame-rate bugs, not a fix for
+their underlying game logic. Users with a higher configured rate should keep the
+60 FPS limit until those bugs are resolved.
+
 ## FPS Unlock: sound manager at 60 Hz
 
 `FPS Unlock (built-in)` lowers the step below 1.0 above 60 fps (0.5 at 120 fps).

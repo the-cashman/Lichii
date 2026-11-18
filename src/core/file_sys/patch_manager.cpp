@@ -693,7 +693,6 @@ constexpr std::array BUILTIN_PATCHES{
         .records = FPS_UNLOCK_RECORDS,
         .states = FPS_UNLOCK_STATES,
         .replaces = "Dynamic FPS by Dark (built-in)",
-        .unlocks_frame_rate = true,
     },
     BuiltinPatch{
         .name = "Dynamic FPS by Dark (built-in)",
