@@ -53,6 +53,7 @@
 #include "core/hle/service/acc/nextendo_id_token.h"
 #include "core/hle/service/acc/profile_manager.h"
 #include "core/hle/service/am/applet_manager.h"
+#include "core/hle/service/bcat/backend/nextendo.h"
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/loader/loader.h"
 #include "frontend_common/config.h"
@@ -731,6 +732,7 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         if (loader && loader->ReadProgramId(title_id) == Loader::ResultStatus::Success) {
             Common::NplnPatchCatalog::PrepareForGame(
                 title_id, [&] { return loader->ReadMainBuildIdHex(state->system); });
+            Service::BCAT::Nextendo::PrepareForGame(title_id);
         }
     }
     const Core::SystemResultStatus load_result = state->system.Load(*state->emu_window, lp.filepath, load_parameters);

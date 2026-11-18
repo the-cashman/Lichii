@@ -18,6 +18,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
+#include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/nx2_bindmemo_stats.h"
 #include "video_core/surface.h"
@@ -281,6 +282,22 @@ public:
             .pSetLayouts = bindings.empty() ? nullptr : &descriptor_set_layout,
             .pushConstantRangeCount = 1,
             .pPushConstantRanges = &range,
+        });
+    }
+
+    /// The set and pipeline layouts from the cache, made on the first pipeline with these
+    /// bindings, set flags and push constant range.
+    const PipelineLayoutCache::Entry& GetLayouts(PipelineLayoutCache& cache,
+                                                 bool use_push_descriptor,
+                                                 bool use_descriptor_buffer = false) const {
+        return cache.Get(PipelineLayoutCache::MakeKey(use_push_descriptor, use_descriptor_buffer,
+                                                      is_compute, uses_mesh, mesh_emulation,
+                                                      std::span(bindings.data(), bindings.size())),
+                         [&] {
+            PipelineLayoutCache::Entry entry;
+            entry.set = CreateDescriptorSetLayout(use_push_descriptor, use_descriptor_buffer);
+            entry.pipeline = CreatePipelineLayout(*entry.set);
+            return entry;
         });
     }
 

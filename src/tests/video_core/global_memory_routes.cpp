@@ -231,6 +231,25 @@ TEST_CASE("Selecting the buffer searches the bound buffers in one function that 
     CHECK(searches.front().second.size() == 6);
 }
 
+TEST_CASE("Task and mesh programs search the bound buffers inline",
+          "[shader][global_memory_routes]") {
+    const Stage stage{GENERATE(Stage::Task, Stage::Mesh)};
+    Fixture fixture;
+    fixture.program.stage = stage;
+    fixture.program.info.is_task = stage == Stage::Task;
+    fixture.program.info.is_mesh = stage == Stage::Mesh;
+    Profile profile{};
+    profile.supported_spirv = 0x00010600;
+    profile.support_int64 = true;
+    profile.support_descriptor_aliasing = true;
+    profile.unified_descriptor_binding = true;
+    profile.min_ssbo_alignment = 16;
+    profile.select_global_memory_buffer = true;
+    const auto code{Backend::SPIRV::EmitSPIRV(profile, fixture.program)};
+    Dump(code, stage == Stage::Task ? "select_task" : "select_mesh");
+    CHECK(NotInlinedCallers(code).empty());
+}
+
 TEST_CASE("A route through a pointer array keeps the bound slots past those searched",
           "[shader][global_memory_routes]") {
     ObjectPool<IR::Inst> pool;

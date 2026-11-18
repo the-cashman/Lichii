@@ -272,6 +272,13 @@ void AppletManager::OperationModeChanged() {
     m_window_system->OnOperationModeChanged();
 }
 
+void AppletManager::PressHomeButton() {
+    std::scoped_lock lk{m_lock};
+    if (m_window_system) {
+        m_window_system->OnHomeButtonPressed(ButtonPressDuration::ShortPressing);
+    }
+}
+
 void AppletManager::SetWindowSystem(WindowSystem* window_system) {
     std::unique_lock lk{m_lock};
 

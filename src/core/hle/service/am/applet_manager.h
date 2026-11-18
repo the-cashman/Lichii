@@ -48,6 +48,8 @@ public:
     /// the kernel that owns it still runs. The next boot would otherwise free it into its own.
     void DropPendingProcess();
     void OperationModeChanged();
+    /// A HOME button press from the frontend (hotkey), as the controller's HOME button sends.
+    void PressHomeButton();
 
 public:
     void SetWindowSystem(WindowSystem* window_system);

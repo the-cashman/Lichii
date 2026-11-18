@@ -325,18 +325,27 @@ public:
         }
     }
 
-    /// Backing offset the view page at virtual_offset maps, or nullopt when it is not mapped.
-    std::optional<size_t> BackingOffset(size_t virtual_offset) {
+    struct BackingRun {
+        size_t virtual_offset;
+        size_t length;
+        size_t backing_offset;
+    };
+
+    /// Appends the mapped parts of [virtual_offset, virtual_offset + length) with the backing
+    /// offsets they map, looked up under one lock.
+    void FindBackingRuns(size_t virtual_offset, size_t length, std::vector<BackingRun>& runs) {
+        const size_t virtual_end = virtual_offset + length;
         std::scoped_lock lock{placeholder_mutex};
-        const auto it = placeholders.find(virtual_offset);
-        if (it == placeholders.end()) {
-            return std::nullopt;
+        auto [it, end] = placeholders.equal_range({virtual_offset, virtual_end});
+        for (; it != end; ++it) {
+            const auto host_pointer_it = placeholder_host_pointers.find(it->lower());
+            if (host_pointer_it == placeholder_host_pointers.end()) {
+                continue;
+            }
+            const size_t begin = (std::max)(it->lower(), virtual_offset);
+            const size_t run_end = (std::min)(it->upper(), virtual_end);
+            runs.push_back({begin, run_end - begin, host_pointer_it->second + begin - it->lower()});
         }
-        const auto host_pointer_it = placeholder_host_pointers.find(it->lower());
-        if (host_pointer_it == placeholder_host_pointers.end()) {
-            return std::nullopt;
-        }
-        return host_pointer_it->second + virtual_offset - it->lower();
     }
 
     void EnableDirectMappedAddress() {
@@ -1257,19 +1266,40 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages() const {
             zero_bytes += PageAlignment;
         }
     }
-    for (const uintptr_t page : view_pages) {
-        const auto offset = impl->BackingOffset(page - view_begin);
-        if (!offset || *offset >= backing_size) {
-            continue;
+    // The views behind each run of resident view pages (2 MiB at most) are looked up under one
+    // lock, released before the pages are read: guest map, unmap and protect calls wait for one
+    // short lookup at most, and a pass over 5 GB takes the lock a few thousand times instead of
+    // about a million.
+    constexpr size_t MaxRunPages = 512;
+    std::sort(view_pages.begin(), view_pages.end());
+    std::vector<Impl::BackingRun> runs;
+    for (size_t i = 0; i < view_pages.size();) {
+        size_t j = i + 1;
+        while (j < view_pages.size() && j - i < MaxRunPages &&
+               view_pages[j] == view_pages[j - 1] + PageAlignment) {
+            ++j;
         }
-        const uintptr_t backing_page = backing_begin + *offset;
-        if (IsZeroPage(reinterpret_cast<const u8*>(backing_page))) {
-            trim.push_back(page);
-            zero_bytes += PageAlignment;
-        }
-        // Reading it put the backing page in the working set: take it out again.
-        if (!std::binary_search(backing_pages.begin(), backing_pages.end(), backing_page)) {
-            trim.push_back(backing_page);
+        runs.clear();
+        impl->FindBackingRuns(view_pages[i] - view_begin,
+                              view_pages[j - 1] + PageAlignment - view_pages[i], runs);
+        i = j;
+        for (const auto& run : runs) {
+            for (size_t offset = 0; offset < run.length; offset += PageAlignment) {
+                if (run.backing_offset + offset >= backing_size) {
+                    break;
+                }
+                const uintptr_t page = view_begin + run.virtual_offset + offset;
+                const uintptr_t backing_page = backing_begin + run.backing_offset + offset;
+                if (IsZeroPage(reinterpret_cast<const u8*>(backing_page))) {
+                    trim.push_back(page);
+                    zero_bytes += PageAlignment;
+                }
+                // Reading it put the backing page in the working set: take it out again.
+                if (!std::binary_search(backing_pages.begin(), backing_pages.end(),
+                                        backing_page)) {
+                    trim.push_back(backing_page);
+                }
+            }
         }
     }
     std::sort(trim.begin(), trim.end());

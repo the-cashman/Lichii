@@ -1227,8 +1227,12 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
     }};
     // With select_global_memory_buffer every access searches all bound buffers. NVIDIA compiles
     // that search slowly at each inlined access (#1848: ~1.7 s per OoT compute pipeline), so the
-    // search is one function that is not inlined, and the accesses stay inlined.
+    // search is one function that is not inlined, and the accesses stay inlined. Task and mesh
+    // programs search inline: as calls, the first of two consecutive loads in Ocarina's tree task
+    // program returned 0 on NVIDIA, so every tree cell drew its 256-record cap (upstream #907).
     Id search_function{};
+    const bool search_call{profile.select_global_memory_buffer && stage != Stage::Task &&
+                           stage != Stage::Mesh};
     const auto define_body{[&](DefPtr ssbo_member, Id addr, const StorageTypeDefinition& type_def,
                                u32 shift, Id result_type, Id fallback, Routing routing,
                                auto&& callback) -> Id {
@@ -1538,7 +1542,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         const bool all{route == 0};
         const bool words{!profile.support_descriptor_aliasing &&
                          (use.accesses[1] || use.accesses[2])};
-        if (profile.select_global_memory_buffer) {
+        if (search_call) {
             search_function = OpFunction(U32[3], spv::FunctionControlMask::DontInline,
                                          TypeFunction(U32[3], U64));
             const Id addr{OpFunctionParameter(U64)};

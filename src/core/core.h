@@ -444,6 +444,15 @@ public:
      */
     void ExecuteProgram(std::size_t program_index);
 
+    /// Type used for the frontend to designate a callback for System to boot an installed
+    /// application in a new session, in place of the running one.
+    using LaunchInNewSessionCallback = std::function<void(u64 program_id)>;
+    void RegisterLaunchInNewSessionCallback(LaunchInNewSessionCallback&& callback);
+
+    /// Asks the frontend to boot the installed application in a new session. False when the
+    /// frontend cannot.
+    bool LaunchInNewSession(u64 program_id);
+
     [[nodiscard]] std::vector<std::vector<u8>>& GetUserChannel();
     [[nodiscard]] std::vector<std::vector<u8>>& GetGeneralChannel();
     void PushGeneralChannelData(std::vector<u8>&& data);
