@@ -69,6 +69,13 @@ struct BuiltinPatchHook {
     std::span<const u8> cave;
 };
 
+struct InstalledBuiltinHook {
+    std::string_view patch;
+    u64 site;
+    u64 cave;
+    size_t cave_size;
+};
+
 struct BuiltinPatchState {
     size_t offset;
     size_t size;
@@ -984,11 +991,10 @@ std::string GetUpdateVersionStringFromSlot(const ContentProvider* provider, u64 
 LICHII_NO_INLINE std::optional<u64> GetParentApplicationId(const ContentProvider* provider, u64 title_id) {
     return provider == nullptr ? std::nullopt : provider->GetParentApplicationId(title_id);
 }
-} // Anonymous namespace
-
 std::vector<BuiltinCheatOverlap> FindBuiltinCheatOverlaps(
     u64 title_id, std::span<const std::string_view> applied_patches,
-    std::span<const Core::Memory::CheatEntry> cheats) {
+    std::span<const Core::Memory::CheatEntry> cheats,
+    std::span<const InstalledBuiltinHook> installed_hooks) {
     const auto stores =
         Core::Memory::DmntCheatVm::MainStaticStores({cheats.begin(), cheats.end()});
     std::vector<BuiltinCheatOverlap> overlaps;
@@ -1034,12 +1040,23 @@ std::vector<BuiltinCheatOverlap> FindBuiltinCheatOverlaps(
             for (const auto& state : patch.states) {
                 check(state.offset, state.offset + state.size, true);
             }
-            for (const auto& hook : patch.hooks) {
-                check(hook.cave_offset, hook.cave_offset + hook.cave.size(), false);
+            for (const auto& hook : installed_hooks) {
+                if (hook.patch == patch.name) {
+                    check(hook.site, hook.site + sizeof(u32), false);
+                    check(hook.cave, hook.cave + hook.cave_size, false);
+                }
             }
         }
     }
     return overlaps;
+}
+
+} // Anonymous namespace
+
+std::vector<BuiltinCheatOverlap> FindBuiltinCheatOverlaps(
+    u64 title_id, std::span<const std::string_view> applied_patches,
+    std::span<const Core::Memory::CheatEntry> cheats) {
+    return FindBuiltinCheatOverlaps(title_id, applied_patches, cheats, {});
 }
 
 PatchManager::PatchManager(u64 title_id_,
@@ -1376,6 +1393,7 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
     std::vector<std::string_view> replaced;
     std::vector<std::string_view> applied_groups;
     std::vector<std::string_view> applied;
+    std::vector<InstalledBuiltinHook> installed_hooks;
     for (const auto& patch : BUILTIN_PATCHES) {
         if (patch.title_id != title_id || patch.module != name) {
             continue;
@@ -1535,8 +1553,9 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
                        !std::all_of(nso.begin() + cave, nso.begin() + cave + hook.cave.size(),
                                     [](u8 byte) { return byte == 0; })) {
                 problem = "its code cave is not executable padding";
-            } else if (!untouched(cave, hook.cave.size()) ||
-                       !untouched(sizeof(Loader::NSOHeader) + site, sizeof(u32))) {
+            } else if (!fits(out, site, hook.pattern.size()) ||
+                       !untouched(cave, hook.cave.size()) ||
+                       !untouched(sizeof(Loader::NSOHeader) + site, hook.pattern.size())) {
                 problem = "a user mod already patched it";
             }
             if (problem != nullptr) {
@@ -1554,6 +1573,7 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
             std::memcpy(out.data() + cave, hook.cave.data(), hook.cave.size() - sizeof(u32));
             std::memcpy(out.data() + sizeof(Loader::NSOHeader) + back, &to_site, sizeof(u32));
             std::memcpy(out.data() + sizeof(Loader::NSOHeader) + site, &to_cave, sizeof(u32));
+            installed_hooks.push_back({patch.name, site, hook.cave_offset, hook.cave.size()});
             LOG_INFO(Loader, "    - \"{}\": {} hook at {}+{:#x}", patch.name, hook.name, name,
                      site);
         }
@@ -1576,7 +1596,8 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
 
     if (!applied.empty()) {
         for (const auto& overlap :
-             FindBuiltinCheatOverlaps(title_id, applied, CreateCheatList(header.build_id))) {
+             FindBuiltinCheatOverlaps(title_id, applied, CreateCheatList(header.build_id),
+                                      installed_hooks)) {
             LOG_WARNING(Loader,
                         "Cheat \"{}\" writes {}+{:#x}..{:#x}, which built-in patch \"{}\" uses "
                         "for its {} at {}+{:#x}..{:#x}. The cheat still runs and overwrites it; "

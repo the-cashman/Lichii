@@ -391,6 +391,11 @@ std::vector<u8> MakeDynamicMain() {
     return nso;
 }
 
+void PutSolverSite(std::vector<u8>& nso, size_t offset) {
+    std::memcpy(nso.data() + offset, &SolverCutInstruction, sizeof(u32));
+    std::memcpy(nso.data() + offset + 4, &SolverStoreInstruction, sizeof(u32));
+}
+
 } // Anonymous namespace
 
 TEST_CASE("Built-in FPS Unlock defaults on and replaces Dynamic FPS", "[patch_manager]") {
@@ -602,11 +607,6 @@ TEST_CASE("Built-in FPS Unlock applies all step counters", "[patch_manager]") {
                        patched.begin() + HitstopHookOffset + sizeof(u32)));
 }
 
-void PutSolverSite(std::vector<u8>& nso, size_t offset) {
-    std::memcpy(nso.data() + offset, &SolverCutInstruction, sizeof(u32));
-    std::memcpy(nso.data() + offset + 4, &SolverStoreInstruction, sizeof(u32));
-}
-
 TEST_CASE("Built-in FPS Unlock rounds up the physics solver's steps", "[patch_manager]") {
     PatchManagerTestContext context;
     auto nso = MakeDynamicMain();
@@ -644,6 +644,21 @@ TEST_CASE("Built-in FPS Unlock leaves out a solver hook it can't place", "[patch
     REQUIRE(std::all_of(patched.begin() + left.cave,
                         patched.begin() + left.cave + SolverRoutineSize,
                         [](u8 byte) { return byte == 0; }));
+}
+
+TEST_CASE("Built-in FPS Unlock leaves a solver store changed by a user mod alone",
+          "[patch_manager]") {
+    const auto& site = SolverSites[0];
+    PatchManagerTestContext context{NopInstruction, site.offset + sizeof(u32)};
+    auto nso = MakeDynamicMain();
+    PutSolverSite(nso, site.offset);
+    PutSolverSite(nso, SolverSites[1].offset);
+    const auto patched = context.Manager().PatchNSO(nso, "main");
+    REQUIRE(WordAt(patched, HudHookOffset) == HudHookInstruction);
+    REQUIRE(WordAt(patched, site.offset) == SolverCutInstruction);
+    REQUIRE(WordAt(patched, site.offset + sizeof(u32)) == NopInstruction);
+    REQUIRE(WordAt(patched, site.cave) == 0);
+    REQUIRE(WordAt(patched, SolverSites[1].offset) == SolverSites[1].to_cave);
 }
 
 TEST_CASE("Built-in Dynamic FPS leaves all step counters untouched", "[patch_manager]") {
