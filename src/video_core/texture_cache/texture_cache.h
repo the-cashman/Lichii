@@ -202,7 +202,7 @@ void TextureCache<P>::DeleteSupersededImages() {
 }
 
 template <class P>
-void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
+void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool at_critical) {
     const StutterTrace::SiteScope site{StutterTrace::Site::TextureCollect};
     bool high_priority_mode = false;
     bool aggressive_mode = false;
@@ -218,8 +218,9 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         return total_used_memory - (std::min)(total_used_memory, pending_freed_bytes);
     };
     const auto Configure = [&](bool allow_aggressive) {
-        high_priority_mode = out_of_memory || UsedMemory() >= expected_memory;
-        aggressive_mode = allow_aggressive && (out_of_memory || UsedMemory() >= critical_memory);
+        high_priority_mode = out_of_memory || at_critical || UsedMemory() >= expected_memory;
+        aggressive_mode = allow_aggressive &&
+                          (out_of_memory || at_critical || UsedMemory() >= critical_memory);
         mode_age = aggressive_mode ? 10ULL : high_priority_mode ? 25ULL : 50ULL;
         // EDEN_NX2_TC_MIN_AGE=<frames>: keep images used more recently while there is room
         // (thrash tests).
@@ -602,7 +603,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         evict_old_costly = false;
     }
     Collect();
-    if (out_of_memory || UsedMemory() >= critical_memory) {
+    if (out_of_memory || at_critical || UsedMemory() >= critical_memory) {
         Configure(true);
         Collect();
     }
@@ -1812,9 +1813,13 @@ void TextureCache<P>::TickFrame() {
     }
     DeleteSupersededImages();
     // A forced collect for memory spilled to host memory collects as at the critical threshold
-    // for this frame, without the re-upload of images left out that a failed image gets.
+    // for this frame: it stops once usage is under it and keeps the retention floor. Collecting as
+    // out of memory instead deleted every image unused for 10 frames, decoded ASTC included, on a
+    // 4 GB GTX 1650 whose scene does not fit (#2127): each spill episode evicted the working set,
+    // which was decoded again (ASTC decodes 1000-1585 per 5 s against 2-15 on a 16 GB card) and
+    // spilled again, with frames up to 2.5 s.
     if (out_of_memory || spill_collect || total_used_memory > minimum_memory) {
-        RunGarbageCollector(out_of_memory || spill_collect);
+        RunGarbageCollector(out_of_memory, spill_collect);
     }
     if (out_of_memory) {
         // Textures left out for lack of memory are made again on their next read, once a frame
