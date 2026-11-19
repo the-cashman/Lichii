@@ -516,13 +516,18 @@ Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, 
     } else {
         gpu_memory->ReadBlock(descriptor_addr, &entry, sizeof(entry));
     }
-    if (entry.raw == decltype(entry.raw){}) {
+    if (entry.raw == decltype(entry.raw){} ||
+        (entry.format.Value() == Tegra::Texture::TextureFormat{} && entry.Address() == 0)) {
         // An empty descriptor (the null texture, handle 0 in NVN games): a game can draw with it
         // before it assigns the real texture, and the shader built for that draw is kept for the
         // pipeline. Read as it is, the zeroes say "1D texture", so a size query of a texture that
         // turns out 2D (it has no type of its own) got a null 1D view for good: Pokemon Legends
         // Z-A's tonemap then samples one texel for the whole screen (issue #846). Compile for a
         // plain 2D RGBA8 texture instead, as for an index past the pool.
+        // A descriptor can also be empty by meaning rather than by bits: Ocarina of Time hands
+        // this path an entry whose format and image address are zero while its other words are
+        // not (#2015). It is the same not-yet-assigned texture, so compile the same null 2D
+        // texture instead of asserting on format 0 in the lookup table.
         null_2d_texture();
         return entry;
     }
