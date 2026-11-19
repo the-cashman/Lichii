@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -30,13 +31,24 @@ namespace {
 
 constexpr u64 kOotProgramId = 0x0400486024DEC000ULL;
 
-enum class Kind : u8 { X, W, S, Lr, Sp, MemW, MemQ, MemF, MemB, GlobW, GlobQ, GlobF };
+enum class Kind : u8 { X, W, S, Lr, Sp, MemW, MemQ, MemF, MemB, GlobW, GlobQ, GlobF, Diff };
 
 struct Item {
     Kind kind{};
     u32 reg{};  // register number (X/W/S, or the base register of Mem*)
-    s64 off{};  // Mem*/Glob* offset
+    s64 off{};  // Mem*/Glob*/Diff offset
+    u32 size{}; // Diff: bytes
     std::string text;
+};
+
+// d:REG+OFF:SIZE (hex): the u32 words of [REG+OFF, +SIZE) are compared with the previous hit;
+// words that changed are logged as "+offset:old>new", except words that have already changed more
+// than kDiffQuiet times (timers, counters), so state that changes rarely stands out.
+constexpr u32 kDiffQuiet = 6;
+struct DiffState {
+    bool primed{};
+    std::vector<u32> words;
+    std::vector<u16> changes;
 };
 
 struct Probe {
@@ -80,7 +92,24 @@ bool ParseItem(std::string_view s, Item& item) {
         return false;
     }
     const std::string_view type = s.substr(0, colon);
-    const std::string_view rest = s.substr(colon + 1);
+    std::string_view rest = s.substr(colon + 1);
+    if (type == "d") {
+        const auto colon2 = rest.find(':');
+        if (colon2 == std::string_view::npos) {
+            return false;
+        }
+        item.kind = Kind::Diff;
+        item.size = static_cast<u32>(std::strtoul(std::string{rest.substr(colon2 + 1)}.c_str(), nullptr, 16)) & ~3U;
+        rest = rest.substr(0, colon2);
+        const auto plus = rest.find_first_of("+-");
+        bool ok = false;
+        item.reg = ParseReg(rest.substr(0, plus), ok);
+        if (plus != std::string_view::npos) {
+            const s64 v = static_cast<s64>(std::strtoull(std::string{rest.substr(plus + 1)}.c_str(), nullptr, 16));
+            item.off = rest[plus] == '-' ? -v : v;
+        }
+        return ok && item.size != 0 && item.size <= 0x10000;
+    }
     if (type == "gw" || type == "gq" || type == "gf") {
         item.kind = type == "gw" ? Kind::GlobW : type == "gq" ? Kind::GlobQ : Kind::GlobF;
         item.off = static_cast<s64>(std::strtoull(std::string{rest}.c_str(), nullptr, 16));
@@ -182,6 +211,12 @@ std::string Format(Core::Memory::Memory& memory, const Probe& probe, const Threa
         out += item.text;
         out += '=';
         u64 address = 0;
+        if (item.kind == Kind::Diff) {
+            out.pop_back();
+            out.resize(out.size() - item.text.size());
+            out.pop_back();
+            continue;
+        }
         switch (item.kind) {
         case Kind::X:
             out += fmt::format("{:#x}", reg(item.reg));
@@ -228,6 +263,53 @@ std::string Format(Core::Memory::Memory& memory, const Probe& probe, const Threa
         default:
             out += fmt::format("{:.4f}", std::bit_cast<float>(memory.Read32(address)));
             break;
+        }
+    }
+    return out;
+}
+
+std::mutex g_diff_mutex;
+std::array<std::vector<DiffState>, kNx2OotProbeMax> g_diffs{};
+
+std::string Diffs(Core::Memory::Memory& memory, size_t index, const Probe& probe,
+                  const ThreadContext& ctx) {
+    std::string out;
+    std::scoped_lock lock{g_diff_mutex};
+    auto& states = g_diffs[index];
+    states.resize(probe.items.size());
+    for (size_t i = 0; i < probe.items.size(); ++i) {
+        const Item& item = probe.items[i];
+        if (item.kind != Kind::Diff) {
+            continue;
+        }
+        const u64 reg = item.reg == 30 ? ctx.lr : item.reg == 29 ? ctx.fp : ctx.r[item.reg];
+        const u64 address = reg + static_cast<u64>(item.off);
+        if (!memory.IsValidVirtualAddressRange(address, item.size)) {
+            continue;
+        }
+        std::vector<u32> now(item.size / 4);
+        memory.ReadBlock(address, now.data(), item.size);
+        DiffState& st = states[i];
+        if (!st.primed || st.words.size() != now.size()) {
+            st.words = now;
+            st.changes.assign(now.size(), 0);
+            st.primed = true;
+            continue;
+        }
+        u32 shown = 0;
+        for (size_t w = 0; w < now.size(); ++w) {
+            if (now[w] == st.words[w]) {
+                continue;
+            }
+            if (st.changes[w] < kDiffQuiet && shown < 48) {
+                out += fmt::format(" {}+{:x}:{:x}>{:x}", item.text.substr(0, item.text.rfind(':')),
+                                   static_cast<u64>(item.off) + w * 4, st.words[w], now[w]);
+                ++shown;
+            }
+            if (st.changes[w] < 0xFFFF) {
+                ++st.changes[w];
+            }
+            st.words[w] = now[w];
         }
     }
     return out;
@@ -296,6 +378,13 @@ bool CallNx2OotProbe(Core::System& system, u32 imm) {
     }
     if (!summary.empty()) {
         LOG_INFO(Kernel_SVC, "OoT probe hits/s:{}", summary);
+    }
+    if (std::ranges::any_of(probe.items, [](const Item& i) { return i.kind == Kind::Diff; })) {
+        const std::string diffs = Diffs(memory, index, probe, ctx);
+        if (!diffs.empty()) {
+            LOG_INFO(Kernel_SVC, "OoT probe {:x} f{} diff:{}", probe.offset,
+                     Core::g_nx2_present_count.load(std::memory_order_relaxed), diffs);
+        }
     }
     if (log_line) {
         LOG_INFO(Kernel_SVC, "OoT probe {:x} f{} t{}:{}", probe.offset,
