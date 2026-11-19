@@ -430,14 +430,17 @@ void GpuSplit::WaitForSpace(size_t words) {
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
     const CountedWait counted{DrainSite::RingFull};
     const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
+    const u64 target = write_position + words - RingWords;
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
-        if (write_position + words - consumed_cache <= RingWords) {
+        if (consumed_cache >= target) {
             Nx2Profile::AddDrain(DrainSite::RingFull, start);
             return;
         }
         if (spins < 4096) {
             Pause();
+        } else if (FrontSleeps()) {
+            SleepForBack(target);
         } else {
             std::this_thread::yield();
         }
@@ -485,9 +488,11 @@ void GpuSplit::Drain(DrainSite site) {
                 RequestIdleHook();
                 hook_asked = true;
             }
-            // Backoff sleeps only while entries are unconsumed: spin until the hook is done.
+            // Spin, then sleep until the back has run the hook (it notifies once quiet).
             if (spins < 16384) {
                 Pause();
+            } else if (FrontSleeps()) {
+                SleepForBack(write_position, true);
             } else {
                 std::this_thread::yield();
             }
@@ -1110,15 +1115,32 @@ void GpuSplit::Backoff(u32 spins, u64 target) {
         Pause();
         return;
     }
+    SleepForBack(target);
+}
+
+bool GpuSplit::FrontSleeps() {
+    // EDEN_NX2_FRONT_SLEEP=0: the ring-full wait and the idle-hook tail of Drain yield-spin
+    // instead of sleeping on front_wake (Lichii #2237).
+    static const bool sleeps = [] {
+        const char* const value = std::getenv("EDEN_NX2_FRONT_SLEEP");
+        return value == nullptr || value[0] != '0';
+    }();
+    return sleeps;
+}
+
+void GpuSplit::SleepForBack(u64 target, bool wait_for_idle) {
     if (!back_running.load(std::memory_order_acquire)) {
         std::this_thread::yield();
         return;
     }
-    // A long wait sleeps until the back stores a new position (port of #161's front_wake): the
-    // back checks front_waiting after each store, the front checks the position after setting it.
+    // A long wait sleeps until the back stores a new position or goes quiet (port of #161's
+    // front_wake; Lichii #2237): the back checks front_waiting after publishing progress or
+    // going quiet, the front rechecks after registering and taking the wake snapshot.
     front_waiting.store(true, std::memory_order_seq_cst);
     const u32 seen = front_wake.load(std::memory_order_seq_cst);
-    if (consumed.load(std::memory_order_seq_cst) < target) {
+    if (back_running.load(std::memory_order_seq_cst) &&
+        (consumed.load(std::memory_order_seq_cst) < target ||
+         (wait_for_idle && !back_quiet.load(std::memory_order_seq_cst)))) {
         front_wake.wait(seen, std::memory_order_seq_cst);
     }
     front_waiting.store(false, std::memory_order_relaxed);
@@ -1431,7 +1453,8 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                         Nx2Profile::Scope hook_scope{Nx2Profile::Zone::IdleHook};
                         idle_hook(idle_argument);
                     }
-                    back_quiet.store(true, std::memory_order_release);
+                    back_quiet.store(true, std::memory_order_seq_cst);
+                    NotifyFront(); // a Drain may sleep until the hook is done (#2237)
                 }
                 available = published.load(std::memory_order_acquire);
             }
