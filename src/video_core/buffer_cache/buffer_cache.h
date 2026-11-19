@@ -366,6 +366,15 @@ bool BufferCache<P>::OnCPUWrite(DAddr device_addr, u64 size) {
     return false;
 }
 
+/// EDEN_NX2_READ_WIDEN=<KiB>: DownloadMemoryForRead's reach on each side of a read (0: off).
+inline u64 Nx2ReadWidenBytes() {
+    static const u64 bytes = [] {
+        const char* value = std::getenv("EDEN_NX2_READ_WIDEN");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) * 1024 : u64{0};
+    }();
+    return bytes;
+}
+
 template <class P>
 std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DAddr device_addr,
                                                                               u64 size) {
@@ -626,6 +635,28 @@ void BufferCache<P>::DownloadMemoryForRead(DAddr device_addr, u64 size) {
         RecordEarlyDownloads();
         // The ranges DownloadMemory takes: the guest CPU soon reads those it read before too.
         boost::container::small_vector<std::pair<DAddr, u64>, 16> ranges{{device_addr, size}};
+        // EDEN_NX2_READ_WIDEN=<KiB> (bazzite, fe60): also take the GPU-written bytes up to that far
+        // on both sides of the read, inside its buffer. Fortune's Weave reads ~200 GPU-written
+        // pages of one buffer every ~12 frames, page by page from four threads: each read
+        // waited for its own download (and all GPU work recorded before it), ~20 ms a burst.
+        // One wide download lets the later reads find their bytes on the way or landed.
+        // RecordReadDownload keeps only GPU-modified bytes not already on their way.
+        if (const u64 widen = Nx2ReadWidenBytes(); widen != 0) {
+            const DAddr read_end = device_addr + size;
+            ForEachBufferInRange(device_addr, size, [&](BufferId, Buffer& buffer) {
+                const DAddr buffer_begin = buffer.CpuAddr();
+                const DAddr buffer_end = buffer_begin + buffer.SizeBytes();
+                const DAddr lo =
+                    (std::max)(buffer_begin, device_addr > widen ? device_addr - widen : DAddr{0});
+                const DAddr hi = (std::min)(buffer_end, read_end + widen);
+                if (lo < device_addr) {
+                    ranges.emplace_back(lo, device_addr - lo);
+                }
+                if (hi > read_end) {
+                    ranges.emplace_back(read_end, hi - read_end);
+                }
+            });
+        }
         if (download_cpu_read_ranges) {
             download_cpu_read_ranges = false;
             cpu_read_ranges.ForEach([&](DAddr lower, DAddr upper) {
