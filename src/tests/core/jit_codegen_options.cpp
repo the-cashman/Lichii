@@ -375,7 +375,7 @@ private:
     }
 };
 
-std::vector<State> RunFastmemProgram(bool options) {
+std::vector<State> RunFastmemProgram(bool options, bool recompile = true) {
     FastmemFaultEnv env;
     // X0 = 0x2800 and X8 = 0x2900, set before the run so the addresses stay base + immediate:
     // accesses at +0x800 and beyond fault, and X0 is used again after accesses whose fault path
@@ -387,22 +387,23 @@ std::vector<State> RunFastmemProgram(bool options) {
         LdrX(0, 0, 0x810),  Svc0,
     };
 
+    A64::UserConfig::Counters counters{};
     A64::UserConfig config{};
     config.callbacks = &env;
+    config.counters = &counters;
     config.enable_cycle_counting = false;
     config.fastmem_pointer = reinterpret_cast<uintptr_t>(env.arena);
     config.fastmem_address_space_bits = 64;
     config.silently_mirror_fastmem = false;
+    config.recompile_on_fastmem_failure = recompile;
     if (options) {
         EnableCodegenOptions(config);
     }
     A64::Jit jit{config};
     env.jit = &jit;
 
-    // The first run faults at each access to the page; the second runs the recompiled block,
-    // whose accesses there go to the callbacks directly.
     std::vector<State> states;
-    for (int run = 0; run < 2; ++run) {
+    for (u64 run = 0; run < 2; ++run) {
         env.Reset();
         for (size_t i = 0; i < 31; ++i) {
             jit.SetRegister(i, 0x1111'0000'0000'0000 * (i % 3) + i * 0x101);
@@ -412,6 +413,8 @@ std::vector<State> RunFastmemProgram(bool options) {
         jit.SetSP(0x8000);
         jit.SetPC(0);
         jit.Run();
+        REQUIRE(counters.fastmem_faults == (recompile ? 7 : 7 * (run + 1)));
+        REQUIRE(counters.fastmem_recompiles == (recompile ? 7 : 0));
         std::map<u64, u8> memory = env.fault_page;
         for (u64 i = 0x2000; i < 0x3000; ++i) {
             memory[i] = env.arena[i];
@@ -441,9 +444,11 @@ TEST_CASE(FaultTestName, "[jit_codegen_options]") {
     }
     const auto off = RunFastmemProgram(false);
     const auto on = RunFastmemProgram(true);
+    const auto no_recompile = RunFastmemProgram(true, false);
     REQUIRE(off[0] == off[1]);
     REQUIRE(on[0] == off[0]);
     REQUIRE(on[1] == off[1]);
+    REQUIRE(no_recompile == on);
 }
 
 #endif

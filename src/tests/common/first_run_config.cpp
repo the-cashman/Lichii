@@ -91,6 +91,7 @@ public:
 
 void CheckFreshProfile() {
     const auto& values = Settings::values;
+    CHECK(values.cpu_backend.GetValue() == Settings::CpuBackend::Dynarmic);
     CHECK(values.scaling_filter.GetValue() == Settings::ScalingFilter::Fsr3);
     CHECK(values.gpu_accuracy.GetValue() == Settings::GpuAccuracy::Low);
     CHECK(values.nvdec_emulation.GetValue() == Settings::NvdecEmulation::Gpu);
@@ -219,6 +220,18 @@ TEST_CASE("Existing explicit settings survive load save and reopen", "[config]")
         CHECK(Settings::values.gpu_clock.GetValue() == Settings::GpuClock::Normal);
     }
 }
+
+#ifdef HAS_NCE
+TEST_CASE("Existing explicit native CPU backend selection survives config reload", "[config]") {
+    ConfigDirectory directory;
+    directory.Write("qt-config.ini", fmt::format("[Cpu]\ncpu_backend={}\ncpu_backend\\default=false\n",
+                                                u32(Settings::CpuBackend::Nce)));
+    for (int i = 0; i < 2; ++i) {
+        FileConfig config{std::string{"qt-config"}};
+        CHECK(Settings::values.cpu_backend.GetValue() == Settings::CpuBackend::Nce);
+    }
+}
+#endif
 
 TEST_CASE("Existing default markers and missing keys keep their historical values", "[config]") {
     ConfigDirectory directory;

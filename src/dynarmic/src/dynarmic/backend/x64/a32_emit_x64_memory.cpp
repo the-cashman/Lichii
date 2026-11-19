@@ -145,6 +145,8 @@ void A32EmitX64::EmitExclusiveValuePointer(Xbyak::Reg64 reg) {
     code.mov(reg, std::bit_cast<u64>(GetExclusiveMonitorValuePointer(conf.global_monitor, conf.processor_id)));
 }
 
+static void RecordFastmemFault(const A32::UserConfig&, bool) {}
+
 #define Axx A32
 #include "dynarmic/backend/x64/emit_x64_memory.cpp.inc"
 #undef Axx

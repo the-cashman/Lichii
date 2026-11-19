@@ -403,6 +403,8 @@ CoreTiming::NextEvents CoreTiming::AdvanceEvents() {
                 event_queue.update(evt.handle, Event{next_time, event_fifo_id++, evt.type,
                                                      next_schedule_time, evt.handle});
             }
+        } else {
+            event_queue.pop();
         }
 
         global_timer = GetGlobalTimeNs().count();

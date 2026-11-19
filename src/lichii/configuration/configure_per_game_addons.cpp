@@ -317,6 +317,9 @@ void ConfigurePerGameAddons::LoadConfiguration() {
         auto* const first_item = new QStandardItem;
         first_item->setText(name);
         first_item->setCheckable(true);
+        if (!patch.description.empty()) {
+            first_item->setToolTip(QString::fromStdString(patch.description));
+        }
 
         const bool is_external_update = patch.type == FileSys::PatchType::Update &&
                                         patch.source == FileSys::PatchSource::External &&

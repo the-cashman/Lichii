@@ -30,6 +30,7 @@
 
 #ifdef HAS_NCE
 #include "core/arm/nce/patcher.h"
+#include "core/device_memory.h"
 #endif
 
 #ifndef HAS_NCE
@@ -41,16 +42,13 @@ class Patcher {};
 namespace Loader {
 
 struct PatchCollection {
-    explicit PatchCollection(bool is_application_) : is_application{is_application_} {
+    explicit PatchCollection(bool is_native_) : is_native{is_native_} {
         module_patcher_indices.fill(-1);
         patchers.emplace_back();
     }
 
     std::vector<Core::NCE::Patcher>* GetPatchers() {
-        if (is_application && Settings::IsNceEnabled()) {
-            return &patchers;
-        }
-        return nullptr;
+        return is_native ? &patchers : nullptr;
     }
 
     size_t GetTotalPatchSize() const {
@@ -75,7 +73,7 @@ struct PatchCollection {
         return static_cast<s32>(patchers.size()) - 1;
     }
 
-    bool is_application;
+    bool is_native;
     std::vector<Core::NCE::Patcher> patchers;
     std::array<s32, 13> module_patcher_indices{};
 };
@@ -495,11 +493,16 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
         }
     }
 
-    // Enable NCE only for applications with 39-bit address space.
-    const bool is_39bit =
-        metadata.GetAddressSpaceType() == FileSys::ProgramAddressSpaceType::Is39Bit;
+#ifdef HAS_NCE
     const bool is_application = metadata.GetPoolPartition() == FileSys::PoolPartition::Application;
-    Settings::SetNceEnabled(is_39bit);
+    const bool is_39bit = metadata.Is64BitProgram() &&
+                          metadata.GetAddressSpaceType() == FileSys::ProgramAddressSpaceType::Is39Bit;
+    const u64 fastmem_base = is_application && !system.IsPoweredOn()
+                                ? system.DeviceMemory().PrepareNativeExecution(is_39bit)
+                                : 0;
+#else
+    constexpr u64 fastmem_base = 0;
+#endif
 
     const auto get_module = [&](size_t index) {
         return exact_modules ? (*exact_modules)[index] : dir->GetFile(StaticModules[index]);
@@ -508,7 +511,7 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
     std::size_t code_size{};
 
     // Define an nce patch context for each potential module.
-    PatchCollection patch_ctx{is_application};
+    PatchCollection patch_ctx{fastmem_base != 0};
 
     // Use the NSO module loader to figure out the code layout
     for (size_t i = 0; i < StaticModules.size(); i++) {
@@ -529,16 +532,6 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
         patch_ctx.SaveIndex(i);
         code_size = *tentative_next_load_addr;
     }
-
-    // Enable direct memory mapping in case of NCE.
-    const u64 fastmem_base = [&]() -> size_t {
-        if (is_application && Settings::IsNceEnabled()) {
-            auto& buffer = system.DeviceMemory().buffer;
-            buffer.EnableDirectMappedAddress();
-            return reinterpret_cast<u64>(buffer.VirtualBasePointer());
-        }
-        return 0;
-    }();
 
     // Add patch size to the total module size
     code_size += patch_ctx.GetTotalPatchSize();

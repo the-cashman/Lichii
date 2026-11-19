@@ -19,6 +19,7 @@
 #include "common/memory_detect.h"
 #include "common/nx2_sampler.h"
 #include "common/adpf.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "common/shutdown_progress.h"
@@ -588,6 +589,22 @@ struct System::Impl {
             return SystemResultStatus::ErrorGetLoader;
         }
 
+        kernel.SetApplicationProcess(process->GetHandle());
+#ifdef HAS_HYPERVISOR
+        const bool has_hypervisor = static_cast<bool>(process->GetHandle()->GetMemory().GetHypervisor());
+        if (has_hypervisor && !cpu_manager.Initialize(process->GetHandle())) {
+            LOG_WARNING(Core, "Hypervisor vCPU setup failed; reloading the guest with Dynarmic");
+            process.reset();
+            ShutdownMainProcess();
+            SetShuttingDown(false);
+            allow_hypervisor_for_load = false;
+            SCOPE_EXIT {
+                allow_hypervisor_for_load = true;
+            };
+            return Load(system, emu_window, filepath, params);
+        }
+#endif
+
         if (app_loader->ReadProgramId(params.program_id) != Loader::ResultStatus::Success) {
             LOG_ERROR(Core, "Failed to find program id for ROM!");
         }
@@ -604,9 +621,6 @@ struct System::Impl {
 
         // Track launch time for frontend launches
         LaunchTimestampCache::SaveLaunchTimestamp(params.program_id);
-
-        // Make the process created be the application
-        kernel.SetApplicationProcess(process->GetHandle());
 
         // Before the cores start: they read it from their JIT without a lock. Not with a single
         // core (no idle core to compile on) or the debugger, nor where any core's backend lacks
@@ -645,7 +659,10 @@ struct System::Impl {
             return init_result;
         }
         // Waiting for GPU before initializing CPU
-        cpu_manager.Initialize();
+#ifdef HAS_HYPERVISOR
+        if (!has_hypervisor)
+#endif
+            cpu_manager.Initialize();
 
         // Initialize cheat engine
         if (cheat_engine) {
@@ -830,6 +847,9 @@ struct System::Impl {
     std::optional<Tegra::Host1x::Host1x> host1x_core;
     std::optional<Core::DeviceMemory> device_memory;
     bool guest_memory_released{};
+#ifdef HAS_HYPERVISOR
+    bool allow_hypervisor_for_load{true};
+#endif
     std::optional<AudioCore::AudioCore> audio_core;
     std::optional<Memory::CheatEngine> cheat_engine;
     std::optional<Tools::Freezer> memory_freezer;
@@ -963,6 +983,12 @@ SystemResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::stri
 bool System::IsPoweredOn() const {
     return impl->is_powered_on.load(std::memory_order::relaxed);
 }
+
+#ifdef HAS_HYPERVISOR
+bool System::IsHypervisorAllowedForLoad() const {
+    return impl->allow_hypervisor_for_load;
+}
+#endif
 
 void System::PrepareReschedule(const u32 core_index) {
     impl->kernel.PrepareReschedule(core_index);

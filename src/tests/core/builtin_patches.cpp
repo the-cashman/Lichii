@@ -293,6 +293,64 @@ TEST_CASE("Built-in Max Resolution patch is gated on build id and original word"
     }
 }
 
+TEST_CASE("Yoshi 2.0.0 Full Scene Resolution with FXAA is an exact opt-in patch",
+          "[patch_manager]") {
+    constexpr u64 TitleId = 0x0400245021D2C000;
+    constexpr std::string_view Name = "Full Scene Resolution with FXAA (built-in)";
+    constexpr size_t SiteOffset = sizeof(Loader::NSOHeader) + 0x7582677;
+    constexpr u8 Original = 0x35;
+    constexpr u8 Replacement = 0x19;
+    PatchManagerTestContext context;
+    const auto manager = context.Manager(TitleId);
+    Settings::values.disabled_addons.erase(TitleId);
+    SCOPE_EXIT {
+        Settings::values.disabled_addons.erase(TitleId);
+    };
+
+    Loader::NSOHeader header{};
+    header.magic = Common::MakeMagic('N', 'S', 'O', '0');
+    header.build_id = {0x89, 0x3C, 0x30, 0xE7, 0x55, 0x21, 0xAF, 0xB8,
+                       0xB2, 0x33, 0x26, 0xEB, 0x6A, 0xA0, 0xE2, 0xDC};
+    std::vector<u8> nso(SiteOffset + 2);
+    std::memcpy(nso.data(), &header, sizeof(header));
+    nso[SiteOffset] = Original;
+
+    SECTION("Listed unchecked and left unchanged by default") {
+        const auto patches = manager.GetPatches();
+        const auto patch = std::ranges::find(patches, Name, &FileSys::Patch::name);
+        REQUIRE(patch != patches.end());
+        CHECK(patch->off_by_default);
+        CHECK_FALSE(patch->enabled);
+        CHECK_FALSE(patch->description.empty());
+        CHECK_FALSE(manager.HasNSOPatch(header.build_id, "main"));
+        REQUIRE(manager.PatchNSO(nso, "main") == nso);
+    }
+
+    SECTION("Checked in Add-Ons") {
+        Settings::values.disabled_addons[TitleId] = FileSys::StoredDisabledAddons(TitleId, {});
+        SECTION("Only the profile byte changes on the matching module") {
+            CHECK(manager.HasNSOPatch(header.build_id, "main"));
+            const auto patched = manager.PatchNSO(nso, "main");
+            nso[SiteOffset] = Replacement;
+            REQUIRE(patched == nso);
+        }
+        SECTION("Different build id sharing the same first 16 bytes is refused") {
+            header.build_id.back() = 1;
+            CHECK_FALSE(manager.HasNSOPatch(header.build_id, "main"));
+            std::memcpy(nso.data(), &header, sizeof(header));
+            REQUIRE(manager.PatchNSO(nso, "main") == nso);
+        }
+        SECTION("Unexpected original byte is refused") {
+            nso[SiteOffset] = 0x36;
+            REQUIRE(manager.PatchNSO(nso, "main") == nso);
+        }
+        SECTION("Different module is refused") {
+            CHECK_FALSE(manager.HasNSOPatch(header.build_id, "sdk"));
+            REQUIRE(manager.PatchNSO(nso, "sdk") == nso);
+        }
+    }
+}
+
 TEST_CASE("Built-in Max Resolution patch defers to a user mod at the same offset",
           "[patch_manager]") {
     SECTION("A different word from the mod is kept") {

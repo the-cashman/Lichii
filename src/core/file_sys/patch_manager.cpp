@@ -104,6 +104,7 @@ struct BuiltinPatch {
     bool off_by_default = false;
     // Built-ins that patch the same place: the first one applied (in this list's order) wins.
     std::string_view group{};
+    std::string_view description{};
 };
 
 // EDEN_NX2_<NAME>: unset or empty gives the default, otherwise on unless it starts with '0'.
@@ -718,6 +719,12 @@ constexpr std::array TEXT_SPEED_INSTANT_RECORDS{
     BuiltinPatchRecord{TEXT_SPEED_CAVE, TEXT_SPEED_INSTANT_CAVE, {}, true},
 };
 
+constexpr std::array<u8, 1> YOSHI_SCENE_PROFILE_ORIGINAL{0x35};
+constexpr std::array<u8, 1> YOSHI_SCENE_PROFILE_FULL{0x19};
+constexpr std::array YOSHI_SCENE_PROFILE_RECORDS{
+    BuiltinPatchRecord{0x7582677, YOSHI_SCENE_PROFILE_FULL, YOSHI_SCENE_PROFILE_ORIGINAL},
+};
+
 constexpr std::array BUILTIN_PATCHES{
     // Ocarina of Time takes its "dynamic resolution disabled" path, so the 3D renders at full scale
     // instead of following the GPU-time controller down to its 480p floor.
@@ -850,6 +857,17 @@ constexpr std::array BUILTIN_PATCHES{
         .records = TEXT_SPEED_2X_RECORDS,
         .off_by_default = true,
         .group = "Text Speed",
+    },
+    BuiltinPatch{
+        .name = "Full Scene Resolution with FXAA (built-in)",
+        .title_id = 0x0400245021D2C000,
+        .module = "main",
+        .build_id = "893C30E75521AFB8B23326EB6AA0E2DC",
+        .records = YOSHI_SCENE_PROFILE_RECORDS,
+        .off_by_default = true,
+        .description = "Yoshi and the Mysterious Book 2.0.0 only. Renders gameplay at full "
+                       "scene resolution with FXAA instead of temporal AA for a sharper image. "
+                       "Expect more aliasing in motion and likely higher GPU cost.",
     },
 };
 
@@ -1623,7 +1641,14 @@ bool PatchManager::HasNSOPatch(const BuildID& build_id_, std::string_view name) 
     LOG_INFO(Loader, "Querying NSO patch existence for build_id={}, name={}", build_id, name);
 
     if (std::ranges::any_of(BUILTIN_PATCHES, [&](const BuiltinPatch& patch) {
-            return patch.title_id == title_id && patch.module == name;
+            if (patch.title_id != title_id || patch.module != name || patch.build_id != build_id) {
+                return false;
+            }
+            if (!patch.off_by_default) {
+                return true;
+            }
+            const auto disabled = GetDisabledAddons();
+            return std::ranges::find(disabled, EnabledAddonKey(patch.name)) != disabled.end();
         })) {
         return true;
     }
@@ -2189,7 +2214,8 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
                        .program_id = title_id,
                        .title_id = title_id,
                        .source = PatchSource::Unknown,
-                       .off_by_default = patch.off_by_default});
+                       .off_by_default = patch.off_by_default,
+                       .description = std::string{patch.description}});
     }
 
     // DLC

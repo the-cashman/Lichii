@@ -412,6 +412,18 @@ if (APPLE)
     set_target_properties(lichii PROPERTIES MACOSX_BUNDLE TRUE)
     set_target_properties(lichii PROPERTIES MACOSX_BUNDLE_INFO_PLIST ${CMAKE_CURRENT_SOURCE_DIR}/Info.plist)
 
+    if (HAS_HYPERVISOR)
+        set_target_properties(lichii PROPERTIES
+            XCODE_ATTRIBUTE_CODE_SIGN_ENTITLEMENTS "${PROJECT_SOURCE_DIR}/dist/eglantine.entitlements")
+        if (NOT CMAKE_GENERATOR MATCHES "Xcode")
+            add_custom_command(TARGET lichii POST_BUILD
+                COMMAND /usr/bin/codesign --force --sign -
+                    --entitlements "${PROJECT_SOURCE_DIR}/dist/eglantine.entitlements"
+                    "$<TARGET_BUNDLE_DIR:lichii>"
+                VERBATIM)
+        endif()
+    endif()
+
     set(CMAKE_FIND_LIBRARY_SUFFIXES ".dylib")
     find_library(MOLTENVK_LIBRARY MoltenVK REQUIRED)
     message(STATUS "Using MoltenVK at ${MOLTENVK_LIBRARY}.")

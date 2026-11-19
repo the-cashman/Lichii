@@ -321,6 +321,11 @@ public:
     bool IsSwitch2() const {
         return m_is_switch2;
     }
+#ifdef HAS_NCE
+    bool UsesNativeExecution() const {
+        return m_page_table.GetBasePageTable().UsesNativeExecution();
+    }
+#endif
 
     bool IsDefaultApplicationSystemResource() const {
         return m_is_default_application_system_resource;
@@ -594,6 +599,10 @@ public:
     void LoadModule(KernelCore& kernel, CodeSet code_set, KProcessAddress base_addr);
 
     void InitializeInterfaces(KernelCore& kernel);
+
+#ifdef HAS_HYPERVISOR
+    void ReleaseHypervisor();
+#endif
 
     Core::Memory::Memory& GetMemory() {
         return m_memory;

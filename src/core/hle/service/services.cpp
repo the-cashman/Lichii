@@ -131,8 +131,8 @@ Services::Services(std::shared_ptr<SM::ServiceManager>& sm, Core::System& system
                            Set::LoopProcess(s, isolated_system_data);
                        }},
         {"psc",        &PSC::LoopProcess},
-        {"glue",       [isolated_time_zone = std::move(isolated_time_zone)](Core::System& s) {
-                           Glue::LoopProcess(s, isolated_time_zone);
+        {"glue",       [time_zone = std::move(isolated_time_zone)](Core::System& s) {
+                           Glue::LoopProcess(s, time_zone);
                        }},
         {"grc",        &GRC::LoopProcess},
         {"hid",        &HID::LoopProcess},
@@ -173,7 +173,7 @@ Services::Services(std::shared_ptr<SM::ServiceManager>& sm, Core::System& system
         {"gpio",        &GPIO::LoopProcess},
     })
         kernel.RunOnGuestCoreProcess(std::string(name),
-                                     [&system, run = std::move(run)] { run(system); });
+                                     [&system, loop = std::move(run)] { loop(system); });
 }
 
 } // namespace Service

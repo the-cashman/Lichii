@@ -46,7 +46,8 @@ void TraceJit(size_t core) {
     const auto& now = g_jit_counters[core];
     auto& traced = g_jit_traced[core];
     if (now.blocks_compiled == traced.blocks_compiled && now.cache_clears == traced.cache_clears &&
-        now.blocks_invalidated == traced.blocks_invalidated) {
+        now.blocks_invalidated == traced.blocks_invalidated &&
+        now.fastmem_recompiles == traced.fastmem_recompiles) {
         return;
     }
     VideoCommon::StutterTrace::AddJit(
@@ -638,7 +639,7 @@ HaltReason ArmDynarmic64::RunThread(Kernel::KThread* thread) {
                                  : Stats::Exit::Other;
     const auto& jit = g_jit_counters[m_core_index];
     Stats::EndRun(thread, m_core_index, start, end, exit, m_svc, jit.block_lookups,
-                  jit.blocks_compiled, jit.cache_clears);
+                  jit.blocks_compiled, jit.cache_clears, jit.fastmem_faults, jit.fastmem_recompiles);
     if (VideoCommon::StutterTrace::Enabled()) {
         TraceJit(m_core_index);
     }

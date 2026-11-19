@@ -3557,45 +3557,50 @@ void MainWindow::OnGameListOpenPerGameProperties(u64 title_id, const std::string
 }
 
 void MainWindow::OnLinkToRyujinx(const u64& program_id) {
-    namespace fs = std::filesystem;
+    if (emulation_running) {
+        QMessageBox::warning(this, tr("Stop emulation before linking saves"),
+                             tr("Close the running game before changing Ryujinx save links."));
+        return;
+    }
 
-    fs::path ryu_dir;
+    const auto profile = GetProfileID();
+    if (!profile) {
+        return;
+    }
 
-    // find an existing Ryujinx linked path in config.ini; if it exists, use it as a "hint"
-    // If it's not defined in config.ini, use default
-    const fs::path existing_path =
+    auto ryujinx_root =
         UISettings::values.ryujinx_link_paths
             .value(program_id, QDir(Common::FS::GetLegacyPath(Common::FS::RyujinxDir)))
             .filesystemAbsolutePath();
 
-    // this function also prompts the user to manually specify a portable location
-    ryu_dir = QtCommon::FS::GetRyujinxSavePath(existing_path, program_id);
-
-    if (ryu_dir.empty())
+    const auto save = QtCommon::FS::ChooseRyujinxSave(ryujinx_root, program_id, profile->AsU128());
+    if (!save) {
         return;
+    }
 
-    const std::string user_id = GetProfileIDString();
-    if (user_id.empty())
-        return;
+    const bool device = save->type == Common::FS::RyujinxSaveType::Device;
+    const auto type = device ? FileSys::SaveDataType::Device : FileSys::SaveDataType::Account;
+    const auto user = device ? u128{} : profile->AsU128();
+    const auto save_root = Common::FS::GetEdenPath(Common::FS::EdenPath::SaveDir);
+    const auto vfs_root = QtCommon::vfs->OpenDirectory(Common::FS::PathToUTF8String(save_root),
+                                                       FileSys::OpenMode::Read);
+    const auto lichii_dir = Common::FS::ConcatPathSafe(
+        save_root, FileSys::SaveDataFactory::GetFullPath(
+                       {}, vfs_root, FileSys::SaveDataSpaceId::User, type, program_id, user, 0));
 
-    const std::string hex_program = fmt::format("{:016X}", program_id);
-
-    const fs::path eden_dir = FrontendCommon::DataManager::GetDataDir(
-                                  FrontendCommon::DataManager::DataDir::Saves, user_id) /
-                              hex_program;
-
-    // CheckUnlink basically just checks to see if one or both are linked, and prompts the user to
-    // unlink if this is the case.
-    // If it returns false, neither dir is linked so it's fine to continue
-    if (!QtCommon::FS::CheckUnlink(eden_dir, ryu_dir)) {
-        RyujinxDialog dialog(eden_dir, ryu_dir, this);
-        if (dialog.exec() == QDialog::Accepted) {
-            UISettings::values.ryujinx_link_paths.insert(
-                program_id,
-                QString::fromStdString(Common::FS::GetRyuPathFromSavePath(ryu_dir).string()));
+    if (const auto unlinked = QtCommon::FS::CheckUnlink(lichii_dir, save->path)) {
+        if (!*unlinked) {
+            return;
         }
-    } else {
         UISettings::values.ryujinx_link_paths.remove(program_id);
+    } else {
+        RyujinxDialog dialog(lichii_dir, save->path,
+                             QString::fromStdString(fmt::format("{:016x}", save->save_id)), this);
+        if (dialog.exec() != QDialog::Accepted) {
+            return;
+        }
+        UISettings::values.ryujinx_link_paths.insert(
+            program_id, QString::fromStdU16String(ryujinx_root.u16string()));
     }
 
     config->SaveAllValues();
