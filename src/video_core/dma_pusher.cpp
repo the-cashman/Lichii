@@ -182,9 +182,21 @@ public:
 
     /// Waits until job `number` and the ones before it ran.
     void WaitFor(u64 number) const {
-        for (u32 spins = 0; completed.load(std::memory_order_acquire) < number; ++spins) {
+        // EDEN_NX2_COPY_PARK=0: yield-spin after the short spin instead of parking on the job
+        // number (Lichii #2247). The worker stores it after the copy, then notifies.
+        static const bool park = [] {
+            const char* const value = std::getenv("EDEN_NX2_COPY_PARK");
+            return value == nullptr || value[0] != '0';
+        }();
+        for (u32 spins = 0;; ++spins) {
+            const u64 done = completed.load(std::memory_order_acquire);
+            if (done >= number) {
+                return;
+            }
             if (spins < 4096) {
                 CopierPause();
+            } else if (park) {
+                completed.wait(done, std::memory_order_acquire);
             } else {
                 std::this_thread::yield();
             }
@@ -225,6 +237,7 @@ private:
             for (; done != available; ++done) {
                 Copy(jobs[done % Capacity]);
                 completed.store(done + 1, std::memory_order_release);
+                completed.notify_all();
             }
         }
     }
