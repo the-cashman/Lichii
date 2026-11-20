@@ -3,8 +3,12 @@
 
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <memory>
@@ -99,8 +103,68 @@ public:
         return BankBase::IsDead() && scheduler.IsFree(last_used_tick);
     }
 
+    // [castle] Counters for the occlusion result reads (logged every 10 s while they happen), and
+    // Lichii #2279's non-blocking read as an opt-in: EDEN_NX2_QUERY_NOWAIT=1 reads once and, when
+    // the results aren't ready, leaves host_results as they were (the values the bank's slots held
+    // last, possibly another query's: stale or wrong results), instead of waiting for the GPU.
+    struct SyncStats {
+        std::atomic<u64> calls{}, not_ready{}, wait_ns{}, stale{};
+        std::atomic<s64> last_log_ns{};
+    };
+    static SyncStats& Stats() {
+        static SyncStats stats;
+        return stats;
+    }
+    static void MaybeLogStats() {
+        SyncStats& s = Stats();
+        const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+        s64 last = s.last_log_ns.load(std::memory_order_relaxed);
+        if (last == 0) {
+            s.last_log_ns.compare_exchange_strong(last, now, std::memory_order_relaxed);
+            return;
+        }
+        if (now - last < 10'000'000'000 ||
+            !s.last_log_ns.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+            return;
+        }
+        LOG_INFO(Render_Vulkan,
+                 "Occlusion result reads last {:.1f} s: {} reads, {} not ready at the first read, "
+                 "{:.1f} ms waiting for the GPU, {} answered with old values (QUERY_NOWAIT)",
+                 static_cast<double>(now - last) / 1e9, s.calls.exchange(0),
+                 s.not_ready.exchange(0), static_cast<double>(s.wait_ns.exchange(0)) / 1e6,
+                 s.stale.exchange(0));
+    }
+
     void Sync(size_t start, size_t size, u64 written_tick) {
+        static const bool nowait = [] {
+            const char* const value = std::getenv("EDEN_NX2_QUERY_NOWAIT");
+            return value != nullptr && value[0] == '1';
+        }();
+        SyncStats& stats = Stats();
+        stats.calls.fetch_add(1, std::memory_order_relaxed);
+        MaybeLogStats();
         const auto& dev = device.GetLogical();
+        if (nowait) {
+            std::array<u64, BANK_SIZE> temp_results;
+            const VkResult result = dev.GetQueryResults(
+                *query_pool, static_cast<u32>(start), static_cast<u32>(size), sizeof(u64) * size,
+                &temp_results[start], sizeof(u64), VK_QUERY_RESULT_64_BIT);
+            if (result == VK_SUCCESS) {
+                std::memcpy(&host_results[start], &temp_results[start], sizeof(u64) * size);
+                return;
+            }
+            if (result == VK_NOT_READY) {
+                stats.not_ready.fetch_add(1, std::memory_order_relaxed);
+                stats.stale.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            if (result == VK_ERROR_DEVICE_LOST) {
+                device.ReportLoss();
+            }
+            throw vk::Exception(result);
+        }
         const auto read = [&] {
             return dev.GetQueryResults(*query_pool, static_cast<u32>(start),
                                        static_cast<u32>(size), sizeof(u64) * size,
@@ -112,6 +176,10 @@ public:
         // loss), and RADV's wait would spin for 20 s per query.
         VkResult query_result = read();
         std::optional<std::chrono::steady_clock::time_point> passed_at;
+        const auto wait_start = std::chrono::steady_clock::now();
+        if (query_result == VK_NOT_READY) {
+            stats.not_ready.fetch_add(1, std::memory_order_relaxed);
+        }
         while (query_result == VK_NOT_READY) {
             scheduler.GetMasterSemaphore().Refresh();
             if (!passed_at && scheduler.IsFree(written_tick)) {
@@ -129,6 +197,10 @@ public:
             std::this_thread::yield();
             query_result = read();
         }
+        stats.wait_ns.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                     std::chrono::steady_clock::now() - wait_start)
+                                                     .count()),
+                                std::memory_order_relaxed);
         switch (query_result) {
         case VK_SUCCESS:
             return;
