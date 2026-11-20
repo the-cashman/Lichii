@@ -302,6 +302,9 @@ public:
                          std::array<f32, 2> motion_scale);
     std::unique_ptr<Fsr3Upscaler> fsr3_upscaler;
     bool fsr3_unsupported{};
+    /// The backend that last drew a DLSS replacement and why, so each change is logged once.
+    std::string_view last_upscale_backend;
+    std::string_view last_upscale_reason;
 
     /// bazzite: Star Fox's DLSS evaluation through AMD FSR 4 (EDEN_NX2_STARFOX_FSR4=1 and an FFX
     /// API upscaler library in EDEN_NX2_FSR4_LIB), created on first use. False to fall back.

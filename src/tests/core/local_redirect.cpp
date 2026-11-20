@@ -69,7 +69,7 @@ void WriteFile(const std::filesystem::path& path, const void* data, std::streams
 }
 
 bool Same(const Network::SockAddrIn& a, const Network::SockAddrIn& b) {
-    return a.family == b.family && a.ip == b.ip && a.portno == b.portno;
+    return a.family == b.family && a.ip == b.ip && a.ip6 == b.ip6 && a.portno == b.portno;
 }
 
 void ResetRedirectSettings() {
@@ -130,6 +130,22 @@ TEST_CASE("LocalRedirect: host names map to the user's server", "[core]") {
     REQUIRE(Same(LocalRedirect::ConnectTarget(loopback_http), loopback_http));
     REQUIRE(Same(LocalRedirect::ConnectTarget(Public), Public));
     REQUIRE(LocalRedirect::Allowed(Public));
+
+    // A dual-stack INET6 socket reaches 127.0.0.1 as ::ffff:127.0.0.1 and stays INET6.
+    Network::SockAddrIn mapped{Network::Domain::INET6, {}, 443};
+    mapped.ip6 = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1};
+    const Network::SockAddrIn mapped_target = LocalRedirect::ConnectTarget(mapped);
+    REQUIRE(mapped_target.family == Network::Domain::INET6);
+    REQUIRE(mapped_target.portno == 8443);
+    REQUIRE(mapped_target.ip6 ==
+            Network::IPv6Address{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 0, 2, 1});
+    Network::SockAddrIn mapped_http = mapped;
+    mapped_http.portno = 80;
+    REQUIRE(Same(LocalRedirect::ConnectTarget(mapped_http), mapped_http));
+    // The redirect never resolves to ::1, so ::1 stays where it is.
+    Network::SockAddrIn loopback6 = mapped;
+    loopback6.ip6 = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    REQUIRE(Same(LocalRedirect::ConnectTarget(loopback6), loopback6));
 
     Settings::values.online_redirect_loopback_only = true;
     LocalRedirect::Configure();

@@ -268,12 +268,19 @@ add_executable(lichii
 
 set_target_properties(lichii PROPERTIES OUTPUT_NAME "lichii")
 
-# Shipped next to the executable: the NX2 switches a GUI launch cannot set another way. Read at
-# startup (LoadNx2Switches in main.cpp); a user copy in %APPDATA%\lichii overrides it.
-add_custom_command(TARGET lichii POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${PROJECT_SOURCE_DIR}/dist/nx2_switches.txt" "$<TARGET_FILE_DIR:lichii>/nx2_switches.txt"
-    VERBATIM)
+set(_nx2_switches "${PROJECT_SOURCE_DIR}/dist/nx2_switches.txt")
+if (APPLE)
+    set_source_files_properties("${_nx2_switches}" PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+    target_sources(lichii PRIVATE "${_nx2_switches}")
+    add_custom_command(TARGET lichii POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E rm -f "$<TARGET_FILE_DIR:lichii>/nx2_switches.txt"
+        VERBATIM)
+else()
+    add_custom_command(TARGET lichii POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${_nx2_switches}" "$<TARGET_FILE_DIR:lichii>/nx2_switches.txt"
+        VERBATIM)
+endif()
 
 if (LICHII_CRASH_DUMPS)
     target_sources(lichii PRIVATE
