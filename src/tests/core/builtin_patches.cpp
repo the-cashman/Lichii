@@ -78,6 +78,11 @@ constexpr std::string_view SoundGate =
 constexpr std::string_view SoundFeed = "001140BD10102E1E0068301EC0035FD6";
 constexpr u32 DynamicCallInstruction = 0x94D57D4F;
 constexpr u32 DynamicOriginalInstruction = 0x1E201828;
+constexpr size_t EponaHookOffset = sizeof(Loader::NSOHeader) + 0x2C3AE20;
+constexpr size_t EponaCaveOffset = sizeof(Loader::NSOHeader) + 0x3C46FB4;
+constexpr u32 EponaOriginalInstruction = 0x54000145;
+constexpr u32 EponaHookInstruction = 0x14403065;
+constexpr size_t EponaRoutineSize = 72;
 constexpr size_t TurnSpeedHookOffset = sizeof(Loader::NSOHeader) + 0x261EB18;
 constexpr u32 TurnSpeedOriginalInstruction = 0x1E210801;
 constexpr u32 TurnSpeedHookInstruction = 0x1458A021;
@@ -114,7 +119,7 @@ constexpr size_t ClothDtRoutineS0Offset = sizeof(Loader::NSOHeader) + 0x3C46B00;
 constexpr size_t ClothDtRoutineS2Offset = sizeof(Loader::NSOHeader) + 0x3C46B30;
 constexpr size_t ClothDtRoutineSize = 48;
 constexpr std::string_view ClothDtRoutineHead =
-    "D0810090104A44F9100240F9111A40B9101191521091A772310600513F02106B3132901A31060011";
+    "D0810090104A44F9100240F9111A40B91011915210B1A772310600513F02106B3132901A31060011";
 
 constexpr size_t StepRoutineOffset = sizeof(Loader::NSOHeader) + 0x3C46900;
 constexpr size_t AmbientRoutineOffset = sizeof(Loader::NSOHeader) + 0x3C46B60;
@@ -225,6 +230,11 @@ public:
     FileSys::PatchManager Manager(u64 title_id = OcarinaTitleId) {
         return FileSys::PatchManager{title_id, system.GetFileSystemController(),
                                      system.GetContentProvider()};
+    }
+
+    void WriteCheat(std::string_view cheat) const {
+        std::ofstream file{root / "load" / fmt::format("{:016X}", OcarinaTitleId) / "cheat_test.txt"};
+        file << cheat;
     }
 
 private:
@@ -415,6 +425,7 @@ std::vector<u8> MakeDynamicMain() {
     std::memcpy(nso.data(), &header, sizeof(header));
     std::memcpy(nso.data() + DynamicCallOffset, &DynamicOriginalInstruction,
                 sizeof(DynamicOriginalInstruction));
+    std::memcpy(nso.data() + EponaHookOffset, &EponaOriginalInstruction, sizeof(u32));
     std::memcpy(nso.data() + WaterHookOffset, &WaterOriginalInstruction,
                 sizeof(WaterOriginalInstruction));
     std::memcpy(nso.data() + WaterMulOffset, &WaterMulOriginalInstruction,
@@ -606,6 +617,75 @@ TEST_CASE("Built-in FPS Unlock defaults on and replaces Dynamic FPS", "[patch_ma
     const auto unrelated = context.Manager(OtherTitleId).GetPatches();
     REQUIRE(std::ranges::find(unrelated, DynamicFps, &FileSys::Patch::name) == unrelated.end());
     REQUIRE(std::ranges::find(unrelated, FpsUnlock, &FileSys::Patch::name) == unrelated.end());
+}
+
+TEST_CASE("FPS Unlock fixes Epona's jump only when its hook and cave are free",
+          "[patch_manager][epona]") {
+    auto nso = MakeDynamicMain();
+    std::optional<u32> mod;
+    size_t mod_offset = EponaHookOffset;
+    std::string_view cheat;
+    bool should_patch = false;
+    bool unlock_applies = true;
+    bool disable_unlock = false;
+    SECTION("Unmodified main") {
+        should_patch = true;
+    }
+    SECTION("Unknown hook word") {
+        std::memcpy(nso.data() + EponaHookOffset, &NopInstruction, sizeof(u32));
+    }
+    SECTION("Nonzero padding") {
+        nso[EponaCaveOffset + EponaRoutineSize - 1] = 1;
+    }
+    SECTION("An IPS replaces the hook") {
+        mod = NopInstruction;
+    }
+    SECTION("An IPS uses the end of the cave") {
+        mod = NopInstruction;
+        mod_offset = EponaCaveOffset + EponaRoutineSize - sizeof(u32);
+    }
+    SECTION("A cheat writes into the cave after loading") {
+        cheat = "[Jump stub]\n04000000 03C46FF8 D503201F\n";
+    }
+    SECTION("Only Dark's Dynamic FPS is enabled") {
+        disable_unlock = true;
+        unlock_applies = false;
+    }
+    SECTION("FPS Unlock is enabled but cannot apply") {
+        nso[SoundEntryOffset] ^= 1;
+        unlock_applies = false;
+    }
+    SECTION("Unknown build ID") {
+        nso[offsetof(Loader::NSOHeader, build_id)] ^= 1;
+        unlock_applies = false;
+    }
+
+    PatchManagerTestContext context{mod, mod_offset};
+    if (!cheat.empty()) {
+        context.WriteCheat(cheat);
+    }
+    if (disable_unlock) {
+        Settings::values.disabled_addons[OcarinaTitleId] = {std::string{FpsUnlock}};
+    }
+    const auto patched = context.Manager().PatchNSO(nso, "main");
+    REQUIRE(WordAt(patched, SoundEntryOffset) ==
+            (unlock_applies ? SoundEntryBranchInstruction : WordAt(nso, SoundEntryOffset)));
+    if (should_patch) {
+        REQUIRE(WordAt(patched, EponaHookOffset) == EponaHookInstruction);
+        REQUIRE(Common::HexToString(std::span{patched}.subspan(EponaCaveOffset, EponaRoutineSize)) ==
+                "25020054699200D0299145F9A90100B42A1140B96A01003409F0A7525F01096B"
+                "020100544901261E3F010071AD00005429010A6B2955895A3F09407149000054"
+                "8CCFBF1794CFBF17");
+    } else {
+        if (mod) {
+            REQUIRE(WordAt(patched, mod_offset) == *mod);
+            std::memcpy(nso.data() + mod_offset, &*mod, sizeof(u32));
+        }
+        REQUIRE(WordAt(patched, EponaHookOffset) == WordAt(nso, EponaHookOffset));
+        REQUIRE(std::equal(nso.begin() + EponaCaveOffset,
+                           nso.begin() + EponaCaveOffset + EponaRoutineSize,
+                           patched.begin() + EponaCaveOffset));
+    }
 }
 
 TEST_CASE("Built-in FPS Unlock skips the sound gate's sites only as a whole patch",

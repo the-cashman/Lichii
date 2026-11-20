@@ -31,6 +31,8 @@
 
 namespace Service::Nvidia::Devices {
 namespace {
+constexpr size_t GpfifoInlineEntries = 512;
+
 Tegra::CommandHeader BuildFenceAction(Tegra::Engines::Puller::FenceOperation op, u32 syncpoint_id) {
     Tegra::Engines::Puller::FenceAction result{};
     result.op.Assign(op);
@@ -81,8 +83,8 @@ NvResult nvhost_gpu::Ioctl1(DeviceFD fd, Ioctl command, std::span<const u8> inpu
             return WrapFixed(this, &nvhost_gpu::ChannelSetTimeout, input, output);
         case 0x8:
         case 0x1b: {
-            const auto result = WrapFixedVariable(this, &nvhost_gpu::SubmitGPFIFOBase1, input,
-                                                  output, fd, command.cmd == 0x1b);
+            const auto result = WrapFixedVariable<GpfifoInlineEntries>(
+                this, &nvhost_gpu::SubmitGPFIFOBase1, input, output, fd, command.cmd == 0x1b);
             LogGPFIFOSubmit(fd, command, 1, input, 0, output, result);
             return result;
         }
@@ -128,8 +130,8 @@ NvResult nvhost_gpu::Ioctl2(DeviceFD fd, Ioctl command, std::span<const u8> inpu
     case 'H':
         switch (command.cmd) {
         case 0x1b: {
-            const auto result =
-                WrapFixedInlIn(this, &nvhost_gpu::SubmitGPFIFOBase2, input, inline_input, output);
+            const auto result = WrapFixedInlIn<GpfifoInlineEntries>(
+                this, &nvhost_gpu::SubmitGPFIFOBase2, input, inline_input, output);
             LogGPFIFOSubmit(fd, command, 2, input, inline_input.size(), output, result);
             return result;
         }
@@ -621,11 +623,11 @@ NvResult nvhost_gpu::SubmitGPFIFOBase1(IoctlSubmitGpfifo& params,
         return NvResult::InvalidSize;
     }
 
-    Tegra::CommandList entries(params.num_entries);
+    Tegra::CommandList entries(params.num_entries, boost::container::default_init);
     if (kickoff) {
         this->GetSessionMemory(fd).ReadBlock(params.address, entries.command_lists.data(),
                                              params.num_entries * sizeof(Tegra::CommandListHeader));
-    } else {
+    } else if (params.num_entries != 0) {
         std::memcpy(entries.command_lists.data(), commands.data(),
                     params.num_entries * sizeof(Tegra::CommandListHeader));
     }
@@ -640,9 +642,11 @@ NvResult nvhost_gpu::SubmitGPFIFOBase2(IoctlSubmitGpfifo& params,
         return NvResult::InvalidSize;
     }
 
-    Tegra::CommandList entries(params.num_entries);
-    std::memcpy(entries.command_lists.data(), commands.data(),
-                params.num_entries * sizeof(Tegra::CommandListHeader));
+    Tegra::CommandList entries(params.num_entries, boost::container::default_init);
+    if (params.num_entries != 0) {
+        std::memcpy(entries.command_lists.data(), commands.data(),
+                    params.num_entries * sizeof(Tegra::CommandListHeader));
+    }
     return SubmitGPFIFOImpl(params, std::move(entries));
 }
 
