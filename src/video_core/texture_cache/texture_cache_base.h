@@ -22,6 +22,7 @@
 #include <utility>
 // TODO: find out which don't require stable iters
 #include <unordered_map>
+#include <unordered_set>
 #include "video_core/page_filter.h"
 #include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
@@ -247,6 +248,24 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 scale_epoch{};
     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
     bool debug_stats{}; ///< Collect what only the debug statistics lines use
+    /// Render targets their lookup created, to check for early deletion (EvictDeadRenderTargets),
+    /// with their allocation tick and how often they were found still in use.
+    struct TransientTarget {
+        ImageId id;
+        u64 allocation_tick;
+        u64 check_tick;
+        u32 survived;
+    };
+    std::deque<TransientTarget> transient_targets;
+    /// Most candidates kept waiting for early deletion, over budget or not.
+    static constexpr size_t MaxTransientTargets = 8192;
+    u64 transient_evictions{};
+    u64 logged_transient_evictions{};
+    /// Image made by the latest JoinImages call; FindRenderTargetView uses it to tell a target it
+    /// just created from one that already existed.
+    ImageId last_created_image{};
+    /// Deletes dead render targets early while the cache is over its expected size.
+    void EvictDeadRenderTargets();
     /// EDEN_NX2_MEM_TRACE: when the last memory trace lines were logged.
     std::chrono::steady_clock::time_point mem_trace_time{};
 
@@ -931,6 +950,8 @@ private:
     /// tracked, so CPU writes, unmaps and write-backs clear them. An image made entirely on marked
     /// pages starts without an upload: the upload would only copy stale bytes the GPU overwrites.
     /// Switch 2 titles only: the buffer cache feeds Nx2MayBeGpuWritten for them alone.
+    /// Whether dropping this image without a download loses data only the GPU has (MarkStale).
+    [[nodiscard]] static bool LosesGpuData(const ImageBase& image);
     void MarkStale(const ImageBase& image);
     [[nodiscard]] static u64 OverlapDownloadMaxBytes();
     [[nodiscard]] bool AsyncOverlapDownloadsEnabled();
@@ -1058,6 +1079,32 @@ private:
     /// Clears every device range [gpu_addr, gpu_addr + size) maps to in memory.
     void ClearStaleGpu(Tegra::MemoryManager& memory, GPUVAddr gpu_addr, size_t size);
     StalePages stale_pages;
+    /// Pages early-deleted render targets left (EvictDeadRenderTargets); a CPU write clears them.
+    StalePages evicted_pages;
+    /// Render target shapes (format, width, height) the game read back after an early deletion:
+    /// written back before one is deleted early, or left to the collector.
+    std::unordered_set<u64> readback_shapes;
+    /// Targets smaller than this aren't deleted early: they barely relieve memory.
+    static constexpr u64 MinEvictBytes = u64{1} << 20;
+    /// The latest early deletions, to find the shape a read-back image was made over.
+    static constexpr size_t MaxRecentEvictions = 16384;
+    struct RecentEviction {
+        DAddr end;
+        u64 shape;
+        u64 sequence;
+    };
+    std::map<DAddr, RecentEviction> recent_evictions;
+    std::deque<std::pair<DAddr, u64>> recent_eviction_order;
+    u64 eviction_sequence{};
+    u64 evict_born{};       ///< Images made over early-deleted pages
+    u64 evict_read_back{};  ///< ...of which sampled before any draw
+    u64 evict_saved{};      ///< Read-back shapes written back before deletion
+    u64 evict_spared{};     ///< Read-back shapes left to the collector (not downloadable)
+    u64 evict_small_kept{}; ///< Small targets left to the collector
+    [[nodiscard]] static u64 RtShapeKey(const ImageBase& image) {
+        return (u64{static_cast<u32>(image.info.format)} << 40) |
+               (u64{image.info.size.width & 0xFFFFF} << 20) | (image.info.size.height & 0xFFFFF);
+    }
     u64 tc_stale_skips{};        ///< Uploads skipped (last 600 frames)
     u64 tc_stale_skip_bytes{};
     u64 tc_stale_gpu_written{};  ///< Stale but buffer-written pages: uploaded after all

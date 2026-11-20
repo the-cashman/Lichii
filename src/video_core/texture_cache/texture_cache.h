@@ -1322,11 +1322,16 @@ u64 TextureCache<P>::OverlapDownloadMaxBytes() {
 }
 
 template <class P>
+bool TextureCache<P>::LosesGpuData(const ImageBase& image) {
+    return Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
+           True(image.flags & ImageFlagBits::GpuModified) &&
+           False(image.flags & (ImageFlagBits::CpuModified | ImageFlagBits::Sparse |
+                                ImageFlagBits::Unbacked));
+}
+
+template <class P>
 void TextureCache<P>::MarkStale(const ImageBase& image) {
-    if (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ||
-        False(image.flags & ImageFlagBits::GpuModified) ||
-        True(image.flags & (ImageFlagBits::CpuModified | ImageFlagBits::Sparse |
-                            ImageFlagBits::Unbacked))) {
+    if (!LosesGpuData(image)) {
         return;
     }
     if (Common::DkbFrameTrace::Enabled()) {
@@ -1347,6 +1352,7 @@ void TextureCache<P>::MarkStale(const ImageBase& image) {
 
 template <class P>
 void TextureCache<P>::ClearStale(DAddr addr, size_t size) {
+    evicted_pages.Clear(addr, size, [](DAddr, u64) {});
     stale_pages.Clear(addr, size, [this](DAddr run_addr, u64 run_size) {
         device_memory.UpdatePagesCachedCount(run_addr, run_size, -1);
     });
@@ -1462,6 +1468,136 @@ template <class P>
 void TextureCache<P>::LogThresholds() const {
     LOG_INFO(HW_GPU, "Texture cache thresholds: expected {} MiB, critical {} MiB, minimum {} MiB",
              expected_memory >> 20, critical_memory >> 20, minimum_memory >> 20);
+}
+
+template <class P>
+void TextureCache<P>::EvictDeadRenderTargets() {
+    // While the cache is over its expected size, render targets their lookup created and that went
+    // unused for DeadTargetFrames are deleted now, before the age-based collector reaches them.
+    // In Ocarina of Time's Market the crowds make a new target every couple of frames; the dead
+    // ones piled up, the cache went over the card's budget, the driver moved video memory into
+    // system RAM and on an 8 GB card the device was lost after ~1-4 min. The collector can't keep
+    // up there: it waits 10-50 frames and downloads each GPU-written image first. These are
+    // marked stale instead, the way the collector handles an image it doesn't download, with two
+    // exceptions so no data the game reads again is lost:
+    // - targets under MinEvictBytes (text and label boxes sized to their contents) are left to
+    //   the collector: they barely relieve memory and were most of what the game read back;
+    // - a shape the game read back after an early deletion (FillImageViews) is written back to
+    //   guest memory before deletion, a few a frame, or left to the collector if it can't be.
+    static constexpr u64 DeadTargetFrames = 8;
+    // At most this many deletions a frame, so a long queue doesn't turn into one long frame when
+    // pressure starts; the Market needs about 10 a frame.
+    static constexpr u32 MaxEvictionsPerFrame = 64;
+    // How often a target found still in use is checked again before it counts as a lasting one.
+    static constexpr u32 MaxChecks = 4;
+    // (FindRenderTargetView keeps the queue at MaxTransientTargets.)
+    if (total_used_memory <= expected_memory) {
+        return;
+    }
+    u32 evicted = 0;
+    // Shapes the game read back after an early deletion are written back to guest memory first,
+    // at most this many a frame; the rest wait for a later frame.
+    static constexpr u32 MaxSavesPerFrame = 4;
+    u32 saved = 0;
+    for (size_t budget = transient_targets.size(); budget != 0 && !transient_targets.empty();
+         --budget) {
+        if (evicted >= MaxEvictionsPerFrame || total_used_memory <= expected_memory) {
+            break;
+        }
+        TransientTarget entry = transient_targets.front();
+        if (frame_tick - entry.check_tick < DeadTargetFrames) {
+            break;
+        }
+        transient_targets.pop_front();
+        if (!slot_images.contains(entry.id)) {
+            continue;
+        }
+        Image& image = slot_images[entry.id];
+        if (image.allocation_tick != entry.allocation_tick ||
+            False(image.flags & ImageFlagBits::TransientTarget) ||
+            False(image.flags & ImageFlagBits::Registered)) {
+            continue;
+        }
+        const u64 last_use = lru_cache.GetTick(image.lru_index);
+        if (frame_tick - last_use < DeadTargetFrames ||
+            True(image.flags & ImageFlagBits::IsDecoding)) {
+            // Still in use: check again later; one used for long is a lasting target.
+            if (++entry.survived < MaxChecks) {
+                entry.check_tick = frame_tick;
+                transient_targets.push_back(entry);
+            } else {
+                image.flags &= ~ImageFlagBits::TransientTarget;
+            }
+            continue;
+        }
+        if (image.guest_size_bytes < MinEvictBytes) {
+            // Small targets (text and label boxes, sized to their contents) barely relieve memory
+            // and are the ones read back most often: leave them to the collector.
+            image.flags &= ~ImageFlagBits::TransientTarget;
+            ++evict_small_kept;
+            continue;
+        }
+        bool saved_this = false;
+        if (readback_shapes.contains(RtShapeKey(image))) {
+            if (!IsDownloadable(image) || True(image.flags & ImageFlagBits::BadOverlap)) {
+                // Can't be written back safely: leave it to the collector.
+                image.flags &= ~ImageFlagBits::TransientTarget;
+                ++evict_spared;
+                continue;
+            }
+            if (saved >= MaxSavesPerFrame) {
+                entry.check_tick = frame_tick;
+                transient_targets.push_back(entry);
+                continue;
+            }
+            auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
+            const auto copies = FullDownloadCopies(image.info);
+            image.DownloadMemory(map, copies);
+            runtime.Finish();
+            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span,
+                         swizzle_data_buffer);
+            ClearStaleImage(image);
+            ++saved;
+            ++evict_saved;
+            saved_this = true;
+        } else {
+            MarkStale(image); // before UntrackImage (see MarkStale)
+        }
+        if (!saved_this && LosesGpuData(image)) {
+            // Only a target whose GPU data is really lost can teach a read-back shape.
+            evicted_pages.Mark(image.cpu_addr, image.guest_size_bytes, [](DAddr, u64) {});
+            const u64 sequence = ++eviction_sequence;
+            recent_evictions[image.cpu_addr] = {image.cpu_addr + image.guest_size_bytes,
+                                                RtShapeKey(image), sequence};
+            recent_eviction_order.emplace_back(image.cpu_addr, sequence);
+            if (recent_eviction_order.size() > MaxRecentEvictions) {
+                const auto [old_addr, old_sequence] = recent_eviction_order.front();
+                recent_eviction_order.pop_front();
+                if (const auto it = recent_evictions.find(old_addr);
+                    it != recent_evictions.end() && it->second.sequence == old_sequence) {
+                    recent_evictions.erase(it);
+                }
+            }
+        }
+        if (True(image.flags & ImageFlagBits::Tracked)) {
+            UntrackImage(image, entry.id);
+        }
+        UnregisterImage(entry.id);
+        DeleteImage(entry.id, false);
+        ++transient_evictions;
+        ++evicted;
+    }
+    if (frame_tick % 600 == 0 && transient_evictions != logged_transient_evictions) {
+        LOG_INFO(HW_GPU, "Dead render targets deleted early: {} so far, {} waiting",
+                 transient_evictions, transient_targets.size());
+        LOG_INFO(HW_GPU, "Dead render targets: {} small ones and {} read-back shapes not "
+                         "downloadable left to the collector, {} written back before deletion; "
+                         "{} of {} images made over deleted pages were sampled before any draw, "
+                         "{} shapes known",
+                 evict_small_kept, evict_spared, evict_saved, evict_read_back, evict_born,
+                 readback_shapes.size());
+        logged_transient_evictions = transient_evictions;
+    }
 }
 
 template <class P>
@@ -1886,6 +2022,7 @@ void TextureCache<P>::TickFrame() {
         gc_deletes = gc_costly_deletes = gc_download_deletes = async_decodes_queued = 0;
         images_created = images_deleted = 0;
     }
+    EvictDeadRenderTargets();
     // An image that could not be made at all: the driver is out of memory whatever the counts
     // say, so collect as at the critical threshold.
     bool out_of_memory = false;
@@ -2026,6 +2163,37 @@ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compu
                           ? previous->id
                           : VisitImageView(view.index, compute);
             previous = &view;
+            if (view.id != NULL_IMAGE_VIEW_ID) {
+                const ImageId probe_id = slot_image_views[view.id].image_id;
+                if (probe_id != NULL_IMAGE_ID) {
+                    Image& probe = slot_images[probe_id];
+                    if (True(probe.flags & ImageFlagBits::EvictBorn)) {
+                        probe.flags &= ~ImageFlagBits::EvictBorn;
+                        if (False(probe.flags & ImageFlagBits::GpuModified)) {
+                            // Sampled before the GPU drew into it: the game read back what an
+                            // early deletion threw away.
+                            const u64 key = RtShapeKey(probe);
+                            ++evict_read_back;
+                            // From now on, targets of the deleted one's shape are written back
+                            // before an early deletion (EvictDeadRenderTargets).
+                            auto it = recent_evictions.upper_bound(probe.cpu_addr);
+                            if (it != recent_evictions.begin() &&
+                                (--it)->second.end > probe.cpu_addr) {
+                                const u64 deleted = it->second.shape;
+                                if (readback_shapes.insert(deleted).second) {
+                                    LOG_INFO(HW_GPU,
+                                             "Dead render targets: format {} {}x{} was read back "
+                                             "(as format {} {}x{}), now written back before "
+                                             "deletion",
+                                             deleted >> 40, (deleted >> 20) & 0xFFFFF,
+                                             deleted & 0xFFFFF, key >> 40, (key >> 20) & 0xFFFFF,
+                                             key & 0xFFFFF);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             if (blacklist) {
                 if (view.blacklist && view.id != NULL_IMAGE_VIEW_ID) {
                     const ImageViewBase& image_view = slot_image_views[view.id];
@@ -4058,6 +4226,16 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         TrackImage(image, image_id);
     }
 
+    // Whole pages inside it too: Mark leaves a deleted target's partial edge pages unmarked.
+    const u64 evicted_first = Common::AlignUp(image.cpu_addr, StalePages::PAGE_SIZE);
+    const u64 evicted_end =
+        Common::AlignDown(image.cpu_addr + image.guest_size_bytes, StalePages::PAGE_SIZE);
+    if (evicted_pages.IsAll(image.cpu_addr, image.guest_size_bytes) ||
+        (evicted_end > evicted_first &&
+         evicted_pages.IsAll(evicted_first, evicted_end - evicted_first))) {
+        image.flags |= ImageFlagBits::EvictBorn;
+        ++evict_born;
+    }
     // Made where a dropped GPU-written image left stale bytes (MarkStale): nothing to upload.
     // Pages the buffer cache wrote on the GPU may hold data written back since: upload those.
     if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed) && image.dirty_layers.empty() &&
@@ -5209,6 +5387,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     BumpBindingSerial(new_image_id);
 
     new_image.allocation_tick = frame_tick;
+    last_created_image = new_image_id;
     {
         // Which shapes are being created (periodic log): format, type, levels, layers, size.
         const u64 key = (u64{static_cast<u32>(new_info.format)} << 56) |
@@ -5736,6 +5915,7 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
     }
     ImageId image_id{};
     bool delete_state = has_deleted_images;
+    last_created_image = ImageId{};
     do {
         has_deleted_images = false;
         image_id = FindOrInsertImage(info, gpu_addr);
@@ -5748,6 +5928,34 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
         return ImageViewId{};
     }
     Image& image = slot_images[image_id];
+    // A render target this lookup just created, on a Switch 2 title, is a candidate for early
+    // deletion once it goes unused (EvictDeadRenderTargets). Its upload is unchanged.
+    // [castle] Lichii #1285, opt-in here: EDEN_NX2_RT_EVICT=1 (off: nothing is queued, so nothing
+    // is deleted early).
+    static const bool rt_evict = [] {
+        const char* const value = std::getenv("EDEN_NX2_RT_EVICT");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (rt_evict && Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
+        image_id == last_created_image &&
+        image.modification_tick == 0 && False(image.flags & ImageFlagBits::TransientTarget) &&
+        False(image.flags & (ImageFlagBits::Sparse | ImageFlagBits::SparseLayers |
+                             ImageFlagBits::SparseTiles | ImageFlagBits::Unbacked))) {
+        // A hard limit, also while over budget: the oldest candidate leaves the queue and stays
+        // like any other image (its flag is dropped, so it is never deleted early).
+        while (transient_targets.size() >= MaxTransientTargets) {
+            const TransientTarget oldest = transient_targets.front();
+            transient_targets.pop_front();
+            if (slot_images.contains(oldest.id)) {
+                Image& old_image = slot_images[oldest.id];
+                if (old_image.allocation_tick == oldest.allocation_tick) {
+                    old_image.flags &= ~ImageFlagBits::TransientTarget;
+                }
+            }
+        }
+        image.flags |= ImageFlagBits::TransientTarget;
+        transient_targets.push_back({image_id, image.allocation_tick, frame_tick, 0});
+    }
     const ImageViewType view_type = RenderTargetImageViewType(info);
     SubresourceBase base;
     if (image.info.type == ImageType::Linear) {
