@@ -4548,20 +4548,9 @@ void RasterizerVulkan::FlushWork() {
         const char* value = std::getenv("EDEN_NX2_FLUSH_AT_PASS_END");
         return value == nullptr || value[0] != '0';
     }();
-    // #1977 (EDEN_NX2_IDLE_SUBMIT=0 off): outside a render pass, submit what was recorded once
-    // the GPU ran out of work, instead of at the draw budget.
-    static const bool idle_submit = [] {
-        const char* value = std::getenv("EDEN_NX2_IDLE_SUBMIT");
-        return value == nullptr || value[0] != '0';
-    }();
     if (native && !android && flush_at_pass_end) {
         ++draw_counter;
         pending_native_work = true;
-        if (idle_submit && scheduler.IdleGpuAwaitsWork()) {
-            draw_counter = 0;
-            scheduler.Flush();
-            return;
-        }
         if (draw_counter % 32 != 0 && draw_counter < native_budget) [[likely]] {
             return;
         }
@@ -4585,13 +4574,7 @@ void RasterizerVulkan::FlushWork() {
         }();
         legacy_budget = forced_draws != 0 ? forced_draws : (device.IsMoltenVK() ? 128U : 4096U);
     }
-    auto action = SubmissionPolicy::Advance(draw_counter, native, android, budget, legacy_budget);
-    if (idle_submit && action != SubmissionPolicy::Action::Flush && native && !android &&
-        scheduler.IdleGpuAwaitsWork()) {
-        draw_counter = 0;
-        action = SubmissionPolicy::Action::Flush;
-    }
-    switch (action) {
+    switch (SubmissionPolicy::Advance(draw_counter, native, android, budget, legacy_budget)) {
     case SubmissionPolicy::Action::None:
         break;
     case SubmissionPolicy::Action::Dispatch:
