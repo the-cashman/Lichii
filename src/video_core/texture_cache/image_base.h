@@ -150,12 +150,6 @@ struct ImageBase {
     /// Levels whose every layer a shader last wrote through a storage view. Any other GPU write
     /// (render pass, clear, copy, alias copy) and an upload from guest memory clear them.
     u32 storage_written_levels = 0;
-
-    /// A guest CPU upload replaces GPU-produced contents and their draw-history evidence.
-    void InvalidateGpuWriteHistoryOnCpuUpload() noexcept {
-        storage_written_levels = 0;
-        first_written_frame = 0;
-    }
     size_t lru_index = SIZE_MAX;
 
     std::array<u32, MAX_MIP_LEVELS> mip_level_offsets{};

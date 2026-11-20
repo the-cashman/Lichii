@@ -4049,7 +4049,7 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     const u32 previous_storage_written_levels = image.storage_written_levels;
     image.flags &= ~ImageFlagBits::CpuModified;
     image.load_tick = modification_tick;
-    image.InvalidateGpuWriteHistoryOnCpuUpload();
+    image.storage_written_levels = 0;
 
     // Images uploaded by layer stay tracked while some of their layers are dirty.
     if (False(image.flags & ImageFlagBits::Tracked)) {
