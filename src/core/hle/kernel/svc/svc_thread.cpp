@@ -181,6 +181,12 @@ void SleepThread(Core::System& system, s64 ns) {
     const auto yield_type = static_cast<Svc::YieldType>(ns);
 
     LOG_TRACE(Kernel_SVC, "called nanoseconds={}", ns);
+    // Lichii #2269: give the host core up after a short sleep or a yield as well.
+    // EDEN_NX2_SPIN_YIELD=1 turns it on (off by default here).
+    static const bool spin_yield = [] {
+        const char* value = std::getenv("EDEN_NX2_SPIN_YIELD");
+        return value != nullptr && value[0] == '1';
+    }();
 
     // When the input tick is positive, sleep.
     if (ns > 0) {
@@ -201,12 +207,24 @@ void SleepThread(Core::System& system, s64 ns) {
         // Sleep.
         // NOTE: Nintendo does not check the result of this sleep.
         static_cast<void>(GetCurrentThread(kernel).Sleep(kernel, timeout));
+        if (spin_yield && ns <= 10000) {
+            std::this_thread::yield();
+        }
     } else if (yield_type == Svc::YieldType::WithoutCoreMigration) {
         KScheduler::YieldWithoutCoreMigration(kernel);
+        if (spin_yield) {
+            std::this_thread::yield();
+        }
     } else if (yield_type == Svc::YieldType::WithCoreMigration) {
         KScheduler::YieldWithCoreMigration(kernel);
+        if (spin_yield) {
+            std::this_thread::yield();
+        }
     } else if (yield_type == Svc::YieldType::ToAnyThread) {
         KScheduler::YieldToAnyThread(kernel);
+        if (spin_yield) {
+            std::this_thread::yield();
+        }
     } else {
         // Nintendo does nothing at all if an otherwise invalid value is passed.
     }

@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <string_view>
+#include <thread>
 #if defined(_M_X64) || defined(__x86_64__)
 #include <immintrin.h>
 #endif
@@ -327,13 +328,26 @@ u64 DynarmicCallbacks64::GetCNTPCT() {
         const char* value = std::getenv("EDEN_NX2_CNTPCT_PAUSE");
         return value == nullptr || value[0] != '0';
     }();
+    // Lichii #2269: every 256th read in a row of such a loop yields the host thread instead.
+    // EDEN_NX2_SPIN_YIELD=1 turns it on (off by default here).
+    static const bool spin_yield = [] {
+        const char* value = std::getenv("EDEN_NX2_SPIN_YIELD");
+        return value != nullptr && value[0] == '1';
+    }();
     if (pause_spins && ticks - m_last_cntpct < m_spin_ticks) {
+        if (spin_yield && ++m_consecutive_spin_polls >= 256) {
+            m_consecutive_spin_polls = 0;
+            std::this_thread::yield();
+        } else {
 #if defined(_M_X64) || defined(__x86_64__)
-        _mm_pause();
-        _mm_pause();
+            _mm_pause();
+            _mm_pause();
 #elif defined(__aarch64__)
-        asm volatile("yield");
+            asm volatile("yield");
 #endif
+        }
+    } else {
+        m_consecutive_spin_polls = 0;
     }
     m_last_cntpct = ticks;
     if (Kernel::Nx2ThreadStats::g_enabled) {
