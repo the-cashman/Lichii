@@ -2107,11 +2107,16 @@ private:
         constexpr u64 DonkeyKongBananzaProgramId = 0x040074A01BF12000ULL;
         // Ocarina waited ~12 ms a frame on its previous frame's fence here (#161).
         constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
+        // Mario Kart World prepares the next frame while this one presents (Lichii #2271). Race at
+        // the 60 cap, 4K, RX 7900 XT (oot-bench mkw/, n=2 each): frames whose time differs from
+        // the previous one's by over 2 ms 8.6 -> 5.5 %, p95 17.7 -> 17.5 ms, >25 ms unchanged.
+        constexpr u64 MarioKartWorldProgramId = 0x0400C3F00006E000ULL;
         int frames_ahead = frames_ahead_setting;
         const u64 app_program_id = system.GetApplicationProcessProgramID();
         if (frames_ahead == -1 && app_program_id == DonkeyKongBananzaProgramId) {
             frames_ahead = 0;
-        } else if (frames_ahead == -1 && app_program_id == OcarinaOfTimeProgramId) {
+        } else if (frames_ahead == -1 && (app_program_id == OcarinaOfTimeProgramId ||
+                                          app_program_id == MarioKartWorldProgramId)) {
             frames_ahead = 1;
         }
         const auto entered = std::chrono::steady_clock::now();
