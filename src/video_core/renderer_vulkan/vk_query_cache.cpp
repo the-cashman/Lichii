@@ -23,6 +23,7 @@
 #include "common/bit_util.h"
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "common/nx2_ab.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/query_cache/frame_trace.h"
@@ -138,10 +139,10 @@ public:
     }
 
     void Sync(size_t start, size_t size, u64 written_tick) {
-        static const bool nowait = [] {
-            const char* const value = std::getenv("EDEN_NX2_QUERY_NOWAIT");
-            return value != nullptr && value[0] == '1';
-        }();
+        // "ab[:arm]" takes part in the in-session A/B arms (common/nx2_ab.h).
+        static const Common::Nx2Ab::Switch nowait_switch =
+            Common::Nx2Ab::Parse(std::getenv("EDEN_NX2_QUERY_NOWAIT"));
+        const bool nowait = nowait_switch.Active();
         SyncStats& stats = Stats();
         stats.calls.fetch_add(1, std::memory_order_relaxed);
         MaybeLogStats();
