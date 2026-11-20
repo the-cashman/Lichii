@@ -102,7 +102,6 @@ public:
                                  RenderPassCache& render_pass_cache_,
                                  DescriptorPool& descriptor_pool,
                                  ComputePassDescriptorQueue& compute_pass_descriptor_queue);
-    ~TextureCacheRuntime();
 
     void Finish();
 
@@ -119,14 +118,6 @@ public:
     u64 GetDeviceLocalMemory() const;
 
     u64 GetDeviceMemoryUsage() const;
-
-    /// EDEN_NX2_IMAGE_POOL: the bytes of the destroyed host images kept for reuse, and dropping
-    /// the oldest of them until at most target_bytes are kept (the texture cache does when it
-    /// needs the memory).
-    [[nodiscard]] u64 PooledImageBytes() const;
-    void TrimImagePool(u64 target_bytes);
-    /// The most bytes the pool keeps (EDEN_NX2_IMAGE_POOL_MIB, when set, wins).
-    void SetImagePoolCap(u64 cap_bytes);
 
     /// GPU progress: the texture cache frees a deleted image once the GPU is past its last use.
     [[nodiscard]] u64 CurrentTick() const noexcept;
@@ -591,26 +582,6 @@ private:
     mutable u32 num_memoized_variants{};
 };
 
-/// What a host image was made from, for EDEN_NX2_IMAGE_POOL: a destroyed image whose key equals a
-/// new one's is handed to it instead of a new VkImage and allocation.
-struct ImagePoolKey {
-    bool valid{};
-    bool compression_disabled{};
-    VkImageCreateFlags flags{};
-    VkImageType type{};
-    VkFormat format{};
-    u32 width{};
-    u32 height{};
-    u32 depth{};
-    u32 levels{};
-    u32 layers{};
-    VkSampleCountFlagBits samples{};
-    VkImageTiling tiling{};
-    VkImageUsageFlags usage{};
-    u64 view_formats{}; ///< Hash of the format list
-    bool operator==(const ImagePoolKey&) const = default;
-};
-
 class Image : public VideoCommon::ImageBase {
 public:
     explicit Image(TextureCacheRuntime&, const VideoCommon::ImageInfo& info, GPUVAddr gpu_addr,
@@ -626,12 +597,6 @@ public:
     Image& operator=(Image&&) = default;
 
     u32 HostMipLevels() const noexcept;
-
-    /// The texture cache sentenced it until the host GPU is done with it: once destroyed, its host
-    /// image may go to the pool (EDEN_NX2_IMAGE_POOL).
-    void AllowPooling() noexcept {
-        pool_allowed = true;
-    }
 
     /// The format a copy out of the host image yields: the guest format, or what a converted one
     /// (ASTC re-compressed to BC1/BC3 or decoded to RGBA8, BCn decoded without host support) is
@@ -826,8 +791,6 @@ private:
     /// Records a clear of the whole image to zero.
     void ClearTiles();
 
-    ImagePoolKey pool_key{}; ///< Before original_image: MakeImage fills it while making that
-    bool pool_allowed = false;
     vk::Image original_image;
     vk::Image scaled_image;
 
