@@ -1667,9 +1667,7 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
 
     if (!applied.empty()) {
         for (const auto& overlap :
-             FindBuiltinCheatOverlaps(title_id, applied, CreateCheatList(header.build_id),
-                                      installed_hooks)) {
-        for (const auto& overlap : FindBuiltinCheatOverlaps(title_id, applied, load_cheats())) {
+             FindBuiltinCheatOverlaps(title_id, applied, load_cheats(), installed_hooks)) {
             LOG_WARNING(Loader,
                         "Cheat \"{}\" writes {}+{:#x}..{:#x}, which built-in patch \"{}\" uses "
                         "for its {} at {}+{:#x}..{:#x}. The cheat still runs and overwrites it; "
