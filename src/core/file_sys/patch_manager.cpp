@@ -264,6 +264,71 @@ constexpr std::array<u8, 48> SOUND_FEED_WHOLE{
     0xD0, 0x92, 0x00, 0xB0, 0x10, 0x82, 0x3A, 0x91, 0x11, 0x02, 0x40, 0xBD, 0x31, 0x2A, 0x20, 0x1E,
     0x20, 0xC2, 0x25, 0x1E, 0x31, 0x3A, 0x20, 0x1E, 0x11, 0x02, 0x00, 0xBD, 0xC0, 0x03, 0x5F, 0xD6,
 };
+// EDEN_NX2_OOT_SOUND_GATE=shadow: upstream's gate, and the job's code that reads the global step
+// (time object +0x10) or frame time (+0x18) itself gets the values of the 60 Hz step the gate let
+// through: 1.0 and frame time / step, written next to the gate's state (state + 0xC0/+0xC4, at
+// 60 fps and below the frame's own values). Measured at 120 fps with the plain gate: 13 loads of
+// the time object run only inside the gated job (BgmMgr calc 0x3353400's countdowns, the 0x449390
+// and 0x55a700.. timers, the ambient waves) and so advance at 60/fps real speed. Each of those
+// float loads branches to a 20-byte cave at 0x3C46600 + 20 * i that loads the shadow value instead
+// (saving x17 on the stack), and the ambient-wave stub reads the shadow step.
+// The gate: as SOUND_GATE, plus ldr s19, [time, #0x18] and the two shadow stores.
+constexpr std::array<u8, 144> SOUND_GATE_SHADOW{
+    0xD0, 0x92, 0x00, 0xB0, 0x10, 0x82, 0x3A, 0x91, 0xA2, 0x03, 0x00, 0x35, 0xC9, 0x81, 0x00, 0x90,
+    0x29, 0x49, 0x44, 0xF9, 0x29, 0x01, 0x40, 0xF9, 0x30, 0x11, 0x40, 0xBD, 0x33, 0x19, 0x40, 0xBD,
+    0x11, 0x10, 0x2E, 0x1E, 0x00, 0x22, 0x31, 0x1E, 0x0A, 0x02, 0x00, 0x54, 0x12, 0x02, 0x40, 0xBD,
+    0x52, 0x2A, 0x30, 0x1E, 0x40, 0x22, 0x31, 0x1E, 0x2B, 0x01, 0x00, 0x54, 0x52, 0x3A, 0x31, 0x1E,
+    0x12, 0x02, 0x00, 0xBD, 0x73, 0x1A, 0x30, 0x1E, 0x11, 0x22, 0x00, 0xBD, 0x13, 0x26, 0x00, 0xBD,
+    0x29, 0x00, 0x80, 0x52, 0x09, 0x06, 0x00, 0xB9, 0x0B, 0x00, 0x00, 0x14, 0x12, 0x02, 0x00, 0xBD,
+    0x1F, 0x06, 0x00, 0xB9, 0xC0, 0x03, 0x5F, 0xD6, 0x10, 0x22, 0x00, 0xBD, 0x13, 0x26, 0x00, 0xBD,
+    0x29, 0x00, 0x80, 0x52, 0x09, 0x06, 0x00, 0xB9, 0x03, 0x00, 0x00, 0x14, 0x09, 0x06, 0x40, 0xB9,
+    0x69, 0x00, 0x00, 0x34, 0x7F, 0x23, 0x03, 0xD5, 0x9F, 0x3A, 0x1F, 0x17, 0xC0, 0x03, 0x5F, 0xD6,
+};
+constexpr std::array<u8, 220> SOUND_SHADOW_LOADS{
+    0xF1, 0x0F, 0x1F, 0xF8, 0xD1, 0x92, 0x00, 0xB0, 0x28, 0xC2, 0x4E, 0xBD, 0xF1, 0x07, 0x41, 0xF8,
+    0x64, 0x0B, 0x20, 0x17, 0xF1, 0x0F, 0x1F, 0xF8, 0xD1, 0x92, 0x00, 0xB0, 0x29, 0xC6, 0x4E, 0xBD,
+    0xF1, 0x07, 0x41, 0xF8, 0x60, 0x0B, 0x20, 0x17, 0xF1, 0x0F, 0x1F, 0xF8, 0xD1, 0x92, 0x00, 0xB0,
+    0x28, 0xC2, 0x4E, 0xBD, 0xF1, 0x07, 0x41, 0xF8, 0x82, 0xD5, 0x23, 0x17, 0xF1, 0x0F, 0x1F, 0xF8,
+    0xD1, 0x92, 0x00, 0xB0, 0x2E, 0xC6, 0x4E, 0xBD, 0xF1, 0x07, 0x41, 0xF8, 0x81, 0xDE, 0x23, 0x17,
+    0xF1, 0x0F, 0x1F, 0xF8, 0xD1, 0x92, 0x00, 0xB0, 0x28, 0xC6, 0x4E, 0xBD, 0xF1, 0x07, 0x41, 0xF8,
+    0x33, 0x50, 0x24, 0x17, 0xF1, 0x0F, 0x1F, 0xF8, 0xD1, 0x92, 0x00, 0xB0, 0x20, 0xC6, 0x4E, 0xBD,
+    0xF1, 0x07, 0x41, 0xF8, 0x59, 0x56, 0x24, 0x17, 0xF1, 0x0F, 0x1F, 0xF8, 0xD1, 0x92, 0x00, 0xB0,
+    0x20, 0xC6, 0x4E, 0xBD, 0xF1, 0x07, 0x41, 0xF8, 0xAB, 0x58, 0x24, 0x17, 0xF1, 0x0F, 0x1F, 0xF8,
+    0xD1, 0x92, 0x00, 0xB0, 0x28, 0xC6, 0x4E, 0xBD, 0xF1, 0x07, 0x41, 0xF8, 0xA4, 0x5B, 0x24, 0x17,
+    0xF1, 0x0F, 0x1F, 0xF8, 0xD1, 0x92, 0x00, 0xB0, 0x21, 0xC6, 0x4E, 0xBD, 0xF1, 0x07, 0x41, 0xF8,
+    0x35, 0x6B, 0x24, 0x17, 0xF1, 0x0F, 0x1F, 0xF8, 0xD1, 0x92, 0x00, 0xB0, 0x28, 0xC2, 0x4E, 0xBD,
+    0xF1, 0x07, 0x41, 0xF8, 0x61, 0x33, 0xDC, 0x17, 0xF1, 0x0F, 0x1F, 0xF8, 0xD1, 0x92, 0x00, 0xB0,
+    0x29, 0xC6, 0x4E, 0xBD, 0xF1, 0x07, 0x41, 0xF8, 0x5D, 0x33, 0xDC, 0x17,
+};
+constexpr std::array<u8, 60> STEP_AMBIENT_SHADOW{
+    0xED, 0x3B, 0xBD, 0xA9, 0xEF, 0x43, 0x01, 0xA9, 0xFE, 0x13, 0x00, 0xF9, 0x8D, 0x0B, 0x01, 0x8B,
+    0xCE, 0x92, 0x00, 0xB0, 0x1F, 0x20, 0x03, 0xD5, 0x1F, 0x20, 0x03, 0xD5, 0xC0, 0xC1, 0x4E, 0xBD,
+    0x80, 0xFF, 0xFF, 0x97, 0x7A, 0x03, 0x0D, 0x0B, 0x00, 0x18, 0x40, 0xBD, 0xFE, 0x13, 0x40, 0xF9,
+    0xEF, 0x43, 0x41, 0xA9, 0xED, 0x3B, 0xC3, 0xA8, 0x60, 0xE3, 0x23, 0x17,
+};
+constexpr std::array<u8, 4> SHADOW_SITE_44939C_ORIGINAL{0x08, 0x11, 0x40, 0xBD}; // ldr s8, [x, #0x10]
+constexpr std::array<u8, 4> SHADOW_SITE_44939C_HOOK{0x99, 0xF4, 0xDF, 0x14};
+constexpr std::array<u8, 4> SHADOW_SITE_4493A0_ORIGINAL{0x09, 0x19, 0x40, 0xBD}; // ldr s9, [x, #0x18]
+constexpr std::array<u8, 4> SHADOW_SITE_4493A0_HOOK{0x9D, 0xF4, 0xDF, 0x14};
+constexpr std::array<u8, 4> SHADOW_SITE_53BC3C_ORIGINAL{0x08, 0x11, 0x40, 0xBD}; // ldr s8, [x, #0x10]
+constexpr std::array<u8, 4> SHADOW_SITE_53BC3C_HOOK{0x7B, 0x2A, 0xDC, 0x14};
+constexpr std::array<u8, 4> SHADOW_SITE_53E04C_ORIGINAL{0x0E, 0x19, 0x40, 0xBD}; // ldr s14, [x, #0x18]
+constexpr std::array<u8, 4> SHADOW_SITE_53E04C_HOOK{0x7C, 0x21, 0xDC, 0x14};
+constexpr std::array<u8, 4> SHADOW_SITE_55A728_ORIGINAL{0x08, 0x19, 0x40, 0xBD}; // ldr s8, [x, #0x18]
+constexpr std::array<u8, 4> SHADOW_SITE_55A728_HOOK{0xCA, 0xAF, 0xDB, 0x14};
+constexpr std::array<u8, 4> SHADOW_SITE_55BFD4_ORIGINAL{0x00, 0x19, 0x40, 0xBD}; // ldr s0, [x, #0x18]
+constexpr std::array<u8, 4> SHADOW_SITE_55BFD4_HOOK{0xA4, 0xA9, 0xDB, 0x14};
+constexpr std::array<u8, 4> SHADOW_SITE_55C930_ORIGINAL{0x00, 0x19, 0x40, 0xBD}; // ldr s0, [x, #0x18]
+constexpr std::array<u8, 4> SHADOW_SITE_55C930_HOOK{0x52, 0xA7, 0xDB, 0x14};
+constexpr std::array<u8, 4> SHADOW_SITE_55D528_ORIGINAL{0x08, 0x19, 0x40, 0xBD}; // ldr s8, [x, #0x18]
+constexpr std::array<u8, 4> SHADOW_SITE_55D528_HOOK{0x59, 0xA4, 0xDB, 0x14};
+constexpr std::array<u8, 4> SHADOW_SITE_561380_ORIGINAL{0x01, 0x19, 0x40, 0xBD}; // ldr s1, [x, #0x18]
+constexpr std::array<u8, 4> SHADOW_SITE_561380_HOOK{0xC8, 0x94, 0xDB, 0x14};
+constexpr std::array<u8, 4> SHADOW_SITE_3353444_ORIGINAL{0x08, 0x11, 0x40, 0xBD}; // ldr s8, [x, #0x10]
+constexpr std::array<u8, 4> SHADOW_SITE_3353444_HOOK{0x9C, 0xCC, 0x23, 0x14};
+constexpr std::array<u8, 4> SHADOW_SITE_3353448_ORIGINAL{0x09, 0x19, 0x40, 0xBD}; // ldr s9, [x, #0x18]
+constexpr std::array<u8, 4> SHADOW_SITE_3353448_HOOK{0xA0, 0xCC, 0x23, 0x14};
+
 constexpr std::array DYNAMIC_FPS_RECORDS{
     BuiltinPatchRecord{0x6E6CC4, DYNAMIC_FPS_CALL, DYNAMIC_FPS_ORIGINAL},
     BuiltinPatchRecord{0x3C46200, DYNAMIC_FPS_ROUTINE, {}, true},
@@ -512,13 +577,29 @@ constexpr std::array<u8, N> PadTo(const std::array<u8, M>& bytes) {
 // patch is applied. They start as the upstream records. Unused cave bytes stay zero.
 std::array<u8, 4> SOUND_ENTRY_WORD = SOUND_ENTRY_BRANCH;
 std::array<u8, 4> SOUND_STEP_WORD = SOUND_STEP_CALL;
-std::array<u8, 124> SOUND_GATE_BYTES = SOUND_GATE;
+std::array<u8, 144> SOUND_GATE_BYTES = PadTo<144>(SOUND_GATE);
+std::array<u8, 220> SOUND_SHADOW_LOADS_BYTES{};
+std::array<u8, 60> STEP_AMBIENT_BYTES = STEP_AMBIENT_ROUTINE;
+std::array<u8, 4> SHADOW_SITE_44939C_WORD = SHADOW_SITE_44939C_ORIGINAL;
+std::array<u8, 4> SHADOW_SITE_4493A0_WORD = SHADOW_SITE_4493A0_ORIGINAL;
+std::array<u8, 4> SHADOW_SITE_53BC3C_WORD = SHADOW_SITE_53BC3C_ORIGINAL;
+std::array<u8, 4> SHADOW_SITE_53E04C_WORD = SHADOW_SITE_53E04C_ORIGINAL;
+std::array<u8, 4> SHADOW_SITE_55A728_WORD = SHADOW_SITE_55A728_ORIGINAL;
+std::array<u8, 4> SHADOW_SITE_55BFD4_WORD = SHADOW_SITE_55BFD4_ORIGINAL;
+std::array<u8, 4> SHADOW_SITE_55C930_WORD = SHADOW_SITE_55C930_ORIGINAL;
+std::array<u8, 4> SHADOW_SITE_55D528_WORD = SHADOW_SITE_55D528_ORIGINAL;
+std::array<u8, 4> SHADOW_SITE_561380_WORD = SHADOW_SITE_561380_ORIGINAL;
+std::array<u8, 4> SHADOW_SITE_3353444_WORD = SHADOW_SITE_3353444_ORIGINAL;
+std::array<u8, 4> SHADOW_SITE_3353448_WORD = SHADOW_SITE_3353448_ORIGINAL;
 std::array<u8, 48> SOUND_FEED_BYTES = PadTo<48>(SOUND_FEED);
 std::array<u8, STEP_SHARED_SIZE> STEP_SHARED_BYTES = PadTo<STEP_SHARED_SIZE>(STEP_SHARED_ROUTINE);
 
 // EDEN_NX2_OOT_SOUND_GATE: unset or "1" = upstream's gate (#1660: the sound manager job at 60 Hz
 // above 60 fps); "0" = no gate and the raw step (before #1660); "feed" = no gate, every frame
-// max(step, 1); "whole" = no gate, every frame the whole steps of an accumulator (SOUND_FEED_WHOLE).
+// max(step, 1); "whole" = no gate, every frame the whole steps of an accumulator (SOUND_FEED_WHOLE);
+// "shadow" = the gate, and the job's own global step/frame-time loads see the gated step
+// (SOUND_GATE_SHADOW). Measured: "whole" runs the BGM manager's per-update volume ramps at the
+// frame rate (a 48-update fade took 0.46 s at 108 fps vs 0.80 s at 60 and with the gate).
 // EDEN_NX2_OOT_STEP_TABLE: unset or "0" = upstream's 16-slot step helper, "1" = the 256-slot one.
 bool SelectFpsUnlockVariant() {
     static const bool selected = [] {
@@ -529,6 +610,21 @@ bool SelectFpsUnlockVariant() {
             SOUND_STEP_WORD = SOUND_STEP_ORIGINAL;
             SOUND_GATE_BYTES = {};
             SOUND_FEED_BYTES = {};
+        } else if (mode == "shadow") {
+            SOUND_GATE_BYTES = SOUND_GATE_SHADOW;
+            SOUND_SHADOW_LOADS_BYTES = SOUND_SHADOW_LOADS;
+            STEP_AMBIENT_BYTES = STEP_AMBIENT_SHADOW;
+            SHADOW_SITE_44939C_WORD = SHADOW_SITE_44939C_HOOK;
+            SHADOW_SITE_4493A0_WORD = SHADOW_SITE_4493A0_HOOK;
+            SHADOW_SITE_53BC3C_WORD = SHADOW_SITE_53BC3C_HOOK;
+            SHADOW_SITE_53E04C_WORD = SHADOW_SITE_53E04C_HOOK;
+            SHADOW_SITE_55A728_WORD = SHADOW_SITE_55A728_HOOK;
+            SHADOW_SITE_55BFD4_WORD = SHADOW_SITE_55BFD4_HOOK;
+            SHADOW_SITE_55C930_WORD = SHADOW_SITE_55C930_HOOK;
+            SHADOW_SITE_55D528_WORD = SHADOW_SITE_55D528_HOOK;
+            SHADOW_SITE_561380_WORD = SHADOW_SITE_561380_HOOK;
+            SHADOW_SITE_3353444_WORD = SHADOW_SITE_3353444_HOOK;
+            SHADOW_SITE_3353448_WORD = SHADOW_SITE_3353448_HOOK;
         } else if (mode == "feed" || mode == "whole") {
             SOUND_ENTRY_WORD = SOUND_ENTRY_ORIGINAL;
             SOUND_GATE_BYTES = {};
@@ -556,6 +652,18 @@ constexpr std::array FPS_UNLOCK_RECORDS{
     BuiltinPatchRecord{0x415300, SOUND_ENTRY_WORD, SOUND_ENTRY_ORIGINAL},
     BuiltinPatchRecord{0x415334, SOUND_STEP_WORD, SOUND_STEP_ORIGINAL},
     BuiltinPatchRecord{0x3C46800, SOUND_GATE_BYTES, {}, true},
+    BuiltinPatchRecord{0x3C46600, SOUND_SHADOW_LOADS_BYTES, {}, true},
+    BuiltinPatchRecord{0x44939C, SHADOW_SITE_44939C_WORD, SHADOW_SITE_44939C_ORIGINAL},
+    BuiltinPatchRecord{0x4493A0, SHADOW_SITE_4493A0_WORD, SHADOW_SITE_4493A0_ORIGINAL},
+    BuiltinPatchRecord{0x53BC3C, SHADOW_SITE_53BC3C_WORD, SHADOW_SITE_53BC3C_ORIGINAL},
+    BuiltinPatchRecord{0x53E04C, SHADOW_SITE_53E04C_WORD, SHADOW_SITE_53E04C_ORIGINAL},
+    BuiltinPatchRecord{0x55A728, SHADOW_SITE_55A728_WORD, SHADOW_SITE_55A728_ORIGINAL},
+    BuiltinPatchRecord{0x55BFD4, SHADOW_SITE_55BFD4_WORD, SHADOW_SITE_55BFD4_ORIGINAL},
+    BuiltinPatchRecord{0x55C930, SHADOW_SITE_55C930_WORD, SHADOW_SITE_55C930_ORIGINAL},
+    BuiltinPatchRecord{0x55D528, SHADOW_SITE_55D528_WORD, SHADOW_SITE_55D528_ORIGINAL},
+    BuiltinPatchRecord{0x561380, SHADOW_SITE_561380_WORD, SHADOW_SITE_561380_ORIGINAL},
+    BuiltinPatchRecord{0x3353444, SHADOW_SITE_3353444_WORD, SHADOW_SITE_3353444_ORIGINAL},
+    BuiltinPatchRecord{0x3353448, SHADOW_SITE_3353448_WORD, SHADOW_SITE_3353448_ORIGINAL},
     BuiltinPatchRecord{0x3C46280, SOUND_FEED_BYTES, {}, true},
     BuiltinPatchRecord{0xA68300, STEP_HUD_HOOK, STEP_HUD_ORIGINAL},
     BuiltinPatchRecord{0x3C46900, STEP_HUD_ROUTINE, {}, true},
@@ -564,7 +672,7 @@ constexpr std::array FPS_UNLOCK_RECORDS{
     BuiltinPatchRecord{0x2F53268, STEP_HITSTOP_HOOK, STEP_HITSTOP_ORIGINAL},
     BuiltinPatchRecord{0x3C46950, STEP_HITSTOP_ROUTINE, {}, true},
     BuiltinPatchRecord{0x53F914, STEP_AMBIENT_HOOK, STEP_AMBIENT_ORIGINAL},
-    BuiltinPatchRecord{0x3C46B60, STEP_AMBIENT_ROUTINE, {}, true},
+    BuiltinPatchRecord{0x3C46B60, STEP_AMBIENT_BYTES, {}, true},
     BuiltinPatchRecord{0x3C46980, STEP_SHARED_BYTES, {}, true},
     BuiltinPatchRecord{0x13A070, GROUND_VELOCITY_NOP, GROUND_VELOCITY_ORIGINAL_A},
     BuiltinPatchRecord{0x13D710, GROUND_VELOCITY_NOP, GROUND_VELOCITY_ORIGINAL_B},
@@ -778,6 +886,7 @@ constexpr std::array FPS_UNLOCK_STATES{
     BuiltinPatchState{0x4E9FE00, 0xA8},
     BuiltinPatchState{0x4E9EE00, 0x110},
     BuiltinPatchState{STEP_TABLE_OFFSET, STEP_TABLE_SIZE},
+    BuiltinPatchState{0x4E9FEC0, 0x8}, // shadow step and frame time (SOUND_GATE_SHADOW)
 };
 
 // Text speed (port of NotRexed/Hookshot#402): main+0xAFE140 steps a text pane's letter

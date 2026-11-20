@@ -27,12 +27,12 @@ bool CallNx2OotProbe(Core::System& system, u32 imm);
 /// The main offsets EDEN_NX2_OOT_PROBE lists, in order (probe i's cave: Nx2OotProbeCave(i)).
 std::vector<u64> Nx2OotProbeOffsets();
 
-// Two runs of the text's zero padding that no built-in uses: 48 + 48 caves of 16 bytes.
+// Two runs of the text's zero padding that no built-in uses: 48 + 16 caves of 16 bytes.
 constexpr u64 kNx2OotProbeCave = 0x3C46C00;
 constexpr u64 kNx2OotProbeCaveEnd = 0x3C46F00;
 constexpr u64 kNx2OotProbeCave2 = 0x3C46500; // after FPS Unlock's solver-steps hooks (0x3C46400..0x3C464FC)
-constexpr u64 kNx2OotProbeCave2End = 0x3C46800;
-constexpr size_t kNx2OotProbeMax = 96;
+constexpr u64 kNx2OotProbeCave2End = 0x3C46600; // 0x3C46600.. = SOUND_SHADOW_LOADS
+constexpr size_t kNx2OotProbeMax = 64;
 constexpr u32 kNx2OotProbeSvc = 0xF4;
 constexpr u32 kNx2OotProbeTag = 0x0F4E0000;
 
