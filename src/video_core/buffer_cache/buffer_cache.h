@@ -366,11 +366,12 @@ bool BufferCache<P>::OnCPUWrite(DAddr device_addr, u64 size) {
     return false;
 }
 
-/// EDEN_NX2_READ_WIDEN=<KiB>: DownloadMemoryForRead's reach on each side of a read (0: off).
+/// EDEN_NX2_READ_WIDEN=<KiB>: DownloadMemoryForRead's reach on each side of a read (0: off,
+/// default 2048: Fortune's Weave's read bursts, measured by fe60 at 60 and 30 fps).
 inline u64 Nx2ReadWidenBytes() {
     static const u64 bytes = [] {
         const char* value = std::getenv("EDEN_NX2_READ_WIDEN");
-        return value != nullptr ? std::strtoull(value, nullptr, 10) * 1024 : u64{0};
+        return (value != nullptr ? std::strtoull(value, nullptr, 10) : u64{2048}) * 1024;
     }();
     return bytes;
 }
