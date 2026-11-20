@@ -435,116 +435,6 @@ std::vector<const char*> ExtensionListForVulkan(
     return output;
 }
 
-// EDEN_NX2_VK_PRIORITY=low|medium|high: create the device queues with that global priority
-// (VK_KHR_global_priority, else VK_EXT_global_priority; RADV maps it to the amdgpu context
-// priority, LOW needs no privileges). Unset (or anything else): queues as before. Falls back to
-// the default when the requested level isn't listed for a queue family or creation is refused
-// with VK_ERROR_NOT_PERMITTED. Logs one line with the outcome.
-vk::Device CreateDeviceWithGlobalPriority(VkInstance instance, const vk::InstanceDispatch& dld,
-                                          vk::PhysicalDevice physical,
-                                          std::vector<VkDeviceQueueCreateInfo> queue_cis,
-                                          const std::set<std::string, std::less<>>& supported,
-                                          std::vector<const char*> extension_list,
-                                          const void* next, vk::DeviceDispatch& dispatch) {
-    const char* const env = std::getenv("EDEN_NX2_VK_PRIORITY");
-    const std::string_view value = env != nullptr ? env : "";
-    VkQueueGlobalPriorityKHR requested{};
-    if (value == "low") {
-        requested = VK_QUEUE_GLOBAL_PRIORITY_LOW_KHR;
-    } else if (value == "medium") {
-        requested = VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR;
-    } else if (value == "high") {
-        requested = VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR;
-    } else {
-        if (!value.empty()) {
-            LOG_INFO(Render_Vulkan, "NX2 VK priority: EDEN_NX2_VK_PRIORITY={} ignored, default",
-                     value);
-        }
-        return vk::Device::Create(physical, queue_cis, extension_list, next, dispatch);
-    }
-    const auto name_of = [](VkQueueGlobalPriorityKHR p) -> std::string_view {
-        switch (p) {
-        case VK_QUEUE_GLOBAL_PRIORITY_LOW_KHR: return "low";
-        case VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR: return "medium";
-        case VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR: return "high";
-        case VK_QUEUE_GLOBAL_PRIORITY_REALTIME_KHR: return "realtime";
-        default: return "?";
-        }
-    };
-    const char* ext = nullptr;
-    if (supported.contains(VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME)) {
-        ext = VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME;
-    } else if (supported.contains(VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME)) {
-        ext = VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME;
-    }
-    // Priorities each used queue family lists (needs the KHR extension or the EXT query one).
-    std::string listed = "unknown";
-    bool listed_ok = true;
-    const auto get_props2 = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties2>(
-        dld.vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceQueueFamilyProperties2"));
-    if (ext != nullptr && get_props2 != nullptr &&
-        (supported.contains(VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME) ||
-         supported.contains(VK_EXT_GLOBAL_PRIORITY_QUERY_EXTENSION_NAME))) {
-        u32 count = 0;
-        get_props2(physical, &count, nullptr);
-        std::vector<VkQueueFamilyGlobalPriorityPropertiesKHR> prio(
-            count, VkQueueFamilyGlobalPriorityPropertiesKHR{
-                       .sType = VK_STRUCTURE_TYPE_QUEUE_FAMILY_GLOBAL_PRIORITY_PROPERTIES_KHR});
-        std::vector<VkQueueFamilyProperties2> props(count);
-        for (u32 i = 0; i < count; ++i) {
-            props[i] = {.sType = VK_STRUCTURE_TYPE_QUEUE_FAMILY_PROPERTIES_2, .pNext = &prio[i]};
-        }
-        get_props2(physical, &count, props.data());
-        listed.clear();
-        for (const auto& ci : queue_cis) {
-            if (ci.queueFamilyIndex >= count) {
-                listed_ok = false;
-                continue;
-            }
-            const auto& p = prio[ci.queueFamilyIndex];
-            bool has = false;
-            listed += fmt::format("{}q{}:", listed.empty() ? "" : " ", ci.queueFamilyIndex);
-            for (u32 j = 0; j < p.priorityCount && j < VK_MAX_GLOBAL_PRIORITY_SIZE_KHR; ++j) {
-                listed += fmt::format("{}{}", j == 0 ? "" : ",", name_of(p.priorities[j]));
-                has |= p.priorities[j] == requested;
-            }
-            listed_ok &= has;
-        }
-    }
-    const auto log = [&](std::string_view outcome) {
-        LOG_INFO(Render_Vulkan,
-                 "NX2 VK priority: requested={} extension={} supported=[{}] applied={}",
-                 name_of(requested), ext != nullptr ? ext : "none", listed, outcome);
-    };
-    if (ext == nullptr || !listed_ok) {
-        log(ext == nullptr ? "no (extension missing)" : "no (level not listed)");
-        return vk::Device::Create(physical, queue_cis, extension_list, next, dispatch);
-    }
-    std::vector<VkDeviceQueueGlobalPriorityCreateInfoKHR> prio_cis(queue_cis.size());
-    auto prio_queue_cis = queue_cis;
-    for (size_t i = 0; i < queue_cis.size(); ++i) {
-        prio_cis[i] = {
-            .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR,
-            .pNext = queue_cis[i].pNext,
-            .globalPriority = requested,
-        };
-        prio_queue_cis[i].pNext = &prio_cis[i];
-    }
-    auto prio_extensions = extension_list;
-    prio_extensions.push_back(ext);
-    try {
-        auto device = vk::Device::Create(physical, prio_queue_cis, prio_extensions, next, dispatch);
-        log("yes");
-        return device;
-    } catch (const vk::Exception& e) {
-        if (e.GetResult() != VK_ERROR_NOT_PERMITTED_KHR) {
-            throw;
-        }
-    }
-    log("no (VK_ERROR_NOT_PERMITTED, default)");
-    return vk::Device::Create(physical, queue_cis, extension_list, next, dispatch);
-}
-
 constexpr u32 NvidiaDriverVersion(u32 major, u32 minor, u32 secondary) {
     return (major << 22) | (minor << 14) | (secondary << 6);
 }
@@ -1090,9 +980,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         }
     }
 #endif
-    logical = CreateDeviceWithGlobalPriority(instance, dld, physical, queue_cis, supported_extensions,
-                                             ExtensionListForVulkan(loaded_extensions), first_next,
-                                             dld);
+    logical = vk::Device::Create(physical, queue_cis, ExtensionListForVulkan(loaded_extensions), first_next, dld);
 
     graphics_queue = logical.GetQueue(graphics_family);
     present_queue = logical.GetQueue(present_family);
