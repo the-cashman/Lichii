@@ -681,15 +681,6 @@ private:
     /// Records the render targets the current clear writes whole (ImageBase::full_write_tick).
     void NoteWholeClears();
 
-    /// Touches the image's LRU entry with the frame tick unless it holds it already: every
-    /// PrepareImage touches, and reading the entry again in the same frame was a cache miss.
-    void TouchLru(ImageBase& image) noexcept {
-        if (image.lru_tick != frame_tick) {
-            image.lru_tick = frame_tick;
-            lru_cache.Touch(image.lru_index, frame_tick);
-        }
-    }
-
     /// Find or create an image view in the guest descriptor table
     ImageViewId VisitImageView(u32 index, bool compute);
 

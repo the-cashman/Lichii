@@ -5598,7 +5598,8 @@ std::pair<u32, u32> TextureCache<P>::PrepareDmaImage(ImageId dst_id, GPUVAddr ba
     const auto& image = slot_images[dst_id];
     const auto base = image.TryFindBase(base_addr);
     PrepareImage(dst_id, mark_as_modified, false);
-    TouchLru(slot_images[dst_id]);
+    const auto& new_image = slot_images[dst_id];
+    lru_cache.Touch(new_image.lru_index, frame_tick);
     return std::make_pair(base->level, base->layer);
 }
 
@@ -5998,7 +5999,6 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
     image.address_space = current_address_space;
     total_used_memory += ImageMemoryBytes(slot_images[image_id]);
     image.lru_index = lru_cache.Insert(image_id, frame_tick);
-    image.lru_tick = frame_tick;
 
     ForEachGPUPage(image.gpu_addr, image.guest_size_bytes, [this, image_id](u64 page) {
         (*channel_state->gpu_page_table)[page].push_back(image_id);
@@ -6542,7 +6542,7 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
             image.first_written_frame = frame_tick + 1;
         }
     }
-    TouchLru(image);
+    lru_cache.Touch(image.lru_index, frame_tick);
     image.last_use_frame = frame_tick;
 }
 

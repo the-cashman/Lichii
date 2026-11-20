@@ -157,8 +157,6 @@ struct ImageBase {
         first_written_frame = 0;
     }
     size_t lru_index = SIZE_MAX;
-    /// The tick lru_index's entry was last inserted or touched with (TouchLru).
-    u64 lru_tick = 0;
 
     std::array<u32, MAX_MIP_LEVELS> mip_level_offsets{};
 
