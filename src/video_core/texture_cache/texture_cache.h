@@ -1554,9 +1554,11 @@ void TextureCache<P>::EvictDeadRenderTargets() {
             const auto copies = FullDownloadCopies(image.info);
             image.DownloadMemory(map, copies);
             runtime.Finish();
-            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span,
-                         swizzle_data_buffer);
-            ClearStaleImage(image);
+            // [castle] our tree writes back through the image's own address space (WriteBackImage
+            // also clears its stale pages); where that isn't known, it's marked stale instead.
+            if (!WriteBackImage(image, copies, map.mapped_span)) {
+                MarkStale(image);
+            }
             ++saved;
             ++evict_saved;
             saved_this = true;
