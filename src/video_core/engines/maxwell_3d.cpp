@@ -665,6 +665,16 @@ void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument
 namespace {
 
 // Executable methods the draw manager does nothing for (ProcessDirtyRegisters is all they do).
+// Lichii #2272: CallMethodFast and CallMethodSlow send the store-only executable methods to the
+// state register path, so a write of the value they hold is dropped like any same-value state
+// write. Not while a deferred instanced draw waits: a topology_override write (not an instance
+// loop method) must still flush it, as before. EDEN_NX2_STORE_ONLY_SKIP=1 turns it on (off by
+// default here).
+const bool g_store_only_skip = [] {
+    const char* value = std::getenv("EDEN_NX2_STORE_ONLY_SKIP");
+    return value != nullptr && value[0] == '1';
+}();
+
 bool IsStoreOnlyExecutable(u32 method) {
     switch (method) {
     case MAXWELL3D_REG_INDEX(vertex_buffer.first):
@@ -683,7 +693,7 @@ bool IsStoreOnlyExecutable(u32 method) {
 // no write history, trace or profile, not a macro call or SET_SHADOW_RAM_CONTROL. The hot
 // executable methods go straight to their handler.
 void Maxwell3D::CallMethodFast(u32 method, u32 method_argument, bool is_last_call) {
-    if (!execution_mask[method]) {
+    if (!execution_mask[method] || (g_store_only_skip && IsStoreOnlyExecutable(method) && !draw_manager.HasDeferredDraw())) {
         return WriteStateRegister(method, method_argument);
     }
     const u32 argument = ProcessShadowRam(method, method_argument);
@@ -874,7 +884,7 @@ void Maxwell3D::CallMethodSlow(Core::System& system, u32 method, u32 method_argu
     // million 3D register writes a second, ~60% of them same-value, most from macro replays.
     // Methods with side effects (execution_mask: draws, clears, constant buffer data and
     // binds, semaphores, ...) always run. EDEN_NX2_SKIP_SAME=0 turns it off.
-    if (!execution_mask[method]) {
+    if (!execution_mask[method] || (g_store_only_skip && IsStoreOnlyExecutable(method) && !draw_manager.HasDeferredDraw())) {
         // ProcessMethodCall (and the draw manager behind it) acts only on executable methods.
         if (!SkipSameValueWrites() || regs.reg_array[method] != argument) {
             ProcessDirtyRegisters(method, argument);
