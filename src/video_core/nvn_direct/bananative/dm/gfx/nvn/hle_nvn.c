@@ -957,9 +957,16 @@ void nvn_wait_stats(uint64_t present_ns) {
     static int every; if (++every % 10 == 0) { void mtl_pso_line(char *out, size_t n); char pl[1024]; mtl_pso_line(pl, sizeof pl); LOG("[nvn] pipelines: %s", pl); }
     t_last = t; frames = 0; pres_ns = 0; s0 = s; f0 = f; x0 = x;
 }
+#if defined(_WIN32)
+__declspec(dllimport) unsigned long __stdcall GetCurrentThreadId(void);
+static unsigned long nvn_sync_log_thread_id(void) { return (unsigned long)GetCurrentThreadId(); }
+#else
+#include <pthread.h>
+static unsigned long nvn_sync_log_thread_id(void) { return (unsigned long)pthread_self(); }
+#endif
 NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     const sync_t *o = (const sync_t *)s;
-    if (sync_log()) { __declspec(dllimport) unsigned long __stdcall GetCurrentThreadId(void); int pre = o->fenced && o->fence ? (o->fenced == 2 ? mtl_wait_acq : mtl_wait)(o->fence, 0) : -1; LOG("[nvn] sync log: SyncWait sync %p fenced %d fence %llu timeout %llu (done before %d) thread %lu", (void *)s, o->fenced, (unsigned long long)o->fence, (unsigned long long)timeout, pre, (unsigned long)GetCurrentThreadId()); }
+    if (sync_log()) { int pre = o->fenced && o->fence ? (o->fenced == 2 ? mtl_wait_acq : mtl_wait)(o->fence, 0) : -1; LOG("[nvn] sync log: SyncWait sync %p fenced %d fence %llu timeout %llu (done before %d) thread %lu", (void *)s, o->fenced, (unsigned long long)o->fence, (unsigned long long)timeout, pre, nvn_sync_log_thread_id()); }
     if (!o->fenced) return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
     int (*w)(uint64_t, uint64_t) = o->fenced == 2 ? mtl_wait_acq : mtl_wait;
     if (w(o->fence, 0)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
