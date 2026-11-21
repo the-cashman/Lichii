@@ -223,9 +223,6 @@ struct GPU::Impl {
             auto request = std::move(sync_requests.front());
             sync_requests.pop_front();
             sync_request_mutex.unlock();
-            if (VideoCommon::GpuSplit::OnBackThread()) {
-                VideoCommon::GpuSplit::Get().WaitRender();
-            }
             VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::TickWork);
             request();
             current_sync_fence.fetch_add(1, std::memory_order_release);

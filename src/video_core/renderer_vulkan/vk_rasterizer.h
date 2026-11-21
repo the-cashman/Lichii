@@ -7,17 +7,14 @@
 
 #include <array>
 #include <optional>
-#include <source_location>
 #include <string_view>
 #include <unordered_set>
-#include <vector>
 
 #include <boost/container/static_vector.hpp>
 
 #include "common/common_types.h"
 #include "common/dkb_cpu_trace.h"
 #include "common/dkb_frame_trace.h"
-#include "common/unique_function.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
@@ -208,8 +205,7 @@ private:
     static constexpr VkDeviceSize DEFAULT_BUFFER_SIZE = 4 * sizeof(float);
 
     template <typename Func>
-    void PrepareDraw(bool is_indexed, Func&&, bool is_indirect = false,
-                     std::optional<u32> direct_instances = std::nullopt);
+    void PrepareDraw(bool is_indexed, Func&&, bool is_indirect = false);
 
     void CaptureIndirectTrace();
     void CollectIndirectTrace();
@@ -229,13 +225,6 @@ private:
     /// Records the dynamic state of the draw being prepared with `pipeline` (null for
     /// DrawTexture's blit).
     void UpdateDynamicStates(const GraphicsPipeline* pipeline);
-
-    using DynamicCommands = std::vector<Common::UniqueFunction<void, const vk::CommandBuffer&>>;
-    DynamicCommands* dynamic_commands{};
-
-    template <typename F>
-    void RecordDynamic(F&& command,
-                       std::source_location location = std::source_location::current());
 
     void HandleTransformFeedback();
 

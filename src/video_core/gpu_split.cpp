@@ -23,7 +23,6 @@
 #include <cstring>
 #include <string>
 
-#include "common/assert.h"
 #include "common/dkb_cpu_trace.h"
 #include "common/logging.h"
 #include "common/settings.h"
@@ -54,6 +53,8 @@ void Pause() {
     std::this_thread::yield();
 #endif
 }
+
+[[maybe_unused]] std::atomic<u32> g_back_thread_id{};
 
 BackIdleTrace::FrontState WaitState(DrainSite site) {
     return site == DrainSite::ListWriters || site == DrainSite::ListCopies ||
@@ -89,11 +90,15 @@ private:
 } // Anonymous namespace
 
 void GpuSplit::CheckOwner(const char* where) {
-    if (!instance.BackRunning() || OwnsScheduler()) {
+#ifdef _WIN32
+    // Also while the back is idle: its idle hook submits (Scheduler::FlushDeferred).
+    if (!instance.back_running.load(std::memory_order_acquire)) {
         return;
     }
-#ifdef _WIN32
     const DWORD thread = GetCurrentThreadId();
+    if (thread == g_back_thread_id.load(std::memory_order_relaxed)) {
+        return;
+    }
     static std::atomic<u32> reports{};
     if (reports.fetch_add(1) >= 12) {
         return;
@@ -114,9 +119,13 @@ void GpuSplit::CheckOwner(const char* where) {
                              reinterpret_cast<uintptr_t>(frames[i]) -
                                  reinterpret_cast<uintptr_t>(module));
     }
-    LOG_ERROR(HW_GPU, "GPU split owner check: {} on thread {} without scheduler ownership; stack:{}",
+    LOG_ERROR(HW_GPU, "GPU split owner check: {} on thread {} while the back runs; stack:{}",
               where, thread, stack);
 #else
+    // Also while the back is idle: its idle hook submits (Scheduler::FlushDeferred).
+    if (on_back_thread || !instance.back_running.load(std::memory_order_acquire)) {
+        return;
+    }
     static std::atomic<u32> reports{};
     if (reports.fetch_add(1) >= 12) {
         return;
@@ -132,7 +141,7 @@ void GpuSplit::CheckOwner(const char* where) {
         std::free(symbols);
     }
 #endif
-    LOG_ERROR(HW_GPU, "GPU split owner check: {} without scheduler ownership; stack:{}", where,
+    LOG_ERROR(HW_GPU, "GPU split owner check: {} on a thread other than the back; stack:{}", where,
               stack);
 #endif
 }
@@ -174,13 +183,6 @@ void GpuSplit::MaybeStart(Core::System& system_) {
                          std::getenv("EDEN_NX2_GUEST_THREAD_STATS") != nullptr;
     ring = std::make_unique<u64[]>(RingWords);
     ++starts; // Before the back starts: its holds name entries with it (EntryTag)
-    if (render_follower_supported) {
-        render_overlap_entries = 0;
-        render_joins = 0;
-        render_follower.emplace();
-        render_thread = std::jthread([this] { RenderLoop(); });
-        LOG_INFO(HW_GPU, "GPU render follower: enabled");
-    }
     back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
     active = true;
     const char* jit = std::getenv("EDEN_NX2_MME_JIT");
@@ -197,11 +199,6 @@ void GpuSplit::Stop() {
     wake.fetch_add(1, std::memory_order_seq_cst);
     wake.notify_one();
     back_thread.join();
-    if (render_follower) {
-        render_follower->Publish({});
-        render_thread.join();
-        render_follower.reset();
-    }
     active = false;
     // The split is static and outlives the emulation session. The next session's back thread
     // starts reading at 0: with the old positions kept it skipped through the new, empty ring a
@@ -457,9 +454,6 @@ std::optional<GpuSplit::SettledWord> GpuSplit::SettledWordAt(const Tegra::Memory
 
 GpuSplit::FencedHold GpuSplit::TrackFencedWrite() {
     if (!on_back_thread) {
-        if (check_owner && on_render_thread) {
-            LOG_ERROR(HW_GPU, "GPU split owner check: render packet tried to publish a fence hold");
-        }
         return {};
     }
     std::scoped_lock lock{fenced_mutex};
@@ -819,26 +813,13 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         back_engine = reinterpret_cast<Tegra::Engines::EngineInterface*>(entry[1]);
         return 2;
     case Kind::Method: {
-        using Tegra::Engines::Maxwell3D;
         const u32 method = static_cast<u32>((head >> 8) & 0xffff);
         const u32 argument = static_cast<u32>(head >> 32);
         auto* const engine = back_engine;
-        if (render_follower && method == MAXWELL3D_REG_INDEX(draw.end) &&
-            engine->reports_fast_draw_breaks) {
-            auto* const maxwell3d = static_cast<Maxwell3D*>(engine);
-            maxwell3d->ConsumeSink(*system);
-            if ((head & HasSegment) != 0) {
-                maxwell3d->current_dma_segment = entry[1];
-            }
-            render_terminal_draw = true;
-            const Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
-            maxwell3d->CallMethod(*system, method, argument, (head & (Direct | IsLast)) != 0);
-            render_terminal_draw = false;
-            return (head & HasSegment) != 0 ? 2 : 1;
-        }
         if (engine->fast_maxwell3d) {
             // Nx2Perf: as below without the profile zones (off with fast_maxwell3d) and the
             // virtual call.
+            using Tegra::Engines::Maxwell3D;
             auto* const maxwell3d = static_cast<Maxwell3D*>(engine);
             constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
             if (method - cb_data < 16 && (head & HasSegment) == 0) {
@@ -940,68 +921,6 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
     return 1;
 }
 
-void GpuSplit::PostRender(Nx2RenderFollower::Work work) {
-    ASSERT(CanPostRender());
-    render_follower->Publish(std::move(work));
-}
-
-void GpuSplit::WaitRender() {
-    if (on_back_thread && RenderPending()) {
-        ++render_joins;
-        const Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
-        render_follower->Wait();
-    }
-}
-
-bool GpuSplit::CanOverlapRender(u64 entry) const {
-    const auto kind = static_cast<Kind>(entry & 0xf);
-    if (kind == Kind::Wrap || kind == Kind::Engine) {
-        return true;
-    }
-    if (kind != Kind::State || !back_engine->method_sink.empty()) {
-        return false;
-    }
-    const auto& engine = *static_cast<Tegra::Engines::Maxwell3D*>(back_engine);
-    return !engine.draw_manager.HasDeferredDraw();
-}
-
-void GpuSplit::RenderLoop() {
-    Common::SetCurrentThreadName("GPURender");
-    system->RegisterHostThread();
-    on_render_thread = true;
-    const bool profile = Nx2Profile::Enabled();
-    const auto cpu_start = profile ? Common::CurrentThreadCpuTimeNs() : std::nullopt;
-    u64 packets{};
-    Nx2Profile::Report("GPU render thread");
-    for (;;) {
-        auto work = [&] {
-            const Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
-            return render_follower->Take();
-        }();
-        if (!work) {
-            break;
-        }
-        work();
-        work = {};
-        render_follower->Retire();
-        ++packets;
-        Nx2Profile::Report("GPU render thread");
-    }
-    if (profile) {
-        const auto cpu_end = Common::CurrentThreadCpuTimeNs();
-        if (cpu_start && cpu_end) {
-            LOG_INFO(HW_GPU,
-                     "GPU render follower: {} packets, {} overlapping entries, {} joins, "
-                     "{:.3f} ms thread CPU",
-                     packets, render_overlap_entries, render_joins,
-                     static_cast<double>(*cpu_end - *cpu_start) / 1e6);
-        }
-    } else {
-        LOG_INFO(HW_GPU, "GPU render follower: {} packets, {} overlapping entries, {} joins",
-                 packets, render_overlap_entries, render_joins);
-    }
-}
-
 void GpuSplit::BackLoop(std::stop_token stop_token) {
     const Common::DkbCpuTrace::Registration cpu_trace{Common::DkbCpuTrace::Role::GpuBack};
     const StutterTrace::ThreadScope stutter_thread{StutterTrace::Thread::Back};
@@ -1014,6 +933,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         Common::PinCurrentThread(Common::PinnedRole::GpuBack);
     }
     system->RegisterHostThread();
+#ifdef _WIN32
+    g_back_thread_id.store(GetCurrentThreadId(), std::memory_order_relaxed);
+#endif
     u64 read_position = 0;
     const bool idle_trace = BackIdleTrace::Enabled();
     u64 idle_since = 0;
@@ -1081,20 +1003,12 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         back_quiet.store(false, std::memory_order_seq_cst);
         while (read_position != available) {
             const size_t index = read_position & RingMask;
-            if (RenderPending()) {
-                if (CanOverlapRender(ring[index])) {
-                    ++render_overlap_entries;
-                } else {
-                    WaitRender();
-                }
-            }
             back_entry_start = read_position;
             const size_t size =
                 Execute(&ring[index], std::min<u64>(available - read_position, RingWords - index));
             read_position += size != 0 ? size : RingWords - index;
             if (hook_requested.load(std::memory_order_relaxed) &&
                 idle_hook != nullptr) [[unlikely]] {
-                WaitRender();
                 hook_requested.store(false, std::memory_order_seq_cst);
                 idle_hook(idle_argument);
             }
@@ -1103,19 +1017,16 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             if ((read_position - last_store >= 4096 ||
                  read_position >= wait_target.load(std::memory_order_relaxed)) &&
                 read_position != available) {
-                WaitRender();
                 SealFencedEntries(read_position);
                 consumed.store(read_position, std::memory_order_seq_cst);
                 last_store = read_position;
                 NotifyFront();
             }
         }
-        WaitRender();
         SealFencedEntries(read_position);
         consumed.store(read_position, std::memory_order_seq_cst);
         NotifyFront();
     }
-    WaitRender();
     back_running.store(false, std::memory_order_seq_cst);
     front_wake.fetch_add(1, std::memory_order_seq_cst);
     front_wake.notify_all();
