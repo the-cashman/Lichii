@@ -669,8 +669,8 @@ private:
 
     void OnGPUASRegister(size_t map_id) final override;
 
-    /// Runs the Garbage Collector; at_critical collects as if usage were at the critical threshold.
-    void RunGarbageCollector(bool out_of_memory, bool at_critical);
+    /// Runs the Garbage Collector.
+    void RunGarbageCollector(bool out_of_memory);
 
     /// Deletes images whose memory went entirely to newer images (see ClassifySuperseded).
     void DeleteSupersededImages();
