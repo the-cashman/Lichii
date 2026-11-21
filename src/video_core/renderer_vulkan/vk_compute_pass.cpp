@@ -964,10 +964,13 @@ void ASTCDecoderPass::FlushPending() {
     if (queued_decodes == 0) {
         return;
     }
-    // Present already called Scheduler::Flush on this command buffer. Another submit here
-    // would be empty, or would ship whatever the present itself recorded after that flush.
+    // Present already called Scheduler::Flush on this command buffer. Another Flush would be
+    // empty. Finish mode still waits: the decode was asked to idle the host GPU.
     if (!scheduler.RecordedSinceSubmit()) {
         queued_decodes = 0;
+        if (!AstcFlushOnly()) {
+            scheduler.Finish();
+        }
         return;
     }
     SubmitQueuedDecodes();
