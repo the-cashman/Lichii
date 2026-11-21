@@ -795,7 +795,8 @@ TEST_CASE("Built-in FPS Unlock leaves a solver store changed by a user mod alone
     REQUIRE(WordAt(patched, HudHookOffset) == HudHookInstruction);
     REQUIRE(WordAt(patched, site.offset) == SolverCutInstruction);
     REQUIRE(WordAt(patched, site.offset + sizeof(u32)) == NopInstruction);
-    REQUIRE(WordAt(patched, site.cave) == 0);
+    REQUIRE(std::equal(nso.begin() + site.cave, nso.begin() + site.cave + SolverRoutineSize,
+                       patched.begin() + site.cave));
     REQUIRE(WordAt(patched, SolverSites[1].offset) == SolverSites[1].to_cave);
 }
 
@@ -1068,6 +1069,69 @@ TEST_CASE("Built-in FPS Unlock leaves all records alone when a user mod changes 
     REQUIRE(context.Manager().PatchNSO(nso, "main") == expected);
 }
 
+TEST_CASE("FPS Unlock guards the Deku Tree floor web carry", "[patch_manager][oot_carry]") {
+    constexpr size_t Site = sizeof(Loader::NSOHeader) + 0x632D00;
+    constexpr size_t Entry = sizeof(Loader::NSOHeader) + 0x177E244;
+    constexpr size_t LastWord = sizeof(Loader::NSOHeader) + 0x177E57C;
+    constexpr size_t State = sizeof(Loader::NSOHeader) + 0x4E9D100;
+    constexpr u32 Original = 0x1E380016;
+    constexpr u32 Branch = 0x14452D51;
+    auto nso = MakeDynamicMain();
+    std::memcpy(nso.data() + Site, &Original, sizeof(Original));
+    std::optional<u32> mod;
+    bool installs = false;
+    bool unlock = true;
+    bool disable_fps = false;
+    std::string_view cheat;
+    SECTION("Matching build, instructions and padding") {
+        installs = true;
+    }
+    SECTION("Different build") {
+        nso[offsetof(Loader::NSOHeader, build_id)] ^= 1;
+        unlock = false;
+    }
+    SECTION("Changed original instruction") {
+        nso[Site] ^= 1;
+    }
+    SECTION("Occupied final alignment slot") {
+        nso[LastWord + 3] = 1;
+    }
+    SECTION("Occupied BSS") {
+        nso[State + 135] = 1;
+    }
+    SECTION("IPS uses the final alignment slot") {
+        mod = NopInstruction;
+    }
+    SECTION("A static cheat writes the BSS remainder") {
+        cheat = "[Carry overlap]\n04000000 04E9D140 00000000\n";
+    }
+    SECTION("Dark's Dynamic FPS without FPS Unlock") {
+        disable_fps = true;
+        unlock = false;
+    }
+    SECTION("FPS Unlock was requested but could not apply") {
+        nso[SoundEntryOffset] ^= 1;
+        unlock = false;
+    }
+    PatchManagerTestContext context{mod, LastWord};
+    if (disable_fps) {
+        Settings::values.disabled_addons[OcarinaTitleId] = {std::string{FpsUnlock}};
+    }
+    if (!cheat.empty()) {
+        context.WriteCheat(cheat);
+    }
+    const auto patched = context.Manager().PatchNSO(nso, "main");
+    REQUIRE(WordAt(patched, Site) == (installs ? Branch : WordAt(nso, Site)));
+    REQUIRE(WordAt(patched, SoundEntryOffset) ==
+            (unlock ? SoundEntryBranchInstruction : WordAt(nso, SoundEntryOffset)));
+    REQUIRE(WordAt(patched, Entry) == (installs ? Original : 0));
+    if (installs) {
+        REQUIRE(WordAt(patched, LastWord) != 0);
+    } else {
+        REQUIRE(WordAt(patched, LastWord) == mod.value_or(WordAt(nso, LastWord)));
+    }
+}
+
 TEST_CASE("Built-in FPS Unlock validates the movie frame count records before writing",
           "[patch_manager]") {
     PatchManagerTestContext context;
@@ -1315,15 +1379,163 @@ TEST_CASE("Built-in text speed is off until checked in Add-Ons", "[patch_manager
     }
 }
 
+TEST_CASE("FPS Unlock guards the OoT day/night clock carry", "[patch_manager][oot_carry]") {
+    constexpr size_t Site = sizeof(Loader::NSOHeader) + 0x3CDFC0;
+    constexpr size_t Entry = sizeof(Loader::NSOHeader) + 0x177DAE4;
+    constexpr size_t LastWord = sizeof(Loader::NSOHeader) + 0x177DE3C;
+    constexpr size_t State = sizeof(Loader::NSOHeader) + 0x4E9D000;
+    constexpr u32 Original = 0x1E380008;
+    constexpr u32 Branch = 0x144EBEC9;
+    auto nso = MakeDynamicMain();
+    std::memcpy(nso.data() + Site, &Original, sizeof(Original));
+    std::optional<u32> mod;
+    bool installs = false;
+    bool unlock = true;
+    bool disable_fps = false;
+    std::string_view cheat;
+    SECTION("Matching build, instructions and padding") {
+        installs = true;
+    }
+    SECTION("Different build") {
+        nso[offsetof(Loader::NSOHeader, build_id)] ^= 1;
+        unlock = false;
+    }
+    SECTION("Changed original instruction") {
+        nso[Site] ^= 1;
+    }
+    SECTION("Occupied final alignment slot") {
+        nso[LastWord + 3] = 1;
+    }
+    SECTION("Occupied BSS") {
+        nso[State + 135] = 1;
+    }
+    SECTION("IPS uses the final alignment slot") {
+        mod = NopInstruction;
+    }
+    SECTION("A static cheat writes the BSS remainder") {
+        cheat = "[Carry overlap]\n04000000 04E9D040 00000000\n";
+    }
+    SECTION("Dark's Dynamic FPS without FPS Unlock") {
+        disable_fps = true;
+        unlock = false;
+    }
+    SECTION("FPS Unlock was requested but could not apply") {
+        nso[SoundEntryOffset] ^= 1;
+        unlock = false;
+    }
+    PatchManagerTestContext context{mod, LastWord};
+    if (disable_fps) {
+        Settings::values.disabled_addons[OcarinaTitleId] = {std::string{FpsUnlock}};
+    }
+    if (!cheat.empty()) {
+        context.WriteCheat(cheat);
+    }
+    const auto patched = context.Manager().PatchNSO(nso, "main");
+    REQUIRE(WordAt(patched, Site) == (installs ? Branch : WordAt(nso, Site)));
+    REQUIRE(WordAt(patched, SoundEntryOffset) ==
+            (unlock ? SoundEntryBranchInstruction : WordAt(nso, SoundEntryOffset)));
+    REQUIRE(WordAt(patched, Entry) == (installs ? Original : 0));
+    if (installs) {
+        REQUIRE(WordAt(patched, LastWord) != 0);
+    } else {
+        REQUIRE(WordAt(patched, LastWord) == mod.value_or(WordAt(nso, LastWord)));
+    }
+}
+
+TEST_CASE("OoT compaction interval is opt-in and skips changed code or state",
+          "[patch_manager][oot_compaction]") {
+    constexpr std::string_view Name = "Texture heap compaction interval (built-in)";
+    constexpr size_t Site = sizeof(Loader::NSOHeader) + 0x777278;
+    constexpr size_t Entry = sizeof(Loader::NSOHeader) + 0x177EDC4;
+    constexpr size_t LastWord = sizeof(Loader::NSOHeader) + 0x177E9D4;
+    constexpr size_t State = sizeof(Loader::NSOHeader) + 0x4E9D200;
+    constexpr u32 Original = 0x36080088;
+    auto nso = MakeDynamicMain();
+    std::memcpy(nso.data() + Site, &Original, sizeof(Original));
+    std::optional<u32> mod;
+    size_t mod_offset = LastWord;
+    std::string_view cheat;
+    std::vector<std::string> unchecked;
+    bool listed = true;
+    bool installs = false;
+    u64 title = OcarinaTitleId;
+    std::string module = "main";
+    SECTION("Unchecked by default") {
+        unchecked.emplace_back(Name);
+    }
+    SECTION("Explicit opt-in with FPS Unlock disabled") {
+        unchecked.emplace_back(FpsUnlock);
+        installs = true;
+    }
+    SECTION("Different build") {
+        nso[offsetof(Loader::NSOHeader, build_id)] ^= 1;
+    }
+    SECTION("Different title") {
+        title = OtherTitleId;
+        listed = false;
+    }
+    SECTION("Different module") {
+        module = "sdk";
+    }
+    SECTION("Changed original instruction") {
+        nso[Site] ^= 1;
+    }
+    SECTION("Occupied alignment slot") {
+        nso[LastWord + 3] = 1;
+    }
+    SECTION("Occupied BSS") {
+        nso[State + 15] = 1;
+    }
+    SECTION("IPS-modified code slot") {
+        mod = NopInstruction;
+    }
+    SECTION("IPS-modified BSS") {
+        mod = NopInstruction;
+        mod_offset = State;
+    }
+    SECTION("Static cheat writes the BSS timestamp") {
+        cheat = "[Compaction overlap]\n08000000 04E9D200 00000000 00000000\n";
+    }
+
+    PatchManagerTestContext context{mod, mod_offset};
+    const auto manager = context.Manager(title);
+    const auto entries = manager.GetPatches();
+    const auto entry = std::ranges::find(entries, Name, &FileSys::Patch::name);
+    REQUIRE((entry != entries.end()) == listed);
+    if (listed) {
+        REQUIRE(entry->off_by_default);
+        REQUIRE_FALSE(entry->enabled);
+        Settings::values.disabled_addons[title] =
+            FileSys::StoredDisabledAddons(title, unchecked);
+        const auto updated = manager.GetPatches();
+        const auto choice = std::ranges::find(updated, Name, &FileSys::Patch::name);
+        REQUIRE(choice != updated.end());
+        REQUIRE(choice->enabled == (unchecked.empty() || installs));
+    }
+    if (!cheat.empty()) {
+        context.WriteCheat(cheat);
+    }
+    const auto patched = manager.PatchNSO(nso, module);
+    REQUIRE(WordAt(patched, Site) == (installs ? 0x14401ED3 : WordAt(nso, Site)));
+    REQUIRE(WordAt(patched, Entry) == (installs ? 0x360FDD88 : 0));
+    if (mod) {
+        REQUIRE(WordAt(patched, mod_offset) == *mod);
+    }
+    REQUIRE(WordAt(patched, LastWord) ==
+            (installs ? 0x17BFE22Au
+                      : mod && mod_offset == LastWord ? *mod : WordAt(nso, LastWord)));
+}
+
 TEST_CASE("Unchecked add-on lists store off-by-default built-ins when checked", "[patch_manager]") {
     const std::string Double{"Text Speed 2x (built-in)"};
     const std::string Quadruple{"Text Speed 4x (built-in)"};
     const std::string Instant{"Text Speed Instant (built-in)"};
+    const std::string Compaction{"Texture heap compaction interval (built-in)"};
     const std::string MaxResolutionName{MaxResolution};
 
     SECTION("Unchecked off-by-default built-ins are not stored, checked ones get their key") {
         auto stored = FileSys::StoredDisabledAddons(OcarinaTitleId,
-                                                    {MaxResolutionName, Double, Instant});
+                                                    {MaxResolutionName, Double, Instant, Compaction});
         std::ranges::sort(stored);
         std::vector<std::string> expected{MaxResolutionName,
                                           FileSys::EnabledAddonKey(Quadruple)};

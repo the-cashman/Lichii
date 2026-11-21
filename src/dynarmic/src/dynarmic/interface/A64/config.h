@@ -9,6 +9,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -388,6 +389,14 @@ struct UserConfig {
     /// This tells the translator a wall clock will be used, thus allowing it
     /// to avoid writting certain unnecessary code only needed for cycle timers.
     bool wall_clock_cntpct = false;
+
+    /// x64 wall-clock counter: use the high half of fenced RDTSC times this Q0.64 scale.
+    /// A null factor or nonzero mode uses GetCNTPCT instead.
+    const std::atomic<std::uint64_t>* inline_cntpct_factor = nullptr;
+    const std::atomic<std::uint32_t>* inline_cntpct_mode = nullptr;
+    /// The same previous-read slot that GetCNTPCT updates, for the polling pause.
+    std::uint64_t* inline_cntpct_last = nullptr;
+    std::uint16_t inline_cntpct_spin_ticks = 0;
 
     /// This allows accurately emulating protection fault handlers. If true, we check
     /// for exit after every data memory access by the emulated program.

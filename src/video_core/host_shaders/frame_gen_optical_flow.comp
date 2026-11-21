@@ -13,7 +13,7 @@ layout(push_constant) uniform PushConstants {
     float block_size;
 };
 
-// ΓöÇΓöÇ Shared memory tile cache ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// ── Shared memory tile cache ────────────────────────────────────────────
 const uint TILE = 16u;
 const uint BORDER = 2u;
 const uint PADDED = TILE + 2u * BORDER; // 20
@@ -101,7 +101,7 @@ void main() {
         }
     }
 
-    // ΓöÇΓöÇ Dampen very small motions to prevent micro-jitter ΓöÇΓöÇ
+    // ── Dampen very small motions to prevent micro-jitter ──
     // Motions below ~0.5 pixels are likely noise, not real movement
     float motion_len = length(best_motion);
     if (motion_len < 0.5) {

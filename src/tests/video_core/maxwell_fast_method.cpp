@@ -89,6 +89,10 @@ struct GpuSplitTestAccess {
         return split.wait_target.load() != ~u64{0};
     }
 
+    static bool FrontWaitRegistered(const GpuSplit& split) {
+        return split.front_waiting.load();
+    }
+
     static u64 Execute(GpuSplit& split, u64 position, u64 available) {
         const size_t index = position & GpuSplit::RingMask;
         const size_t size = split.Execute(
@@ -1126,6 +1130,51 @@ TEST_CASE("Split drain waits for the back's idle hook",
         split.Defer([] {});
         split.Drain(VideoCommon::DrainSite::Acquire);
         REQUIRE(hooks.load() >= i);
+    }
+}
+
+TEST_CASE("Split front parks while waiting for ring space or the idle hook",
+          "[video_core][gpu_split_dependencies]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    auto split = std::make_unique<VideoCommon::GpuSplit>();
+    std::atomic<bool> release{};
+    bool slept = false;
+    const auto unblock = [&] {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+        while (!(slept = Access::FrontWaitRegistered(*split)) &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        }
+        release.store(true);
+        release.notify_one();
+    };
+
+    SECTION("full ring") {
+        std::vector<u32> payload(Access::NearWrap() + 1);
+        Access::Start(*split, f.system);
+        split->Defer([&release] { release.wait(false); });
+        split->DeferWords([](std::span<const u32>) {}, payload);
+        std::jthread unblock_back{unblock};
+        split->DeferWords([](std::span<const u32>) {}, payload);
+        unblock_back.join();
+        CHECK(slept);
+        split->Drain();
+        split->Stop();
+    }
+
+    SECTION("idle hook") {
+        split->SetIdleHook(
+            [](void* arg) { static_cast<std::atomic<bool>*>(arg)->wait(false); }, &release);
+        Access::Start(*split, f.system);
+        split->Defer([] {});
+        split->WaitUntil(split->Position(), VideoCommon::DrainSite::Other);
+        std::jthread unblock_hook{unblock};
+        split->Drain();
+        unblock_hook.join();
+        CHECK(slept);
+        split->Stop();
     }
 }
 

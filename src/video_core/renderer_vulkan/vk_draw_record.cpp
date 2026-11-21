@@ -9,6 +9,7 @@
 #include <fmt/ranges.h>
 
 #include "common/logging.h"
+#include "common/settings.h"
 #include "core/memory.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/memory_manager.h"
@@ -1261,8 +1262,10 @@ u64 DrawRecorder::DescriptorHash(Tegra::MemoryManager& gpu_memory, u32 tic, u32 
         hash = MixBytes(hash, words.data(), sizeof(words));
     };
     const u32 tic_limit = regs.tex_header.limit;
-    const u32 header = Tegra::Texture::TextureHeaderIndex(tic, tic_limit,
-                                                          gpu_memory.UsesNativeTiling());
+    const u32 header = Tegra::Texture::TextureHeaderIndex(
+        tic, tic_limit,
+        Tegra::Texture::UsesHeaderByteOffsetHandles(gpu_memory.UsesNativeTiling(),
+                                                    Settings::GetCurrentProgramID()));
     if (tic != ~0U && header <= tic_limit) {
         add_entry(regs.tex_header.Address() + u64{header} * 32);
     }
@@ -1726,8 +1729,10 @@ void DrawRecorder::CopyEntry(Tegra::MemoryManager& gpu_memory, size_t element, u
     const auto& regs = cur_maxwell3d->regs;
     out = Entry::EntryCopy{};
     const u32 tic_limit = regs.tex_header.limit;
-    const u32 header =
-        Tegra::Texture::TextureHeaderIndex(tic, tic_limit, gpu_memory.UsesNativeTiling());
+    const u32 header = Tegra::Texture::TextureHeaderIndex(
+        tic, tic_limit,
+        Tegra::Texture::UsesHeaderByteOffsetHandles(gpu_memory.UsesNativeTiling(),
+                                                    Settings::GetCurrentProgramID()));
     if (tic != ~0U && header <= tic_limit) {
         out.tic = PagePointer(gpu_memory, regs.tex_header.Address() + u64{header} * 32);
         if (out.tic != nullptr) {

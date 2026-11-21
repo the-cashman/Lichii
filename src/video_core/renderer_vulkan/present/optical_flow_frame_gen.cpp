@@ -3,20 +3,20 @@
 
 #include <algorithm>
 
-#include "video_core/renderer_vulkan/present/fsr3_frame_gen.h"
+#include "video_core/renderer_vulkan/present/optical_flow_frame_gen.h"
 #include "video_core/renderer_vulkan/present/util.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 
-#include "video_core/host_shaders/fsr3_frame_interpolation_comp_spv.h"
-#include "video_core/host_shaders/fsr3_optical_flow_comp_spv.h"
+#include "video_core/host_shaders/frame_gen_interpolation_comp_spv.h"
+#include "video_core/host_shaders/frame_gen_optical_flow_comp_spv.h"
 
 namespace Vulkan {
 
 namespace {
 
-// ΓöÇΓöÇ Precise pipeline barriers ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// ── Precise pipeline barriers ──────────────────────────────────────────
 
 VkImageMemoryBarrier MakeBarrier(VkImage image, VkAccessFlags src_access,
                                  VkAccessFlags dst_access, VkImageLayout old_layout,
@@ -49,7 +49,7 @@ void DiscardForComputeWrite(vk::CommandBuffer cmdbuf, VkImage image) {
                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, {}, {}, barrier);
 }
 
-// ΓöÇΓöÇ Batched dual-copy ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// ── Batched dual-copy ──────────────────────────────────────────────────
 // Copy one source image into TWO destinations with only 3 barrier calls
 // instead of 6 (avoiding redundant source transitions).
 void CopyImageToTwo(vk::CommandBuffer cmdbuf, VkImage source,
@@ -62,7 +62,7 @@ void CopyImageToTwo(vk::CommandBuffer cmdbuf, VkImage source,
         .extent = {extent.width, extent.height, 1},
     };
 
-    // 1. Transition source ΓåÆ TRANSFER_SRC, both dests ΓåÆ TRANSFER_DST (batched)
+    // 1. Transition source → TRANSFER_SRC, both dests → TRANSFER_DST (batched)
     const std::array before{
         MakeBarrier(source, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
                                 VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -78,7 +78,7 @@ void CopyImageToTwo(vk::CommandBuffer cmdbuf, VkImage source,
                                VK_PIPELINE_STAGE_TRANSFER_BIT,
                            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, {}, {}, before);
 
-    // 2. Copy source ΓåÆ dest_a, then source ΓåÆ dest_b (source stays TRANSFER_SRC)
+    // 2. Copy source → dest_a, then source → dest_b (source stays TRANSFER_SRC)
     cmdbuf.CopyImage(source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dest_a,
                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
     cmdbuf.CopyImage(source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dest_b,
@@ -159,8 +159,8 @@ struct InterpPushConstants {
     float flow_scale;
 };
 
-Fsr3FrameGen::Fsr3FrameGen(const Device& device, MemoryAllocator& memory_allocator,
-                           VkExtent2D extent, VkFormat format)
+OpticalFlowFrameGen::OpticalFlowFrameGen(const Device& device, MemoryAllocator& memory_allocator,
+                                         VkExtent2D extent, VkFormat format)
     : m_allocator{memory_allocator}, m_extent{extent},
       m_flow_extent{(std::max)(1u, extent.width / 2), (std::max)(1u, extent.height / 2)},
       m_format{format} {
@@ -170,9 +170,9 @@ Fsr3FrameGen::Fsr3FrameGen(const Device& device, MemoryAllocator& memory_allocat
     m_initialized = true;
 }
 
-Fsr3FrameGen::~Fsr3FrameGen() = default;
+OpticalFlowFrameGen::~OpticalFlowFrameGen() = default;
 
-void Fsr3FrameGen::CreateResources(const Device& device) {
+void OpticalFlowFrameGen::CreateResources(const Device& device) {
     m_linear_sampler = CreateBilinearSampler(device);
 
     m_history_image = CreateWrappedImage(m_allocator, m_extent, m_format);
@@ -211,13 +211,13 @@ void Fsr3FrameGen::CreateResources(const Device& device) {
     });
 }
 
-void Fsr3FrameGen::CreateShaders(const Device& device) {
-    m_flow_shader = BuildShader(device, FSR3_OPTICAL_FLOW_COMP_SPV);
-    m_interp_shader = BuildShader(device, FSR3_FRAME_INTERPOLATION_COMP_SPV);
+void OpticalFlowFrameGen::CreateShaders(const Device& device) {
+    m_flow_shader = BuildShader(device, FRAME_GEN_OPTICAL_FLOW_COMP_SPV);
+    m_interp_shader = BuildShader(device, FRAME_GEN_INTERPOLATION_COMP_SPV);
 }
 
-void Fsr3FrameGen::CreatePipelines(const Device& device) {
-    // ΓöÇΓöÇ Optical Flow Pipeline ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+void OpticalFlowFrameGen::CreatePipelines(const Device& device) {
+    // ── Optical Flow Pipeline ──────────────────────────────────────────
     const std::array flow_bindings{
         VkDescriptorSetLayoutBinding{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
         VkDescriptorSetLayoutBinding{1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
@@ -255,7 +255,7 @@ void Fsr3FrameGen::CreatePipelines(const Device& device) {
         .layout = *m_flow_pipe_layout,
     });
 
-    // ΓöÇΓöÇ Frame Interpolation Pipeline ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+    // ── Frame Interpolation Pipeline ───────────────────────────────────
     const std::array interp_bindings{
         VkDescriptorSetLayoutBinding{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
         VkDescriptorSetLayoutBinding{1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
@@ -298,8 +298,8 @@ void Fsr3FrameGen::CreatePipelines(const Device& device) {
     m_flow_desc_sets = CreateWrappedDescriptorSets(m_desc_pool, {*m_flow_desc_layout});
 }
 
-void Fsr3FrameGen::Process(const Device& device, Scheduler& scheduler, VkImage current_frame,
-                           VkImageView, u64 frame_count) {
+void OpticalFlowFrameGen::Process(const Device& device, Scheduler& scheduler, VkImage current_frame,
+                                  VkImageView, u64 frame_count) {
     if (frame_count == 0) {
         m_has_history = false;
         m_flow_valid = false;
@@ -315,13 +315,13 @@ void Fsr3FrameGen::Process(const Device& device, Scheduler& scheduler, VkImage c
         return;
     }
 
-    // ΓöÇΓöÇ Duplicate-frame detection ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+    // ── Duplicate-frame detection ──────────────────────────────────────
     if (frame_count == m_last_frame_count) {
         return;
     }
     m_last_frame_count = frame_count;
 
-    // ΓöÇΓöÇ Descriptor caching ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+    // ── Descriptor caching ─────────────────────────────────────────────
     if (!m_flow_descriptors_initialized) {
         std::vector<VkDescriptorImageInfo> image_infos;
         image_infos.reserve(4);
@@ -381,14 +381,14 @@ void Fsr3FrameGen::Process(const Device& device, Scheduler& scheduler, VkImage c
     m_flow_valid = true;
 }
 
-void Fsr3FrameGen::Generate(const Device& device, Scheduler& scheduler, VkImage destination,
-                            VkImageView destination_storage_view, float blend_factor,
-                            float flow_scale) {
+void OpticalFlowFrameGen::Generate(const Device& device, Scheduler& scheduler, VkImage destination,
+                                   VkImageView destination_storage_view, float blend_factor,
+                                   float flow_scale) {
     if (!m_has_history || !m_flow_valid) {
         return;
     }
 
-    // ΓöÇΓöÇ Descriptor caching for interpolation ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+    // ── Descriptor caching for interpolation ───────────────────────────
     if (!m_interp_pool) {
         m_interp_pool.emplace(device, scheduler);
         m_interp_allocator = m_interp_pool->Allocator(device, scheduler, *m_interp_desc_layout,

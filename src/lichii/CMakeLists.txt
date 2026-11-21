@@ -14,9 +14,12 @@ endif()
 
 find_package(Qt6 REQUIRED COMPONENTS Widgets)
 
+option(LICHII_USE_PENDING_RELEASE_NOTES "Show the staged What's new notes for this build" OFF)
+
 if(LICHII_TESTS)
     add_subdirectory(../tests/qt_compatibility ${CMAKE_BINARY_DIR}/qt_compatibility_tests)
     add_subdirectory(../tests/qt_iidb ${CMAKE_BINARY_DIR}/qt_iidb_tests)
+    add_subdirectory(../tests/qt_whats_new ${CMAKE_BINARY_DIR}/qt_whats_new_tests)
 endif()
 
 add_executable(lichii
@@ -267,6 +270,8 @@ add_executable(lichii
 )
 
 set_target_properties(lichii PROPERTIES OUTPUT_NAME "lichii")
+target_compile_definitions(lichii PRIVATE
+    LICHII_USE_PENDING_RELEASE_NOTES=$<BOOL:${LICHII_USE_PENDING_RELEASE_NOTES}>)
 
 set(_nx2_switches "${PROJECT_SOURCE_DIR}/dist/nx2_switches.txt")
 if (APPLE)

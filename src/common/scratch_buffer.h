@@ -64,7 +64,10 @@ public:
     void resize(size_type size) {
         if (size > buffer_capacity) {
             auto new_buffer = std::make_unique_for_overwrite<T[]>(size);
-            std::memcpy(new_buffer.get(), buffer.get(), buffer_capacity * sizeof(T));
+            // Nothing to keep from an empty buffer, whose pointer is null.
+            if (buffer_capacity != 0) {
+                std::memcpy(new_buffer.get(), buffer.get(), buffer_capacity * sizeof(T));
+            }
             buffer = std::move(new_buffer);
             buffer_capacity = size;
         }

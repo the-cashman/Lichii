@@ -174,6 +174,8 @@ public:
 
 template <class P>
 class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelInfo> {
+    friend struct TextureCacheTestAccess;
+
     /// Address shift for caching images into a hash table
     static constexpr u64 LICHII_PAGEBITS = 20;
 
@@ -669,8 +671,8 @@ private:
 
     void OnGPUASRegister(size_t map_id) final override;
 
-    /// Runs the Garbage Collector.
-    void RunGarbageCollector(bool out_of_memory);
+    /// Runs the Garbage Collector; at_critical collects as if usage were at the critical threshold.
+    void RunGarbageCollector(bool out_of_memory, bool at_critical);
 
     /// Deletes images whose memory went entirely to newer images (see ClassifySuperseded).
     void DeleteSupersededImages();
@@ -707,15 +709,16 @@ private:
     void UploadImageContents(Image& image, StagingBuffer& staging_buffer);
 
     /// Create a new image view from a guest descriptor
-    [[nodiscard]] ImageViewId CreateImageView(const TICEntry& config);
+    [[nodiscard]] ImageViewId CreateImageView(const TICEntry& config, bool& retry);
 
     /// Find or create an image from the given parameters
     [[nodiscard]] ImageId FindOrInsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
-                                            RelaxedOptions options = RelaxedOptions{});
+                                            RelaxedOptions options = RelaxedOptions{},
+                                            bool* retry = nullptr);
 
     /// Find an image from the given parameters
     [[nodiscard]] ImageId FindImage(const ImageInfo& info, GPUVAddr gpu_addr,
-                                    RelaxedOptions options);
+                                    RelaxedOptions options, bool* retry = nullptr);
 
     /// Create an image from the given parameters
     [[nodiscard]] ImageId InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
@@ -983,6 +986,7 @@ private:
     [[nodiscard]] static bool OverlapWritebacksEnabled();
     u64 join_writeback_reuses{};
     void WriteBackBadOverlaps(ImageId new_image_id);
+    [[nodiscard]] bool GobViewBytesReady(DAddr cpu_addr, size_t size);
     /// Collector write-backs waiting for the GPU: written to guest
     /// memory once their command buffer is done, except bytes the guest writes first; dropped if
     /// the memory is unmapped first. Their pages stay write-tracked meanwhile.
@@ -1003,6 +1007,7 @@ private:
         u64 tick{};
         /// The image's address space: gpu_addr is in it, whichever channel is bound on landing.
         size_t address_space{};
+        bool gob_view{};
     };
     std::deque<AsyncOverlapDownload> async_overlap_downloads;
     /// The GPU memory of an address space the cache has seen, or null.

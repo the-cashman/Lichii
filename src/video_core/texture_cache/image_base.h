@@ -63,6 +63,7 @@ enum class ImageFlagBits : u32 {
     /// Its own address space mapped it to more than one device range when it was made (with
     /// Sparse only when the texture says so).
     NonContiguous = 1 << 24,
+    GuestReplacedContents = 1 << 25,
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 
@@ -212,6 +213,7 @@ void NoteStorageWrite(ImageBase& image, u32 levels_before, const SubresourceRang
 /// Sets an image's modification tick and raises its aliases' newest_alias_tick to it.
 template <typename Images>
 void SetModificationTick(Images& images, ImageBase& image, u64 tick) {
+    image.flags &= ~ImageFlagBits::GuestReplacedContents;
     image.modification_tick = tick;
     for (const AliasedImage& alias : image.aliased_images) {
         u64& newest = images[alias.id].newest_alias_tick;

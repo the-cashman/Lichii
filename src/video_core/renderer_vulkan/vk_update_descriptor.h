@@ -66,6 +66,15 @@ public:
         return upload_start ? static_cast<size_t>(payload_cursor - upload_start) : 0;
     }
 
+    [[nodiscard]] bool HasRejectedTexelBuffer() const noexcept {
+        return rejected_texel_buffer;
+    }
+
+    void RejectTexelBuffer() {
+        rejected_texel_buffer = true;
+        AddTexelBuffer(VK_NULL_HANDLE);
+    }
+
     void ReplaceSampledImage(size_t entry, VkImageView image_view) {
         upload_start[entry].image.imageView = image_view;
     }
@@ -145,6 +154,7 @@ private:
     const size_t maximum_frame_payload_size;
     const bool supports_descriptor_buffer;
     bool use_descriptor_buffer{false};
+    bool rejected_texel_buffer{};
     size_t frame_index{0};
     DescriptorUpdateEntry* payload_cursor = nullptr;
     DescriptorUpdateEntry* payload_start = nullptr;

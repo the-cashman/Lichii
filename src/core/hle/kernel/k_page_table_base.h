@@ -244,7 +244,7 @@ public:
                                 KMemoryManager::Pool pool, KProcessAddress code_address,
                                 size_t code_size, KSystemResource* system_resource,
                                 KResourceLimit* resource_limit, Core::Memory::Memory& memory,
-                                KProcessAddress aslr_space_start);
+                                KProcessAddress aslr_space_start, u64 switch2_program_id);
 
     Result FinalizeProcess();
     void Finalize();

@@ -103,6 +103,7 @@ struct BuiltinPatch {
     // Off until checked in Add-Ons (stored as EnabledAddonKey(name)), for game options rather
     // than fixes.
     bool off_by_default = false;
+    bool skip_on_cheat_overlap = false;
     // Built-ins that patch the same place: the first one applied (in this list's order) wins.
     std::string_view group{};
     std::string_view description{};
@@ -426,6 +427,30 @@ constexpr std::array<u8, 48> CLOTH_DT_ROUTINE_S2{
     0x10, 0x11, 0x91, 0x52, 0x10, 0xB1, 0xA7, 0x72, 0x31, 0x06, 0x00, 0x51, 0x3F, 0x02, 0x10, 0x6B,
     0x31, 0x32, 0x90, 0x1A, 0x31, 0x06, 0x00, 0x11, 0x22, 0x02, 0x27, 0x1E, 0xC0, 0x03, 0x5F, 0xD6,
 };
+
+// Below a step of 1, Epona's jump keeps extending the JumpReady blend for slow motion.
+// Take the normal path when both steps are positive and below 1, and differ by at most
+// 8192 ULPs. Otherwise keep the game's b.pl decision. T = *[main+0x4E94B20]; T+0x10 is
+// the global frame step. The original exits do not use x9, x10 or the condition flags.
+constexpr size_t EPONA_JUMP_HOOK_OFFSET = 0x2C3AE20;
+constexpr size_t EPONA_JUMP_CAVE_OFFSET = 0x3C46FB4;
+constexpr std::array<u8, 4> EPONA_JUMP_ORIGINAL{0x45, 0x01, 0x00, 0x54};
+constexpr std::array<u8, 4> EPONA_JUMP_BRANCH{0x65, 0x30, 0x40, 0x14};
+constexpr std::array<u8, 72> EPONA_JUMP_ROUTINE{
+    0x25, 0x02, 0x00, 0x54, 0x69, 0x92, 0x00, 0xD0, 0x29, 0x91, 0x45, 0xF9,
+    0xA9, 0x01, 0x00, 0xB4, 0x2A, 0x11, 0x40, 0xB9, 0x6A, 0x01, 0x00, 0x34,
+    0x09, 0xF0, 0xA7, 0x52, 0x5F, 0x01, 0x09, 0x6B, 0x02, 0x01, 0x00, 0x54,
+    0x49, 0x01, 0x26, 0x1E, 0x3F, 0x01, 0x00, 0x71, 0xAD, 0x00, 0x00, 0x54,
+    0x29, 0x01, 0x0A, 0x6B, 0x29, 0x55, 0x89, 0x5A, 0x3F, 0x09, 0x40, 0x71,
+    0x49, 0x00, 0x00, 0x54, 0x8C, 0xCF, 0xBF, 0x17, 0x94, 0xCF, 0xBF, 0x17,
+};
+static_assert(EPONA_JUMP_CAVE_OFFSET >= 0x3C46FB0 &&
+              EPONA_JUMP_CAVE_OFFSET + EPONA_JUMP_ROUTINE.size() <= 0x3C47000);
+constexpr std::array EPONA_JUMP_RECORDS{
+    BuiltinPatchRecord{EPONA_JUMP_HOOK_OFFSET, EPONA_JUMP_BRANCH, EPONA_JUMP_ORIGINAL},
+    BuiltinPatchRecord{EPONA_JUMP_CAVE_OFFSET, EPONA_JUMP_ROUTINE, {}, true},
+};
+
 // The physics world's solver steps (port of Hookshot's fix by hckrman101, Z-TOON/Hookshot
 // 8fcc8c22b9, GPL-3.0): each update the game sets them to (int)(step * the steps of a 60 fps
 // frame + 0.001), stored at the solver's +0x2C8 (main+0x38AEB80 and main+0x38AFC10, the same code
@@ -456,30 +481,6 @@ constexpr std::array FPS_UNLOCK_HOOKS{
                      0x3C46400, SOLVER_STEPS_ROUTINE},
     BuiltinPatchHook{"solver steps", 0x38AFC10, SOLVER_STEPS_FUNCTION_SIZE, SOLVER_STEPS_SITE,
                      0x3C46480, SOLVER_STEPS_ROUTINE},
-};
-
-
-// Below a step of 1, Epona's jump keeps extending the JumpReady blend for slow motion.
-// Take the normal path when both steps are positive and below 1, and differ by at most
-// 8192 ULPs. Otherwise keep the game's b.pl decision. T = *[main+0x4E94B20]; T+0x10 is
-// the global frame step. The original exits do not use x9, x10 or the condition flags.
-constexpr size_t EPONA_JUMP_HOOK_OFFSET = 0x2C3AE20;
-constexpr size_t EPONA_JUMP_CAVE_OFFSET = 0x3C46FB4;
-constexpr std::array<u8, 4> EPONA_JUMP_ORIGINAL{0x45, 0x01, 0x00, 0x54};
-constexpr std::array<u8, 4> EPONA_JUMP_BRANCH{0x65, 0x30, 0x40, 0x14};
-constexpr std::array<u8, 72> EPONA_JUMP_ROUTINE{
-    0x25, 0x02, 0x00, 0x54, 0x69, 0x92, 0x00, 0xD0, 0x29, 0x91, 0x45, 0xF9,
-    0xA9, 0x01, 0x00, 0xB4, 0x2A, 0x11, 0x40, 0xB9, 0x6A, 0x01, 0x00, 0x34,
-    0x09, 0xF0, 0xA7, 0x52, 0x5F, 0x01, 0x09, 0x6B, 0x02, 0x01, 0x00, 0x54,
-    0x49, 0x01, 0x26, 0x1E, 0x3F, 0x01, 0x00, 0x71, 0xAD, 0x00, 0x00, 0x54,
-    0x29, 0x01, 0x0A, 0x6B, 0x29, 0x55, 0x89, 0x5A, 0x3F, 0x09, 0x40, 0x71,
-    0x49, 0x00, 0x00, 0x54, 0x8C, 0xCF, 0xBF, 0x17, 0x94, 0xCF, 0xBF, 0x17,
-};
-static_assert(EPONA_JUMP_CAVE_OFFSET >= 0x3C46FB0 &&
-              EPONA_JUMP_CAVE_OFFSET + EPONA_JUMP_ROUTINE.size() <= 0x3C47000);
-constexpr std::array EPONA_JUMP_RECORDS{
-    BuiltinPatchRecord{EPONA_JUMP_HOOK_OFFSET, EPONA_JUMP_BRANCH, EPONA_JUMP_ORIGINAL},
-    BuiltinPatchRecord{EPONA_JUMP_CAVE_OFFSET, EPONA_JUMP_ROUTINE, {}, true},
 };
 
 constexpr std::array FPS_UNLOCK_RECORDS{
@@ -705,6 +706,74 @@ bool OotShadowResEnabled() {
     return true;
 }
 
+// Convert 2 * step to game seconds. Short steps keep a per-clock fraction (x19+0x3c);
+// all other amounts retain the retail conversion, including the ordinary 60 FPS case.
+// The nine zero-filled .text alignment slots are listed for E0F3CCFA in the KaeGae
+// registry. Branches chain them without using LR. Each of eight BSS slots has an
+// address key and a double-precision fraction; a miss starts at zero.
+constexpr std::array<u8, 4> CLOCK_CARRY_ORIGINAL{0x08, 0x00, 0x38, 0x1E};
+constexpr std::array<u8, 4> CLOCK_CARRY_HOOK{0xC9, 0xBE, 0x4E, 0x14};
+constexpr std::array<u8, 28> CLOCK_CARRY_PADDING{};
+constexpr std::array<u8, 28> CLOCK_CARRY_ENTRY{
+    0x08, 0x00, 0x38, 0x1E, 0xED, 0x3B, 0xBB, 0xA9, 0xEF, 0x43, 0x01, 0xA9,
+    0xF0, 0x47, 0x01, 0xAD, 0x0D, 0x42, 0x3B, 0xD5, 0xED, 0x23, 0x00, 0xF9,
+    0x53, 0x00, 0x00, 0x14,
+};
+constexpr std::array<u8, 24> CLOCK_CARRY_RANGE_CHECK{
+    0x0D, 0x00, 0x26, 0x1E, 0xED, 0x0E, 0x00, 0x34, 0x0E, 0x00, 0xA8, 0x52,
+    0xBF, 0x01, 0x0E, 0x6B, 0x82, 0x0E, 0x00, 0x54, 0x13, 0x00, 0x00, 0x14,
+};
+constexpr std::array<u8, 20> CLOCK_CARRY_SETUP{
+    0x0E, 0xB9, 0x01, 0x90, 0xCE, 0x01, 0x00, 0x91, 0x6D, 0xF2, 0x00, 0x91,
+    0x0F, 0x00, 0x80, 0x52, 0xB3, 0x00, 0x00, 0x14,
+};
+constexpr std::array<u8, 28> CLOCK_CARRY_LOOKUP{
+    0xD0, 0x79, 0x6F, 0xF8, 0x1F, 0x02, 0x0D, 0xEB, 0xE0, 0xEB, 0xFF, 0x54,
+    0xEF, 0x05, 0x00, 0x91, 0xFF, 0x21, 0x00, 0xF1, 0x63, 0xFF, 0xFF, 0x54,
+    0x3A, 0x00, 0x00, 0x14,
+};
+constexpr std::array<u8, 28> CLOCK_CARRY_MISS{
+    0xCF, 0x81, 0x40, 0xB9, 0xF0, 0x05, 0x00, 0x11, 0x10, 0x0A, 0x00, 0x12,
+    0xD0, 0x81, 0x00, 0xB9, 0xCD, 0x79, 0x2F, 0xF8, 0x10, 0xE4, 0x00, 0x2F,
+    0x33, 0xFF, 0xFF, 0x17,
+};
+constexpr std::array<u8, 12> CLOCK_CARRY_HIT{
+    0xCD, 0x01, 0x01, 0x91, 0xB0, 0x79, 0x6F, 0xFC, 0x16, 0x00, 0x00, 0x14,
+};
+constexpr std::array<u8, 24> CLOCK_CARRY_CALC{
+    0x11, 0xC0, 0x22, 0x1E, 0x10, 0x2A, 0x71, 0x1E, 0x08, 0x02, 0x78, 0x1E,
+    0x11, 0x01, 0x62, 0x1E, 0x10, 0x3A, 0x71, 0x1E, 0x13, 0x00, 0x00, 0x14,
+};
+constexpr std::array<u8, 12> CLOCK_CARRY_STORE{
+    0xCD, 0x01, 0x01, 0x91, 0xB0, 0x79, 0x2F, 0xFC, 0x16, 0x00, 0x00, 0x14,
+};
+constexpr std::array<u8, 24> CLOCK_CARRY_DONE{
+    0xED, 0x23, 0x40, 0xF9, 0x0D, 0x42, 0x1B, 0xD5, 0xF0, 0x47, 0x41, 0xAD,
+    0xEF, 0x43, 0x41, 0xA9, 0xED, 0x3B, 0xC5, 0xA8, 0x62, 0x40, 0xB1, 0x17,
+};
+constexpr std::array CLOCK_CARRY_RECORDS{
+    BuiltinPatchRecord{0x3CDFC0, CLOCK_CARRY_HOOK, CLOCK_CARRY_ORIGINAL},
+    BuiltinPatchRecord{0x177DAE4, CLOCK_CARRY_ENTRY,
+                       std::span{CLOCK_CARRY_PADDING}.first(CLOCK_CARRY_ENTRY.size())},
+    BuiltinPatchRecord{0x177DC48, CLOCK_CARRY_RANGE_CHECK,
+                       std::span{CLOCK_CARRY_PADDING}.first(CLOCK_CARRY_RANGE_CHECK.size())},
+    BuiltinPatchRecord{0x177DCA8, CLOCK_CARRY_SETUP,
+                       std::span{CLOCK_CARRY_PADDING}.first(CLOCK_CARRY_SETUP.size())},
+    BuiltinPatchRecord{0x177DF84, CLOCK_CARRY_LOOKUP,
+                       std::span{CLOCK_CARRY_PADDING}.first(CLOCK_CARRY_LOOKUP.size())},
+    BuiltinPatchRecord{0x177E084, CLOCK_CARRY_MISS,
+                       std::span{CLOCK_CARRY_PADDING}.first(CLOCK_CARRY_MISS.size())},
+    BuiltinPatchRecord{0x177DD08, CLOCK_CARRY_HIT,
+                       std::span{CLOCK_CARRY_PADDING}.first(CLOCK_CARRY_HIT.size())},
+    BuiltinPatchRecord{0x177DD68, CLOCK_CARRY_CALC,
+                       std::span{CLOCK_CARRY_PADDING}.first(CLOCK_CARRY_CALC.size())},
+    BuiltinPatchRecord{0x177DDC8, CLOCK_CARRY_STORE,
+                       std::span{CLOCK_CARRY_PADDING}.first(CLOCK_CARRY_STORE.size())},
+    BuiltinPatchRecord{0x177DE28, CLOCK_CARRY_DONE,
+                       std::span{CLOCK_CARRY_PADDING}.first(CLOCK_CARRY_DONE.size())},
+};
+constexpr std::array CLOCK_CARRY_STATE{BuiltinPatchState{0x4E9D000, 136}};
+
 // Dark's timer state at 0 and the water slots to 0x98.
 constexpr std::array DYNAMIC_FPS_STATES{BuiltinPatchState{0x4E9FE00, 0x98}};
 // Dynamic FPS's state and the sound gate at 0xA0, then the step counters on a page of their own:
@@ -749,6 +818,124 @@ constexpr std::array<u8, 1> YOSHI_SCENE_PROFILE_FULL{0x19};
 constexpr std::array YOSHI_SCENE_PROFILE_RECORDS{
     BuiltinPatchRecord{0x7582677, YOSHI_SCENE_PROFILE_FULL, YOSHI_SCENE_PROFILE_ORIGINAL},
 };
+
+// Convert elapsed time to 60 Hz steps. Short steps keep a per-web fraction (x19+0x8f8).
+// The original clamp after this conversion still limits pauses to three steps; large
+// deltas go down the original path and do not add to the pending fraction.
+// The nine zero-filled .text alignment slots are listed for E0F3CCFA in the KaeGae
+// registry. Branches chain them without using LR. Each of eight BSS slots has an
+// address key and a double-precision fraction; a miss starts at zero.
+constexpr std::array<u8, 4> WEB_CARRY_ORIGINAL{0x16, 0x00, 0x38, 0x1E};
+constexpr std::array<u8, 4> WEB_CARRY_HOOK{0x51, 0x2D, 0x45, 0x14};
+constexpr std::array<u8, 28> WEB_CARRY_PADDING{};
+constexpr std::array<u8, 28> WEB_CARRY_ENTRY{
+    0x16, 0x00, 0x38, 0x1E, 0xED, 0x3B, 0xBB, 0xA9, 0xEF, 0x43, 0x01, 0xA9,
+    0xF0, 0x47, 0x01, 0xAD, 0x0D, 0x42, 0x3B, 0xD5, 0xED, 0x23, 0x00, 0xF9,
+    0x13, 0x00, 0x00, 0x14,
+};
+constexpr std::array<u8, 24> WEB_CARRY_RANGE_CHECK{
+    0x0D, 0x00, 0x26, 0x1E, 0xED, 0x15, 0x00, 0x34, 0x0E, 0xF0, 0xA7, 0x52,
+    0xBF, 0x01, 0x0E, 0x6B, 0x82, 0x15, 0x00, 0x54, 0x13, 0x00, 0x00, 0x14,
+};
+constexpr std::array<u8, 20> WEB_CARRY_SETUP{
+    0xEE, 0xB8, 0x01, 0xF0, 0xCE, 0x01, 0x04, 0x91, 0x6D, 0xE2, 0x23, 0x91,
+    0x0F, 0x00, 0x80, 0x52, 0x7B, 0x00, 0x00, 0x14,
+};
+constexpr std::array<u8, 28> WEB_CARRY_LOOKUP{
+    0xD0, 0x79, 0x6F, 0xF8, 0x1F, 0x02, 0x0D, 0xEB, 0xE0, 0xF2, 0xFF, 0x54,
+    0xEF, 0x05, 0x00, 0x91, 0xFF, 0x21, 0x00, 0xF1, 0x63, 0xFF, 0xFF, 0x54,
+    0x3A, 0x00, 0x00, 0x14,
+};
+constexpr std::array<u8, 28> WEB_CARRY_MISS{
+    0xCF, 0x81, 0x40, 0xB9, 0xF0, 0x05, 0x00, 0x11, 0x10, 0x0A, 0x00, 0x12,
+    0xD0, 0x81, 0x00, 0xB9, 0xCD, 0x79, 0x2F, 0xF8, 0x10, 0xE4, 0x00, 0x2F,
+    0x6B, 0xFF, 0xFF, 0x17,
+};
+constexpr std::array<u8, 12> WEB_CARRY_HIT{
+    0xCD, 0x01, 0x01, 0x91, 0xB0, 0x79, 0x6F, 0xFC, 0x16, 0x00, 0x00, 0x14,
+};
+constexpr std::array<u8, 24> WEB_CARRY_CALC{
+    0x11, 0xC0, 0x22, 0x1E, 0x10, 0x2A, 0x71, 0x1E, 0x16, 0x02, 0x78, 0x1E,
+    0xD1, 0x02, 0x62, 0x1E, 0x10, 0x3A, 0x71, 0x1E, 0x13, 0x00, 0x00, 0x14,
+};
+constexpr std::array<u8, 12> WEB_CARRY_STORE{
+    0xCD, 0x01, 0x01, 0x91, 0xB0, 0x79, 0x2F, 0xFC, 0x4E, 0x00, 0x00, 0x14,
+};
+constexpr std::array<u8, 24> WEB_CARRY_DONE{
+    0xED, 0x23, 0x40, 0xF9, 0x0D, 0x42, 0x1B, 0xD5, 0xF0, 0x47, 0x41, 0xAD,
+    0xEF, 0x43, 0x41, 0xA9, 0xED, 0x3B, 0xC5, 0xA8, 0xE2, 0xD1, 0xBA, 0x17,
+};
+constexpr std::array WEB_CARRY_RECORDS{
+    BuiltinPatchRecord{0x632D00, WEB_CARRY_HOOK, WEB_CARRY_ORIGINAL},
+    BuiltinPatchRecord{0x177E244, WEB_CARRY_ENTRY,
+                       std::span{WEB_CARRY_PADDING}.first(WEB_CARRY_ENTRY.size())},
+    BuiltinPatchRecord{0x177E2A8, WEB_CARRY_RANGE_CHECK,
+                       std::span{WEB_CARRY_PADDING}.first(WEB_CARRY_RANGE_CHECK.size())},
+    BuiltinPatchRecord{0x177E308, WEB_CARRY_SETUP,
+                       std::span{WEB_CARRY_PADDING}.first(WEB_CARRY_SETUP.size())},
+    BuiltinPatchRecord{0x177E504, WEB_CARRY_LOOKUP,
+                       std::span{WEB_CARRY_PADDING}.first(WEB_CARRY_LOOKUP.size())},
+    BuiltinPatchRecord{0x177E604, WEB_CARRY_MISS,
+                       std::span{WEB_CARRY_PADDING}.first(WEB_CARRY_MISS.size())},
+    BuiltinPatchRecord{0x177E368, WEB_CARRY_HIT,
+                       std::span{WEB_CARRY_PADDING}.first(WEB_CARRY_HIT.size())},
+    BuiltinPatchRecord{0x177E3C8, WEB_CARRY_CALC,
+                       std::span{WEB_CARRY_PADDING}.first(WEB_CARRY_CALC.size())},
+    BuiltinPatchRecord{0x177E428, WEB_CARRY_STORE,
+                       std::span{WEB_CARRY_PADDING}.first(WEB_CARRY_STORE.size())},
+    BuiltinPatchRecord{0x177E568, WEB_CARRY_DONE,
+                       std::span{WEB_CARRY_PADDING}.first(WEB_CARRY_DONE.size())},
+};
+constexpr std::array WEB_CARRY_STATE{BuiltinPatchState{0x4E9D100, 136}};
+
+// Keep the manager's original bit test and both targets. After the first eligible request,
+// require one guest second between requests. The hook preserves x8-x11, SP and NZCV.
+// The KaeGae registry lists these zero-filled alignment slots inside the exact build's text,
+// where the native-execution scanner can also translate the two timer reads.
+constexpr std::string_view TEXTURE_COMPACTION_NAME = "Texture heap compaction interval (built-in)";
+constexpr std::array<u8, 4> TEXTURE_COMPACTION_ORIGINAL{0x88, 0x00, 0x08, 0x36};
+constexpr std::array<u8, 4> TEXTURE_COMPACTION_HOOK{0xD3, 0x1E, 0x40, 0x14};
+constexpr std::array<u8, 28> TEXTURE_COMPACTION_PADDING{};
+constexpr std::array<u8, 28> TEXTURE_COMPACTION_ENTRY{
+    0x88, 0xDD, 0x0F, 0x36, 0xE8, 0x27, 0xBE, 0xA9, 0xEA, 0x2F, 0x01, 0xA9,
+    0x0B, 0x42, 0x3B, 0xD5, 0x08, 0xE0, 0x3B, 0xD5, 0x88, 0xDF, 0xFF, 0xB4,
+    0x93, 0xFE, 0xFF, 0x17,
+};
+constexpr std::array<u8, 24> TEXTURE_COMPACTION_SAMPLE{
+    0x29, 0xE0, 0x3B, 0xD5, 0xEA, 0xB8, 0x01, 0xF0, 0x4A, 0x01, 0x08, 0x91,
+    0x4A, 0x05, 0x40, 0xF9, 0x8A, 0x06, 0x00, 0xB4, 0x1B, 0x00, 0x00, 0x14,
+};
+constexpr std::array<u8, 24> TEXTURE_COMPACTION_ELAPSED{
+    0xEA, 0xB8, 0x01, 0xF0, 0x4A, 0x01, 0x41, 0xF9, 0x2A, 0x01, 0x0A, 0xCB,
+    0x5F, 0x01, 0x08, 0xEB, 0x83, 0x05, 0x00, 0x54, 0x13, 0x00, 0x00, 0x14,
+};
+constexpr std::array<u8, 20> TEXTURE_COMPACTION_RECORD{
+    0xEA, 0xB8, 0x01, 0xF0, 0x4A, 0x01, 0x08, 0x91, 0x28, 0x00, 0x80, 0xD2,
+    0x49, 0x21, 0x00, 0xA9, 0x2C, 0x00, 0x00, 0x14,
+};
+constexpr std::array<u8, 16> TEXTURE_COMPACTION_SKIP{
+    0x0B, 0x42, 0x1B, 0xD5, 0xEA, 0x2F, 0x41, 0xA9, 0xE8, 0x27, 0xC2, 0xA8,
+    0x45, 0xE2, 0xBF, 0x17,
+};
+constexpr std::array<u8, 16> TEXTURE_COMPACTION_ALLOW{
+    0x0B, 0x42, 0x1B, 0xD5, 0xEA, 0x2F, 0x41, 0xA9, 0xE8, 0x27, 0xC2, 0xA8,
+    0x2A, 0xE2, 0xBF, 0x17,
+};
+constexpr std::array TEXTURE_COMPACTION_RECORDS{
+    BuiltinPatchRecord{0x777278, TEXTURE_COMPACTION_HOOK, TEXTURE_COMPACTION_ORIGINAL},
+    BuiltinPatchRecord{0x177EDC4, TEXTURE_COMPACTION_ENTRY, TEXTURE_COMPACTION_PADDING},
+    BuiltinPatchRecord{0x177E828, TEXTURE_COMPACTION_SAMPLE,
+                       std::span{TEXTURE_COMPACTION_PADDING}.first<TEXTURE_COMPACTION_SAMPLE.size()>()},
+    BuiltinPatchRecord{0x177E8A8, TEXTURE_COMPACTION_ELAPSED,
+                       std::span{TEXTURE_COMPACTION_PADDING}.first<TEXTURE_COMPACTION_ELAPSED.size()>()},
+    BuiltinPatchRecord{0x177E908, TEXTURE_COMPACTION_RECORD,
+                       std::span{TEXTURE_COMPACTION_PADDING}.first<TEXTURE_COMPACTION_RECORD.size()>()},
+    BuiltinPatchRecord{0x177E968, TEXTURE_COMPACTION_SKIP,
+                       std::span{TEXTURE_COMPACTION_PADDING}.first<TEXTURE_COMPACTION_SKIP.size()>()},
+    BuiltinPatchRecord{0x177E9C8, TEXTURE_COMPACTION_ALLOW,
+                       std::span{TEXTURE_COMPACTION_PADDING}.first<TEXTURE_COMPACTION_ALLOW.size()>()},
+};
+constexpr std::array TEXTURE_COMPACTION_STATE{BuiltinPatchState{0x4E9D200, 16}};
 
 constexpr std::array BUILTIN_PATCHES{
     // Ocarina of Time takes its "dynamic resolution disabled" path, so the 3D renders at full scale
@@ -796,6 +983,15 @@ constexpr std::array BUILTIN_PATCHES{
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = DYNAMIC_FPS_RECORDS,
         .states = DYNAMIC_FPS_STATES,
+    },
+    BuiltinPatch{
+        .name = "OoT day/night clock (FPS Unlock)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = CLOCK_CARRY_RECORDS,
+        .states = CLOCK_CARRY_STATE,
+        .requires_patch = FPS_UNLOCK_NAME,
     },
     // The NVIDIA DLSS quality lowers Ocarina's render resolution under Max Resolution, since DLSS
     // replaces the game's own 1440p -> 4K upscale and takes whatever the game renders.
@@ -890,6 +1086,27 @@ constexpr std::array BUILTIN_PATCHES{
         .records = TEXT_SPEED_2X_RECORDS,
         .off_by_default = true,
         .group = "Text Speed",
+    },
+    BuiltinPatch{
+        .name = "Deku Tree floor web (FPS Unlock)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = WEB_CARRY_RECORDS,
+        .states = WEB_CARRY_STATE,
+        .requires_patch = FPS_UNLOCK_NAME,
+    },
+    BuiltinPatch{
+        .name = TEXTURE_COMPACTION_NAME,
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = TEXTURE_COMPACTION_RECORDS,
+        .states = TEXTURE_COMPACTION_STATE,
+        .off_by_default = true,
+        .skip_on_cheat_overlap = true,
+        .description = "Limits requests for new texture heap compaction rounds to once per guest "
+                       "second. This may increase heap fragmentation. Restart the game to apply.",
     },
     BuiltinPatch{
         .name = "Full Scene Resolution with FXAA (built-in)",
@@ -1577,11 +1794,11 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         if (!apply) {
             continue;
         }
-        if (!patch.requires_patch.empty()) {
+        if (!patch.requires_patch.empty() || patch.skip_on_cheat_overlap) {
             const auto overlaps =
                 FindBuiltinCheatOverlaps(title_id, std::span{&patch.name, 1}, load_cheats());
             if (!overlaps.empty()) {
-                LOG_INFO(Loader, "    - Skipping \"{}\": cheat \"{}\" uses the hook or code cave",
+                LOG_INFO(Loader, "    - Skipping \"{}\": cheat \"{}\" overlaps the patch",
                          patch.name, overlaps.front().cheat);
                 continue;
             }

@@ -238,7 +238,7 @@ public:
             FlushUploads();
         }
         ++record_serial;
-        if (Common::DkbFrameTrace::Enabled()) {
+        if (Common::DkbFrameTrace::GpuSitesEnabled()) {
             RecordSiteMarker(location);
         }
         if (chunk->Record(command)) {
@@ -248,7 +248,7 @@ public:
         (void)chunk->Record(command);
     }
 
-    /// Send work to a separate thread; `location` labels it in EDEN_DKB_FRAME_TRACE's gpu_site log.
+    /// Send work to a separate thread; `location` labels it in EDEN_DKB_GPU_SITES's gpu_site log.
     template <typename T>
         requires std::is_invocable_v<T, vk::CommandBuffer>
     void Record(T&& c, std::source_location location = std::source_location::current()) {
@@ -505,7 +505,7 @@ private:
 
     void TraceGpuSubmission();
     void ReportWorkTimes();
-    /// EDEN_DKB_FRAME_TRACE: before each recorded command, a marker that timestamps it in
+    /// EDEN_DKB_GPU_SITES: before each recorded command, a marker that timestamps it in
     /// sampled submissions, so the frame's GPU time can be split by the code that recorded it.
     void RecordSiteMarker(std::source_location location);
     /// Worker thread, run by a marker: writes its timestamp while a sampled submission records.

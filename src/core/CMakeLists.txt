@@ -860,6 +860,8 @@ add_library(core STATIC
     hle/service/ns/ecommerce_interface.h
     hle/service/ns/factory_reset_interface.cpp
     hle/service/ns/factory_reset_interface.h
+    hle/service/ns/game_list_applications.cpp
+    hle/service/ns/game_list_applications.h
     hle/service/ns/language.cpp
     hle/service/ns/language.h
     hle/service/ns/ns.cpp

@@ -75,6 +75,7 @@
 #include "core/hle/service/sm/sm.h"
 #include "core/internal_network/local_redirect.h"
 #include "core/internal_network/network.h"
+#include "core/loader/deconstructed_rom_directory.h"
 #include "core/loader/loader.h"
 #include "core/loader/nx.h"
 #include "core/memory.h"
@@ -139,7 +140,7 @@ FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
     }
 
     if (Common::FS::IsDir(path)) {
-        return vfs->OpenFile(path + "/main", FileSys::OpenMode::Read);
+        return Loader::ResolveLooseProgram(vfs->OpenDirectory(path, FileSys::OpenMode::Read));
     }
 
     return vfs->OpenFile(path, FileSys::OpenMode::Read);
@@ -165,20 +166,9 @@ std::optional<u64> FindSwitch2Program(const FileSys::VirtualFile& file, u64 prog
     FileSys::ProgramMetadata metadata;
     if (FileSys::NupContainer::IsNupFile(file)) {
         FileSys::NupContainer nup{file};
-        if (nup.GetStatus() != Loader::ResultStatus::Success) {
-            return std::nullopt;
-        }
-        const auto base = nup.FindBasePackage();
-        const auto update = nup.FindBestUpdatePackage();
-        std::optional<std::size_t> program;
-        if (update && nup.GetExeFSDir(*update) != nullptr) {
-            program = update;
-        } else if (base && nup.GetExeFSDir(*base) != nullptr) {
-            program = base;
-        }
-        const auto exefs = program ? nup.GetExeFSDir(*program) : nullptr;
-        const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
-        return Switch2ProgramId(metadata, npdm);
+        const auto program = nup.SelectProgram();
+        return program ? Switch2ProgramId(metadata, program->exefs->GetFile("main.npdm"))
+                       : std::nullopt;
     }
     const auto type = file != nullptr ? Loader::IdentifyFile(file) : Loader::FileType::Unknown;
     if (type == Loader::FileType::NX) {
@@ -235,6 +225,12 @@ struct System::Impl {
 
     u64 program_id;
 
+    void EnsureFilesystem() {
+        if (virtual_filesystem == nullptr) {
+            virtual_filesystem = std::make_shared<FileSys::RealVfsFilesystem>();
+        }
+    }
+
     bool Initialize(System& system) {
         try {
             device_memory.emplace();
@@ -251,10 +247,7 @@ struct System::Impl {
         core_timing.SetMulticore(is_multicore);
         core_timing.Initialize([&system]() { system.RegisterHostThread(); });
 
-        // Create a default fs if one doesn't already exist.
-        if (virtual_filesystem == nullptr) {
-            virtual_filesystem = std::make_shared<FileSys::RealVfsFilesystem>();
-        }
+        EnsureFilesystem();
         if (content_provider == nullptr) {
             content_provider = std::make_unique<FileSys::ContentProviderUnion>();
         }
@@ -420,6 +413,10 @@ struct System::Impl {
             return SystemResultStatus::ErrorMemoryAllocation;
         }
         Kernel::Nx2ThreadStats::ReadSwitch();
+#if defined(ARCHITECTURE_x86_64)
+        core_timing.ConfigureInlineCntpct(!Kernel::Nx2ThreadStats::g_enabled &&
+                                         !system.DebuggerEnabled());
+#endif
         Service::FileSystem::ReadTraceScope::ReadSwitch();
         kernel.Initialize();
         return SystemResultStatus::Success;
@@ -500,15 +497,14 @@ struct System::Impl {
         }
 
         VideoCommon::StutterTrace::BootMarker("boot_start");
+        EnsureFilesystem();
         if (params.launch_type == Service::AM::LaunchType::FrontendInitiated) {
             fs_controller.InitTempStorage();
         }
 
-        const std::optional<u64> switch2_program_id =
-            virtual_filesystem != nullptr
-                ? FindSwitch2Program(GetGameFileFromPath(virtual_filesystem, filepath),
-                                     params.program_id, params.program_index)
-                : std::nullopt;
+        const auto file = GetGameFileFromPath(virtual_filesystem, filepath);
+        const auto switch2_program_id =
+            FindSwitch2Program(file, params.program_id, params.program_index);
         const bool switch2_program = switch2_program_id.has_value();
         Kernel::KSystemControl::SetApplicationProgramId(switch2_program_id.value_or(0));
         Settings::SetCurrentProgramIsSwitch2(switch2_program);
@@ -564,8 +560,6 @@ struct System::Impl {
         if (params.applet_type == Service::AM::AppletType::Application) {
             current_application_filepath = filepath;
         }
-
-        const auto file = GetGameFileFromPath(virtual_filesystem, filepath);
 
         // Create the application process
         Loader::ResultStatus load_result{};
@@ -675,7 +669,7 @@ struct System::Impl {
 
         if (Settings::values.gamecard_inserted) {
             if (Settings::values.gamecard_current_game) {
-                fs_controller.SetGameCard(GetGameFileFromPath(virtual_filesystem, filepath));
+                fs_controller.SetGameCard(file);
             } else if (!Settings::values.gamecard_path.GetValue().empty()) {
                 const auto& gamecard_path = Settings::values.gamecard_path.GetValue();
                 fs_controller.SetGameCard(GetGameFileFromPath(virtual_filesystem, gamecard_path));
@@ -869,8 +863,10 @@ struct System::Impl {
 
     /// Service manager
     std::shared_ptr<Service::SM::ServiceManager> service_manager;
-    /// ContentProviderUnion instance
-    std::unique_ptr<FileSys::ContentProviderUnion> content_provider;
+    /// ContentProviderUnion instance. Empty until a frontend sets its own, so a System nobody gave
+    /// a provider (tests, tools) still has one to look titles up in.
+    std::unique_ptr<FileSys::ContentProviderUnion> content_provider =
+        std::make_unique<FileSys::ContentProviderUnion>();
     /// AppLoader used to load the current executing application
     std::unique_ptr<Loader::AppLoader> app_loader;
     std::stop_source stop_event;
@@ -1416,6 +1412,9 @@ void System::NotifyApplicationChanged(u64 program_id) {
 }
 
 void System::ApplySettings() {
+#if defined(ARCHITECTURE_x86_64)
+    impl->core_timing.RefreshInlineCntpct();
+#endif
     impl->RefreshTime(*this);
 
     if (IsPoweredOn()) {

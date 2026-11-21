@@ -226,6 +226,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
       kept_spirv(std::move(kept_spirv_)) {
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
+        build_notify = shader_notify;
     }
     std::copy_n(info.constant_buffer_used_sizes.begin(), uniform_buffer_sizes.size(),
                 uniform_buffer_sizes.begin());
@@ -343,7 +344,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             is_built = true;
             build_condvar.notify_all();
             if (shader_notify) {
-                shader_notify->MarkShaderComplete();
+                NotifyBuilt();
             }
             return;
         }
@@ -365,7 +366,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         is_built = true;
         build_condvar.notify_all();
         if (shader_notify) {
-            shader_notify->MarkShaderComplete();
+            NotifyBuilt();
         }
     }};
     build_task = std::move(func);
@@ -390,7 +391,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
                     is_built = true;
                     build_condvar.notify_all();
                     if (shader_notify) {
-                        shader_notify->MarkShaderComplete();
+                        NotifyBuilt();
                     }
                 };
                 try {
@@ -418,6 +419,14 @@ ComputePipeline::~ComputePipeline() {
         // Nothing needs a pipeline that goes: a build still queued is dropped.
         jobs->Cancel(job);
         job.Wait();
+    }
+    // A dropped build never ran, and never counted itself as done.
+    NotifyBuilt();
+}
+
+void ComputePipeline::NotifyBuilt() noexcept {
+    if (build_notify != nullptr && !build_notified.exchange(true)) {
+        build_notify->MarkShaderComplete();
     }
 }
 
@@ -763,6 +772,10 @@ ComputePipeline::ConfigureResult ComputePipeline::Configure(
     }
     part.reset();
 
+    if (guest_descriptor_queue.HasRejectedTexelBuffer()) {
+        return ConfigureResult::Failed;
+    }
+
     RescalingPushConstant rescaling;
     const VideoCommon::SamplerId* samplers_it{samplers.data()};
     const VideoCommon::ImageViewInOut* views_it{views.data()};
@@ -846,7 +859,8 @@ ComputePipeline::ConfigureResult ComputePipeline::Configure(
     // Log compute pipeline binding
     if (GPU::Logging::IsActive() &&
         Settings::values.gpu_log_vulkan_calls.GetValue()) {
-        GPU::Logging::GPULogger::GetInstance().LogPipelineBind(true, "compute pipeline");
+        GPU::Logging::GPULogger::GetInstance().LogPipelineBind(
+            true, fmt::format("shader={:016x}", shader_hash));
     }
 
     const DescriptorUpdateEntry* const descriptor_data{guest_descriptor_queue.UpdateData()};

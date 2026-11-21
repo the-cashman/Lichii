@@ -17,22 +17,22 @@ namespace Vulkan {
 class Device;
 class Scheduler;
 
-/// AMD FidelityFX Super Resolution 3 (FSR 3) Frame Generation pipeline.
+/// Lichii Optical Flow Frame Generation pipeline.
 /// Uses compute-based optical flow and bilateral frame interpolation
 /// to synthesize intermediate frames without requiring engine motion vectors.
 ///
 /// Optimizations:
-///  - Quarter-resolution optical flow (16├ù fewer compute invocations)
+///  - Quarter-resolution optical flow (16× fewer compute invocations)
 ///  - Shared-memory tile caching in both shaders
 ///  - Early-out for static pixels (skip diamond search)
 ///  - Duplicate-frame detection (skip optical flow entirely)
 ///  - Precise pipeline barriers instead of full-pipeline TransitionImageLayout
 ///  - Descriptor-write caching (only update when image views change)
-class Fsr3FrameGen {
+class OpticalFlowFrameGen {
 public:
-    explicit Fsr3FrameGen(const Device& device, MemoryAllocator& memory_allocator,
-                          VkExtent2D extent, VkFormat format);
-    ~Fsr3FrameGen();
+    explicit OpticalFlowFrameGen(const Device& device, MemoryAllocator& memory_allocator,
+                                 VkExtent2D extent, VkFormat format);
+    ~OpticalFlowFrameGen();
 
     void Process(const Device& device, Scheduler& scheduler, VkImage current_frame,
                  VkImageView current_view, u64 frame_count);

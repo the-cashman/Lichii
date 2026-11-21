@@ -2119,6 +2119,12 @@ private:
                                           app_program_id == MarioKartWorldProgramId)) {
             frames_ahead = 1;
         }
+        constexpr u64 DuskbloodsNetworkTestProgramId = 0x0400D1D02399A000ULL;
+        const bool duskbloods_auto_ahead =
+            frames_ahead_setting == -1 && app_program_id == DuskbloodsNetworkTestProgramId;
+        if (duskbloods_auto_ahead) {
+            frames_ahead = 1;
+        }
         const auto entered = std::chrono::steady_clock::now();
         static const bool fence_trace = [] {
             const char* value = std::getenv("EDEN_NX2_PRESENT_FENCE_TRACE");
@@ -2145,7 +2151,7 @@ private:
                                         m_previous_fence_id, m_previous_fence_value);
             WaitForFrame(m_previous_fence_id, m_previous_fence_value);
             if (gpu_behind) {
-                WaitForFrame(~w[22], w[24]);
+                WaitForFrame(~w[22], w[24], duskbloods_auto_ahead);
             }
         } else if (frames_ahead == 0) {
             WaitForFrame(~w[22], w[24]);
@@ -2259,6 +2265,7 @@ private:
     // present faster than that. Every slot is reported free here: hold each present until the
     // next vblank instead (title 4 ran at up to 160 fps, its timing and audio with it).
     Nx2PresentPacer m_present_pacer;
+    bool m_unpaced_cap_logged{};
     u32 m_swap_word{};
 
     // Mario Kart World's 60 FPS mode with the 30 FPS fallback (loader/nso.cpp): the game reads its
@@ -2686,7 +2693,15 @@ private:
         // EDEN_NX2_PACE: the rate the presenter releases frames at caps the game too, so it
         // doesn't make frames faster than they are shown (they would queue up as latency).
         const s64 pace_ns = Tegra::Nx2Pace::GuestIntervalNs();
-        if (!speed_limited && fps_limit == 0 && pace_ns == 0) {
+        const u32 unpaced_cap = UnpacedFpsCap(process != nullptr && process->IsFrameRateUnlocked(),
+                                              speed_limited || timer_paced, fps_limit);
+        if (unpaced_cap != 0 && !std::exchange(m_unpaced_cap_logged, true)) {
+            LOG_INFO(Service,
+                     "nx2:vi2 the frame rate is unlocked with neither the speed limit nor an FPS "
+                     "limit: presents are held to {} fps, the most its frame step patch is made for",
+                     unpaced_cap);
+        }
+        if (!speed_limited && fps_limit == 0 && unpaced_cap == 0 && pace_ns == 0) {
             Tegra::g_nx2_guest_frame_interval_ns.store(0, std::memory_order_relaxed);
             return;
         }
@@ -2700,11 +2715,12 @@ private:
                         : std::chrono::nanoseconds{100'000'000'000LL * swap_interval /
                                                    refresh_rate /
                                                    (speed_limited ? Settings::SpeedLimit() : 100)};
-        const auto interval =
-            (std::max)(PacedInterval(vblank_interval, fps_limit), std::chrono::nanoseconds{pace_ns});
+        const auto interval = (std::max)(unpaced_cap != 0
+                                             ? std::chrono::nanoseconds{1'000'000'000LL / unpaced_cap}
+                                             : PacedInterval(vblank_interval, fps_limit),
+                                         std::chrono::nanoseconds{pace_ns});
         Tegra::g_nx2_guest_frame_interval_ns.store(
-            static_cast<u64>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(interval).count()),
+            unpaced_cap == 0 ? static_cast<u64>(interval.count()) : 0,
             std::memory_order_relaxed);
         if (trace) {
             m_frame_trace.target_ms = std::chrono::duration<double, std::milli>(interval).count();

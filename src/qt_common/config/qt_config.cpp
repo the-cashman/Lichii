@@ -73,6 +73,14 @@ void QtConfig::SaveAllValues() {
     SaveQtValues();
 }
 
+void QtConfig::SaveLastSeenRelease(u32 build) {
+    UISettings::values.last_seen_release = build;
+    BeginGroup(Settings::TranslateCategory(Settings::Category::Ui));
+    WriteSettingGeneric(&UISettings::values.last_seen_release);
+    EndGroup();
+    WriteToIni();
+}
+
 void QtConfig::ReadQtValues() {
     if (global) {
         ReadUIValues();
