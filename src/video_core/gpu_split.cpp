@@ -174,13 +174,7 @@ void GpuSplit::MaybeStart(Core::System& system_) {
                          std::getenv("EDEN_NX2_GUEST_THREAD_STATS") != nullptr;
     ring = std::make_unique<u64[]>(RingWords);
     ++starts; // Before the back starts: its holds name entries with it (EntryTag)
-    // EDEN_NX2_RENDER_FOLLOWER=1: record warm direct draws on GPURender. Off by default: the back
-    // joined it on 99.8% of packets in OoT (#2348), so it added a wake-up per draw.
-    const char* const render = std::getenv("EDEN_NX2_RENDER_FOLLOWER");
-    const bool render_requested = render != nullptr && render[0] == '1';
-    if (render_requested && !render_follower_supported) {
-        LOG_INFO(HW_GPU, "GPU render follower: unsupported on this renderer or driver");
-    } else if (render_requested) {
+    if (render_follower_supported) {
         render_overlap_entries = 0;
         render_joins = 0;
         render_follower.emplace();
