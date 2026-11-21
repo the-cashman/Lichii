@@ -111,10 +111,11 @@ high-refresh monitor cannot raise the default game rate when `fps_limit` is 0.
 Explicit timer-rate overrides still apply; existing settings are not reset.
 
 In #2049, keeping FPS Unlock enabled and limiting the emulator to 60 FPS resolved
-stuck battle music, skipped song notes and Epona's missing jump animation. Keeping
-the default at 60 is a mitigation for those high-frame-rate bugs, not a fix for
-their underlying game logic. Users with a higher configured rate should keep the
-60 FPS limit until those bugs are resolved.
+stuck battle music, skipped song notes and Epona's missing jump animation. The
+BGM callbacks on the sound gate's skipped frames (below) fix the battle music.
+Keeping the default at 60 is still a mitigation for the song notes and Epona's
+jump; users with a higher configured rate should keep the 60 FPS limit until
+those are resolved.
 
 ## FPS Unlock: sound manager at 60 Hz
 
@@ -133,14 +134,25 @@ and its step load at `0x415334`, `ldr s0, [x8, #0x10]`, with `bl 0x3C46280`
 (16 bytes, returns `max(step, 1.0)`). In phase 0 the gate runs the job as before
 when the step is at least 1.0. Below that it adds the step to an accumulator
 at `0x4E9FEA0` and runs the job only once a whole step has built up, keeping
-the remainder; otherwise it returns. Other phases follow that frame's decision
+the remainder. Other phases follow that frame's decision
 (flag at `0x4E9FEA4`). So above 60 fps the sound manager runs at 60 Hz with
 whole steps and sound still follows real time; at 60 fps and below nothing
 changes. FPS Unlock's timer state grows to `0xA8` bytes to cover both words.
 Dynamic FPS never lowers the step below 1.0 and does not include the gate.
 
-Both caves are in the executable padding after the text (`0x3C46280` follows
-the FPS routine at `0x3C46200`; `0x3C46800` is past the other caves in use).
+The gate and step clamp are in the executable padding after the text. On skipped
+frames the branches at `0x3C46854` and `0x3C46878` run only the BGM callbacks, so
+combat and area music can transition on every frame (#2036, #2049). The stub scans
+the phase 0 list (`S+0xE0/+0xE8`) for `game::Bgm` (vtable `0x4BD67C8`) or the
+phase 1 list (`S+0xF0/+0xF8`) for `game::BgmSub` (vtable `0x4BD7840`), where
+`S = *[main+0x4E84E08]`. It calls vtable slot `+0x28` with flag bit 0, then
+reloads the list and calls slot `+0x30` on matching objects with that bit clear.
+`game::Bgm` reads the raw step at `T+0x10/+0x18`, where `T = *[main+0x4E94B20]`.
+The rest of the sound job and its step clamp still run at 60 Hz above 60 fps.
+
+The stub uses seven zero-filled alignment slots within `.text` at `0x17803A4`,
+`0x1780864`, `0x17808C4`, `0x1780AE4`, `0x1780D64`, `0x1780EA4`, and `0x1781044`.
+FPS Unlock checks the original bytes in each slot before it applies any records.
 
 ## FPS Unlock step counters
 

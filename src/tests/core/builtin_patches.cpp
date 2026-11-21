@@ -73,9 +73,25 @@ constexpr u32 SoundStepCallInstruction = 0x94E0C3D3;      // bl main+0x3C46280
 constexpr std::string_view SoundGate =
     "D09200B010823A9102030035C9810090294944F9290140F9301140BD11102E1E0022311EAA010054"
     "120240BD522A301E4022311ECB000054523A311E120200BD29008052090600B90A000014120200BD"
-    "1F0600B9C0035FD61F2003D529008052090600B903000014090640B9690000347F2303D5A43A1F17"
-    "C0035FD6";
+    "1F0600B9D4E66C171F2003D529008052090600B903000014090640B9690000347F2303D5A43A1F17"
+    "CBE66C17";
 constexpr std::string_view SoundFeed = "001140BD10102E1E0068301EC0035FD6";
+constexpr std::array<std::pair<size_t, std::string_view>, 7> SoundBgmCaves{{
+    {sizeof(Loader::NSOHeader) + 0x17803A4,
+     "5F040071A800005428B80190080547F9480000B42B010014C0035FD6"},
+    {sizeof(Loader::NSOHeader) + 0x1780864,
+     "0851228BA9A201F02AE120D1290121914931899A13000014"},
+    {sizeof(Loader::NSOHeader) + 0x17808C4,
+     "7F2303D5FD7BBCA9F35301A9F55B02A9F71B00F9FD03009182000014"},
+    {sizeof(Loader::NSOHeader) + 0x1780AE4,
+     "F30308AAF40309AA1705805276E240B9D62A0034757640F99A000014"},
+    {sizeof(Loader::NSOHeader) + 0x1780D64,
+     "A08640F8080040F91F0114EB210A005401604039210000124A000014"},
+    {sizeof(Loader::NSOHeader) + 0x1780EA4,
+     "3F10576A61000054086977F800013FD6D606007161F5FF5462000014"},
+    {sizeof(Loader::NSOHeader) + 0x1781044,
+     "F722001157D51F36F71B40F9F55B42A9F35341A9FD7BC4A8FF0F5FD6"},
+}};
 constexpr u32 DynamicCallInstruction = 0x94D57D4F;
 constexpr u32 DynamicOriginalInstruction = 0x1E201828;
 constexpr size_t EponaHookOffset = sizeof(Loader::NSOHeader) + 0x2C3AE20;
@@ -504,7 +520,10 @@ TEST_CASE("Built-in FPS Unlock defaults on and replaces Dynamic FPS", "[patch_ma
                hex_at(nso, SoundGateOffset, SoundGate.size() / 2) == SoundGate &&
                hex_at(nso, SoundFeedOffset, SoundFeed.size() / 2) == SoundFeed;
     };
-    const auto sound_gate_untouched = [](const std::vector<u8>& nso) {
+    const auto sound_gate_untouched = [&](const std::vector<u8>& nso) {
+        for (const auto& [offset, bytes] : SoundBgmCaves) {
+            REQUIRE(hex_at(nso, offset, bytes.size() / 2) == std::string(bytes.size(), '0'));
+        }
         return WordAt(nso, SoundEntryOffset) == SoundEntryOriginalInstruction &&
                WordAt(nso, SoundStepOffset) == SoundStepOriginalInstruction &&
                WordAt(nso, SoundGateOffset) == 0 && WordAt(nso, SoundFeedOffset) == 0;
@@ -556,6 +575,9 @@ TEST_CASE("Built-in FPS Unlock defaults on and replaces Dynamic FPS", "[patch_ma
     REQUIRE(WordAt(patched) == BranchInstruction);
     REQUIRE(water_patched(patched));
     REQUIRE(sound_gate_patched(patched));
+    for (const auto& [offset, bytes] : SoundBgmCaves) {
+        REQUIRE(hex_at(patched, offset, bytes.size() / 2) == bytes);
+    }
 
     // Unchecking only Dynamic FPS keeps FPS Unlock.
     Settings::values.disabled_addons[OcarinaTitleId] = {std::string{DynamicFps}};
@@ -702,6 +724,10 @@ TEST_CASE("Built-in FPS Unlock skips the sound gate's sites only as a whole patc
     SECTION("Nonzero gate cave") {
         nso[SoundGateOffset + 4] = 1;
     }
+    SECTION("Nonzero BGM cave") {
+        const auto& [offset, bytes] = SoundBgmCaves.back();
+        nso[offset + bytes.size() / 2 - 1] = 1;
+    }
     SECTION("Nonzero sound state") {
         nso[DynamicStateOffset + 0xA4] = 1;
     }
@@ -711,6 +737,11 @@ TEST_CASE("Built-in FPS Unlock skips the sound gate's sites only as a whole patc
     REQUIRE(WordAt(patched, DynamicRoutineOffset + DynamicRoutineSize) == 0);
     REQUIRE(WordAt(patched, SoundStepOffset) != SoundStepCallInstruction);
     REQUIRE(WordAt(patched, SoundEntryOffset) != SoundEntryBranchInstruction);
+    REQUIRE(WordAt(patched, SoundGateOffset) == 0);
+    for (const auto& [offset, bytes] : SoundBgmCaves) {
+        REQUIRE(std::equal(nso.begin() + offset, nso.begin() + offset + bytes.size() / 2,
+                           patched.begin() + offset));
+    }
 }
 
 TEST_CASE("Built-in FPS Unlock applies all step counters", "[patch_manager]") {

@@ -225,10 +225,12 @@ constexpr std::array<u8, 148> WATER_STEPS_ROUTINE{
 // restart (#716, #1092). So above 60 fps FPS Unlock runs the sound manager job (main+0x415300,
 // phase in w2; phase 0 reads the step and updates the engine, phase 1 follows) at 60 Hz: its entry
 // goes to SOUND_GATE, which in phase 0 adds the step to an accumulator (timer state + 0xA0) and
-// runs the job only once a whole step has built up, else returns; the other phases follow that
+// runs the job only once a whole step has built up. The other phases follow that
 // frame's decision (flag at state + 0xA4). At 60 fps and below it runs every frame as before. The
 // job's step load (main+0x415334) goes to SOUND_FEED, max(step, 1.0), so the engine always gets
 // whole steps and sound still follows real time.
+// Skipping BGM updates with the full job breaks music transitions (#2036, #2049). The two wait
+// branches (main+0x3C46854 and main+0x3C46878) enter SOUND_BGM_ENTRY to run just Bgm/BgmSub.
 constexpr std::array<u8, 4> SOUND_ENTRY_ORIGINAL{0x7F, 0x23, 0x03, 0xD5}; // pacibsp
 constexpr std::array<u8, 4> SOUND_ENTRY_BRANCH{0x40, 0xC5, 0xE0, 0x14};   // b main+0x3C46800
 constexpr std::array<u8, 4> SOUND_STEP_ORIGINAL{0x00, 0x11, 0x40, 0xBD};  // ldr s0, [x8, #0x10]
@@ -237,10 +239,10 @@ constexpr std::array<u8, 4> SOUND_STEP_CALL{0xD3, 0xC3, 0xE0, 0x94};      // bl 
 // ldr x9, [x9] ; ldr s16, [x9, #0x10] ; fmov s17, #1.0 ; fcmp s16, s17 ; b.ge every_frame ;
 // ldr s18, [x16] ; fadd s18, s18, s16 ; fcmp s18, s17 ; b.lt wait ; fsub s18, s18, s17 ;
 // str s18, [x16] ; mov w9, #1 ; str w9, [x16, #4] ; b run ;
-// wait: str s18, [x16] ; str wzr, [x16, #4] ; ret ;
+// wait: str s18, [x16] ; str wzr, [x16, #4] ; b SOUND_BGM_ENTRY ;
 // every_frame: nop (a remainder built up below a whole step carries over) ; mov w9, #1 ;
 // str w9, [x16, #4] ; b run ;
-// other: ldr w9, [x16, #4] ; cbz w9, skip ; run: pacibsp ; b main+0x415304 ; skip: ret
+// other: ldr w9, [x16, #4] ; cbz w9, skip ; run: pacibsp ; b main+0x415304 ; skip: b SOUND_BGM_ENTRY
 // x9, x16 and s16-s18 are free at the job's entry.
 constexpr std::array<u8, 124> SOUND_GATE{
     0xD0, 0x92, 0x00, 0xB0, 0x10, 0x82, 0x3A, 0x91, 0x02, 0x03, 0x00, 0x35, 0xC9, 0x81, 0x00, 0x90,
@@ -248,14 +250,63 @@ constexpr std::array<u8, 124> SOUND_GATE{
     0x00, 0x22, 0x31, 0x1E, 0xAA, 0x01, 0x00, 0x54, 0x12, 0x02, 0x40, 0xBD, 0x52, 0x2A, 0x30, 0x1E,
     0x40, 0x22, 0x31, 0x1E, 0xCB, 0x00, 0x00, 0x54, 0x52, 0x3A, 0x31, 0x1E, 0x12, 0x02, 0x00, 0xBD,
     0x29, 0x00, 0x80, 0x52, 0x09, 0x06, 0x00, 0xB9, 0x0A, 0x00, 0x00, 0x14, 0x12, 0x02, 0x00, 0xBD,
-    0x1F, 0x06, 0x00, 0xB9, 0xC0, 0x03, 0x5F, 0xD6, 0x1F, 0x20, 0x03, 0xD5, 0x29, 0x00, 0x80, 0x52,
+    0x1F, 0x06, 0x00, 0xB9, 0xD4, 0xE6, 0x6C, 0x17, 0x1F, 0x20, 0x03, 0xD5, 0x29, 0x00, 0x80, 0x52,
     0x09, 0x06, 0x00, 0xB9, 0x03, 0x00, 0x00, 0x14, 0x09, 0x06, 0x40, 0xB9, 0x69, 0x00, 0x00, 0x34,
-    0x7F, 0x23, 0x03, 0xD5, 0xA4, 0x3A, 0x1F, 0x17, 0xC0, 0x03, 0x5F, 0xD6,
+    0x7F, 0x23, 0x03, 0xD5, 0xA4, 0x3A, 0x1F, 0x17, 0xCB, 0xE6, 0x6C, 0x17,
 };
 // ldr s0, [x8, #0x10] ; fmov s16, #1.0 ; fmaxnm s0, s0, s16 ; ret
 constexpr std::array<u8, 16> SOUND_FEED{
     0x00, 0x11, 0x40, 0xBD, 0x10, 0x10, 0x2E, 0x1E, 0x00, 0x68, 0x30, 0x1E, 0xC0, 0x03, 0x5F, 0xD6,
 };
+
+// Port of Fritchii's ac52b42c80 to zero-filled slots between game functions. Use the raw step
+// through the original callbacks. Scan S+0xE0/+0xE8 for Bgm in phase 0 or S+0xF0/+0xF8 for BgmSub
+// in phase 1, where S = *[main+0x4E84E08]. As in the game's loops (main+0x415878 and main+0x4154B0),
+// call vf+0x28 with flags & 1, reload the list, then call vf+0x30 only with bit 0 clear.
+constexpr size_t SOUND_BGM_ENTRY_OFFSET = 0x17803A4;
+constexpr std::array<u8, 28> SOUND_BGM_ENTRY{
+    0x5F, 0x04, 0x00, 0x71, 0xA8, 0x00, 0x00, 0x54, // cmp w2, #1; b.hi ret
+    0x28, 0xB8, 0x01, 0x90, 0x08, 0x05, 0x47, 0xF9, // adrp x8, #0x4e84000; ldr x8, [x8, #0xe08]
+    0x48, 0x00, 0x00, 0xB4, 0x2B, 0x01, 0x00, 0x14, // cbz x8, ret; b select
+    0xC0, 0x03, 0x5F, 0xD6,                         // ret (LR is still unsigned)
+};
+constexpr std::array<u8, 24> SOUND_BGM_SELECT{
+    0x08, 0x51, 0x22, 0x8B, 0xA9, 0xA2, 0x01, 0xF0, // add x8, x8, w2, uxtw #4; adrp x9, #0x4bd7000
+    0x2A, 0xE1, 0x20, 0xD1, 0x29, 0x01, 0x21, 0x91, // sub x10, x9, #0x838; add x9, x9, #0x840
+    0x49, 0x31, 0x89, 0x9A, 0x13, 0x00, 0x00, 0x14, // csel x9, x10, x9, lo (Bgm); b frame
+};
+constexpr std::array<u8, 28> SOUND_BGM_FRAME{
+    0x7F, 0x23, 0x03, 0xD5, 0xFD, 0x7B, 0xBC, 0xA9, // pacibsp; stp x29, x30, [sp, #-0x40]!
+    0xF3, 0x53, 0x01, 0xA9, 0xF5, 0x5B, 0x02, 0xA9, // stp x19, x20, [sp, #0x10]; stp x21, x22, [sp, #0x20]
+    0xF7, 0x1B, 0x00, 0xF9, 0xFD, 0x03, 0x00, 0x91, // str x23, [sp, #0x30]; mov x29, sp
+    0x82, 0x00, 0x00, 0x14,                         // b list
+};
+constexpr std::array<u8, 28> SOUND_BGM_LIST{
+    0xF3, 0x03, 0x08, 0xAA, 0xF4, 0x03, 0x09, 0xAA, // mov x19, x8; mov x20, x9
+    0x17, 0x05, 0x80, 0x52, 0x76, 0xE2, 0x40, 0xB9, // mov w23, #0x28; reload: ldr w22, [x19, #0xe0]
+    0xD6, 0x2A, 0x00, 0x34, 0x75, 0x76, 0x40, 0xF9, // cbz w22, restore; ldr x21, [x19, #0xe8]
+    0x9A, 0x00, 0x00, 0x14,                         // b scan
+};
+constexpr std::array<u8, 28> SOUND_BGM_SCAN{
+    0xA0, 0x86, 0x40, 0xF8, 0x08, 0x00, 0x40, 0xF9, // ldr x0, [x21], #8; ldr x8, [x0]
+    0x1F, 0x01, 0x14, 0xEB, 0x21, 0x0A, 0x00, 0x54, // cmp x8, x20; b.ne advance
+    0x01, 0x60, 0x40, 0x39, 0x21, 0x00, 0x00, 0x12, // ldrb w1, [x0, #0x18]; and w1, w1, #1
+    0x4A, 0x00, 0x00, 0x14,                         // b call
+};
+constexpr std::array<u8, 28> SOUND_BGM_CALL{
+    0x3F, 0x10, 0x57, 0x6A, 0x61, 0x00, 0x00, 0x54, // tst w1, w23, lsr #4; b.ne advance (only +0x30 can skip)
+    0x08, 0x69, 0x77, 0xF8, 0x00, 0x01, 0x3F, 0xD6, // ldr x8, [x8, x23]; blr x8
+    0xD6, 0x06, 0x00, 0x71, 0x61, 0xF5, 0xFF, 0x54, // advance: subs w22, w22, #1; b.ne scan
+    0x62, 0x00, 0x00, 0x14,                         // b next
+};
+constexpr std::array<u8, 28> SOUND_BGM_NEXT{
+    0xF7, 0x22, 0x00, 0x11, 0x57, 0xD5, 0x1F, 0x36, // add w23, w23, #8; tbz w23, #3, reload (0x30)
+    0xF7, 0x1B, 0x40, 0xF9, 0xF5, 0x5B, 0x42, 0xA9, // restore: ldr x23, [sp, #0x30]; ldp x21, x22, [sp, #0x20]
+    0xF3, 0x53, 0x41, 0xA9, 0xFD, 0x7B, 0xC4, 0xA8, // ldp x19, x20, [sp, #0x10]; ldp x29, x30, [sp], #0x40
+    0xFF, 0x0F, 0x5F, 0xD6,                         // retab
+};
+constexpr std::array<u8, 28> SOUND_BGM_PADDING{};
+
 constexpr std::array DYNAMIC_FPS_RECORDS{
     BuiltinPatchRecord{0x6E6CC4, DYNAMIC_FPS_CALL, DYNAMIC_FPS_ORIGINAL},
     BuiltinPatchRecord{0x3C46200, DYNAMIC_FPS_ROUTINE, {}, true},
@@ -519,7 +570,16 @@ constexpr std::array FPS_UNLOCK_RECORDS{
     BuiltinPatchRecord{0x2C2208C, CLOTH_DT_CALL_D, CLOTH_DT_ORIGINAL_D},
     BuiltinPatchRecord{0x3C46B00, CLOTH_DT_ROUTINE_S0, {}, true},
     BuiltinPatchRecord{0x3C46B30, CLOTH_DT_ROUTINE_S2, {}, true},
+    BuiltinPatchRecord{SOUND_BGM_ENTRY_OFFSET, SOUND_BGM_ENTRY, SOUND_BGM_PADDING},
+    BuiltinPatchRecord{0x1780864, SOUND_BGM_SELECT,
+                       std::span{SOUND_BGM_PADDING}.first(SOUND_BGM_SELECT.size())},
+    BuiltinPatchRecord{0x17808C4, SOUND_BGM_FRAME, SOUND_BGM_PADDING},
+    BuiltinPatchRecord{0x1780AE4, SOUND_BGM_LIST, SOUND_BGM_PADDING},
+    BuiltinPatchRecord{0x1780D64, SOUND_BGM_SCAN, SOUND_BGM_PADDING},
+    BuiltinPatchRecord{0x1780EA4, SOUND_BGM_CALL, SOUND_BGM_PADDING},
+    BuiltinPatchRecord{0x1781044, SOUND_BGM_NEXT, SOUND_BGM_PADDING},
 };
+constexpr auto SOUND_BGM_RECORDS = std::span{FPS_UNLOCK_RECORDS}.last<7>();
 
 // The render pipeline's settings are mirrored into nodes (main+0x11ac..., per setting: init, then
 // compare and store when it changes) after `bl getter; ldrb w8, [x0]`. `mov w8, wzr` there makes
@@ -1120,6 +1180,34 @@ constexpr std::array BUILTIN_PATCHES{
                        "Expect more aliasing in motion and likely higher GPU cost.",
     },
 };
+
+static_assert([] {
+    for (const auto& cave : SOUND_BGM_RECORDS) {
+        if (cave.original.size() != cave.bytes.size() ||
+            cave.module_offset < SOUND_BGM_ENTRY_OFFSET ||
+            cave.module_offset + cave.bytes.size() > 0x1781060) {
+            return false;
+        }
+        const auto overlaps = [&](size_t offset, size_t size) {
+            return offset < cave.module_offset + cave.bytes.size() &&
+                   cave.module_offset < offset + size;
+        };
+        for (const auto& patch : BUILTIN_PATCHES) {
+            for (const auto& record : patch.records) {
+                if (&record != &cave && overlaps(record.module_offset, record.bytes.size())) {
+                    return false;
+                }
+            }
+            for (const auto& hook : patch.hooks) {
+                if (overlaps(hook.cave_offset, hook.cave.size()) ||
+                    overlaps(hook.function_offset, hook.function_size)) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}());
 
 } // Anonymous namespace
 
