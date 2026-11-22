@@ -419,12 +419,40 @@ bool IsFastDrawQueryMethod(u32 method) {
            method - report < sizeof(Maxwell3D::Regs::ReportSemaphore) / sizeof(u32);
 }
 
+// register_count is stored and dirtied. Nothing a draw resolves reads it.
+// reserved[0] and reserved[1] are the shader id and still end the chain. (Lichii PR #2394)
+bool IsShaderRegisterCount(u32 method) {
+    constexpr u32 base = MAXWELL3D_REG_INDEX(pipelines);
+    constexpr u32 words = sizeof(Maxwell3D::Regs::Pipeline) / sizeof(u32);
+    constexpr u32 register_count_word =
+        offsetof(Maxwell3D::Regs::Pipeline, register_count) / sizeof(u32);
+    static_assert(register_count_word == 3);
+    if (method < base) {
+        return false;
+    }
+    const u32 delta = method - base;
+    if (delta >= Maxwell3D::Regs::MaxShaderProgram * words) {
+        return false;
+    }
+    return delta % words == register_count_word;
+}
+
+// Nothing a draw resolves reads these words. The value is still stored. (Lichii PR #2394)
+bool IsConstantColorRendering(u32 method) {
+    constexpr u32 base = MAXWELL3D_REG_INDEX(const_color_rendering);
+    constexpr u32 words = sizeof(Maxwell3D::Regs::ConstantColorRendering) / sizeof(u32);
+    return method >= base && method < base + words;
+}
+
 } // Anonymous namespace
 
 // Whether a write to `method` leaves what a fast draw keeps from the draw before (pipeline, image
 // views, samplers, texture buffer bindings): the draw reads the register again on both paths, or
 // nothing a draw resolves from reads it.
 bool Maxwell3D::IsFastDrawParameter(u32 method) {
+    if (IsShaderRegisterCount(method) || IsConstantColorRendering(method)) {
+        return true;
+    }
     switch (method) {
     case MAXWELL3D_REG_INDEX(const_buffer.size):
     case MAXWELL3D_REG_INDEX(const_buffer.address_high):
