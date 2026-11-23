@@ -3898,8 +3898,10 @@ private:
             if (acquired && *acquired != w[2] && m_registered.contains(*acquired) &&
                 std::ranges::find(m_free, *acquired) == m_free.end() &&
                 std::ranges::none_of(m_outputs, is_acquired)) {
+                const auto timing = m_parallel_decode ? Nx2MovieClock::ReleaseTiming::AlignAtStart
+                                                      : Nx2MovieClock::ReleaseTiming::FollowClient;
                 m_clock.Released(HostTimeUs(),
-                                 Core::g_nx2_present_count.load(std::memory_order_relaxed));
+                                 Core::g_nx2_present_count.load(std::memory_order_relaxed), timing);
             }
         }
         const auto handle = HandOut(w[2], Fence{~w[4], w[6]});

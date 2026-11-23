@@ -109,3 +109,30 @@ TEST_CASE("NX2 movie clock doesn't follow a client that shows frames as it gets 
         REQUIRE(clock.Due(now + 500, 0) == static_cast<u64>(now + 500 - Start));
     }
 }
+
+TEST_CASE("NX2 movie clock keeps elapsed time when a running movie returns an old image late",
+          "[nx2_movie_clock]") {
+    using Clock = Service::Nx2MovieClock;
+    constexpr auto timing = Clock::ReleaseTiming::AlignAtStart;
+    Clock clock;
+    clock.Acquired(Start, 0, 0, 100);
+    clock.Acquired(Start + 2000, Frame, 0, 100);
+    clock.Released(Start + Frame, 101, timing);
+
+    const s64 acquired = Start + 2 * Frame;
+    clock.Acquired(acquired, 2 * Frame, 0, 102);
+    const s64 late = acquired + 330'000;
+    clock.Released(late, 104, timing);
+    REQUIRE(clock.Due(late, 0) == static_cast<u64>(late - Start));
+
+    // Resuming opens a new first handoff. A genuinely held startup frame can still align it.
+    const s64 resumed = late + Clock::PauseGap + 1;
+    clock.Acquired(resumed, 3 * Frame, resumed, 105);
+    clock.Acquired(resumed + 1000, 4 * Frame, resumed, 105);
+    const s64 shown = resumed + 100'000;
+    clock.Released(shown, 111, timing);
+    REQUIRE(clock.Due(shown, resumed) == static_cast<u64>(4 * Frame));
+    clock.Acquired(shown + Frame, 5 * Frame, resumed, 112);
+    clock.Released(shown + 3 * Frame, 114, timing);
+    REQUIRE(clock.Due(shown + 3 * Frame, resumed) == static_cast<u64>(7 * Frame));
+}

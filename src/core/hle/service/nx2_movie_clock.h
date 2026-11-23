@@ -12,6 +12,8 @@ namespace Service {
 // audio has reached. Times are host microseconds; pause_end is when emulation last resumed.
 class Nx2MovieClock {
 public:
+    enum class ReleaseTiming { FollowClient, AlignAtStart };
+
     // A longer gap between acquires is a pause, a longer lag a jump in the stream; both restart
     // the clock.
     static constexpr s64 PauseGap = 1'000'000;
@@ -21,8 +23,7 @@ public:
         offset.reset();
     }
 
-    // A client that holds the frame it acquired last through this many of its own presents before
-    // it gives an older image back shows frames at its own time.
+    // Minimum number of client presents before a held frame can align the playback clock.
     static constexpr u64 PacedPresents = 2;
 
     // The client acquired the frame at pts, at present count presents. The clock starts from the
@@ -35,23 +36,22 @@ public:
         if (!offset || now - last_acquire > PauseGap || pause_end > last_acquire ||
             pts < last_acquired_pts || acquired_offset - *offset > MaxCatchUp) {
             offset = acquired_offset;
+            first_release = true;
         }
         last_acquire = now;
         last_acquired_pts = pts;
         last_acquire_presents = presents;
     }
 
-    // The client gave an older image back while it still holds the frame it acquired last. If it
-    // held that frame through PacedPresents presents, it waited for its own clock to reach it and
-    // shows it now, so the clock moves to it. Kirby Air Riders can start its clock well after its
-    // first acquire; a clock started at that acquire stayed that far ahead for the whole movie,
-    // and every frame between the ones it held was dropped. A client
-    // that shows frames as it gets them (Ocarina of Time) gives the older image back within a
-    // present and isn't followed.
-    void Released(s64 now, u64 presents) {
-        if (offset && presents - last_acquire_presents >= PacedPresents) {
+    // Kirby can hold its first frames before starting its own clock. Ocarina can also give an
+    // older image back several presents late during uninterrupted playback. Use its first
+    // handoff to align the start, then keep elapsed time through those later stalls.
+    void Released(s64 now, u64 presents, ReleaseTiming timing = ReleaseTiming::FollowClient) {
+        if (offset && (first_release || timing == ReleaseTiming::FollowClient) &&
+            presents - last_acquire_presents >= PacedPresents) {
             offset = now - static_cast<s64>(last_acquired_pts);
         }
+        first_release = false;
     }
 
     // The pts the movie's audio has reached, unless the client hasn't acquired a frame yet or for
@@ -77,6 +77,7 @@ private:
     s64 last_acquire{};
     u64 last_acquired_pts{};
     u64 last_acquire_presents{};
+    bool first_release{};
 };
 
 } // namespace Service
