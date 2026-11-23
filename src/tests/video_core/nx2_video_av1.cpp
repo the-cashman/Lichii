@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <array>
+#include <future>
 #include <span>
 #include <vector>
 
@@ -138,4 +139,37 @@ TEST_CASE("NX2 video decodes AV1 on the CPU with libdav1d whatever NVDEC emulati
                                  pictures[0].frame->GetPlane(0) + 64,
                                  pictures[0].frame->GetPlane(0) + 1));
     }
+}
+
+TEST_CASE("NX2 pictures remain convertible on an output thread after decoder destruction",
+          "[video_core][nx2_video_av1]") {
+    if (avcodec_find_decoder_by_name("libdav1d") == nullptr) {
+        SKIP("FFmpeg has no libdav1d");
+    }
+    const auto emulation = Settings::values.nvdec_emulation.GetValue();
+    SCOPE_EXIT {
+        Settings::values.nvdec_emulation.SetValue(emulation);
+    };
+    Settings::values.nvdec_emulation.SetValue(Settings::NvdecEmulation::Cpu);
+    auto decoder = std::make_unique<Nx2VideoDecoder>("video/av1");
+    REQUIRE(decoder->IsOpen());
+    std::vector<Nx2Picture> pictures;
+    decoder->Decode(Av1Frame0, 123'000, pictures);
+    decoder->Drain(pictures);
+    REQUIRE(pictures.size() == 1);
+    REQUIRE(pictures.front().pts == 123'000);
+    std::vector<u8> reference(32 * 24 * 4);
+    decoder->Render(pictures.front(), Nx2PictureFormat::Rgba8, 32, 24, 32 * 4, 0, reference);
+    decoder.reset();
+
+    // A queued AVFrame owns its buffers independently of the codec context. The consumer's
+    // scaler must also remain independent when the producer resets or destroys that context.
+    auto output = std::async(std::launch::async, [pictures = std::move(pictures)] {
+        Tegra::Host1x::Nx2VideoFrameConverter converter;
+        std::vector<u8> bytes(32 * 24 * 4);
+        converter.Render(pictures.front(), Nx2PictureFormat::Rgba8, 32, 24, 32 * 4, 0, bytes);
+        return bytes;
+    });
+    const auto converted = output.get();
+    REQUIRE(std::equal(reference.begin(), reference.end(), converted.begin(), converted.end()));
 }

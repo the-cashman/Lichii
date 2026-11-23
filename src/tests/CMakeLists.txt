@@ -270,6 +270,7 @@ add_executable(tests
     core/nx2_image_layout.cpp
     core/nx2_movie_clock.cpp
     core/nx2_video_input_queue.cpp
+    core/nx2_video_frame_queue.cpp
     core/font_merge.cpp
     core/ldn.cpp
     core/internal_network/socket_proxy.cpp

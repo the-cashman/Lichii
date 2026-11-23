@@ -89,6 +89,7 @@
 #include "core/hle/service/nx2_image_layout.h"
 #include "core/hle/service/nx2_movie_clock.h"
 #include "core/hle/service/nx2_video_input_queue.h"
+#include "core/hle/service/nx2_video_frame_queue.h"
 #include "core/hle/service/nx2_present_pacer.h"
 #include "core/hle/service/nx2_present_queue.h"
 #include "core/hle/service/nx2_video_ready.h"
@@ -3647,13 +3648,18 @@ public:
 
     ~INx2VideoSession() override {
         m_ready->SetRunning(system.Kernel(), false);
-        if (m_worker.joinable()) {
+        if (m_worker.joinable() || m_decode_worker.joinable()) {
             {
                 std::scoped_lock lk{m_mutex};
                 m_quit = true;
             }
             m_cv.notify_all();
-            m_worker.join();
+            if (m_worker.joinable()) {
+                m_worker.join();
+            }
+            if (m_decode_worker.joinable()) {
+                m_decode_worker.join();
+            }
         }
         // The ready timer runs on the HostTiming thread: clear its event under its lock first.
         {
@@ -3673,11 +3679,7 @@ public:
 
 private:
     using Input = Nx2VideoInputQueue::Input;
-    struct Decoded {
-        std::optional<Tegra::Host1x::Nx2Picture> picture; // none: an empty end-of-stream frame
-        u64 pts;
-        bool end;
-    };
+    using Decoded = Nx2VideoFrameQueue::Frame;
     struct Output {
         u32 image;
         u32 width;
@@ -3776,15 +3778,28 @@ private:
                  w[6], w[7]);
         {
             std::scoped_lock lk{m_mutex};
+            if (m_worker.joinable()) {
+                DiscardPendingFrames();
+                m_stream_ended = false;
+                m_end_queued = false;
+                m_ready->room.store(true, std::memory_order_relaxed);
+            }
             m_codec = std::move(codec);
+            m_parallel_decode = system.GetApplicationProcessProgramID() == 0x0400486024DEC000ULL &&
+                                (m_codec == "video/av1" || m_codec == "video/av01");
             m_width = w[5];
             m_height = w[6];
             m_clock.Reset();
             m_stream_start.reset();
         }
         if (!m_worker.joinable()) {
+            // Keep ownership separate even when Configure switches this session to another codec.
+            if (system.GetApplicationProcessProgramID() == 0x0400486024DEC000ULL) {
+                m_decode_worker = std::thread{[this] { DecodeAheadLoop(); }};
+            }
             m_worker = std::thread{[this] { DecodeLoop(); }};
         }
+        m_cv.notify_all();
         TipcReplyWords(ctx, {});
     }
 
@@ -3841,7 +3856,7 @@ private:
             const bool drain_eos =
                 system.GetApplicationProcessProgramID() == Settings::MarioKartWorldProgramId;
             if ((drain_eos || release_now) && release_fence && m_stream_ended && m_inputs.Empty() &&
-                m_decoded.empty()) {
+                m_decoded.Empty()) {
                 const u32 reached =
                     drain_eos ? DrainFreeAsEndOfStream()
                               : static_cast<u32>(system.Host1x().GetSyncpointManager()
@@ -3858,10 +3873,10 @@ private:
                          "current={} eos={} inputs={} decoded={} outputs={}",
                          m_syncpoint, image, release_fence.has_value(), value,
                          system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(m_syncpoint),
-                         m_stream_ended, m_inputs.Size(), m_decoded.size(), m_outputs.size());
+                         m_stream_ended, m_inputs.Size(), m_decoded.Size(), m_outputs.size());
             }
         }
-        m_cv.notify_one();
+        m_cv.notify_all();
         return {~m_syncpoint, 0, value, 0};
     }
 
@@ -3944,7 +3959,7 @@ private:
                          m_inputs.Size());
             }
         }
-        m_cv.notify_one();
+        m_cv.notify_all();
         const u64 id = ++m_submitted;
         TipcReplyWords(ctx, {static_cast<u32>(id), static_cast<u32>(id >> 32)});
     }
@@ -3963,11 +3978,10 @@ private:
                          "nx2:vdec trace {} syncpoint={} inputs={} decoded={} outputs={} "
                          "decoded_frames={} frames_out={} eos={} eos_queued={}",
                          ctx.GetCommand() == 8 ? "flush" : "stop", m_syncpoint, m_inputs.Size(),
-                         m_decoded.size(), m_outputs.size(), m_decoded_frames, m_frames_out,
+                         m_decoded.Size(), m_outputs.size(), m_decoded_frames, m_frames_out,
                          m_stream_ended, m_end_queued);
             }
-            m_inputs.Clear();
-            m_flush = true;
+            DiscardPendingFrames();
             m_stream_ended = false;
             m_end_queued = false;
             m_clock.Reset();
@@ -3979,7 +3993,7 @@ private:
                 CompleteHandedFences();
             }
         }
-        m_cv.notify_one();
+        m_cv.notify_all();
         TipcReplyWords(ctx, {});
     }
 
@@ -3992,14 +4006,25 @@ private:
                 LOG_INFO(Service,
                          "nx2:vdec trace finalize syncpoint={} inputs={} decoded={} outputs={} "
                          "decoded_frames={} frames_out={} eos={} eos_queued={}",
-                         m_syncpoint, m_inputs.Size(), m_decoded.size(), m_outputs.size(),
+                         m_syncpoint, m_inputs.Size(), m_decoded.Size(), m_outputs.size(),
                          m_decoded_frames, m_frames_out, m_stream_ended, m_end_queued);
             }
+            DiscardPendingFrames();
             CompleteHandedFences();
             m_clock.Reset();
             m_stream_start.reset();
         }
+        m_cv.notify_all();
         TipcReplyWords(ctx, {});
+    }
+
+    // Called under m_mutex. The worker alone resets its codec, after an in-flight decode returns.
+    void DiscardPendingFrames() {
+        m_inputs.Clear();
+        m_decoded.Reset();
+        m_flush = true;
+        m_last_decoded_pts = 0;
+        m_dropped_in_a_row = 0;
     }
 
     s64 HostTimeUs() const {
@@ -4015,31 +4040,25 @@ private:
     // one, while the movie's audio plays in real time: below the movie's frame rate the picture
     // falls further behind the sound. Drop decoded frames a later frame has already overtaken
     // (m_mutex held). Returns true when the only frame left is late and more input is queued:
-    // decode on before filling an image.
+    // decode on before filling an image on the serial path. The parallel producer must not
+    // withhold the last available picture while its successor is still being decoded.
     bool DropOvertakenFrames() {
-        if (m_decoded.empty()) {
+        if (m_decoded.Empty()) {
             return false;
         }
         const auto due = m_clock.Due(HostTimeUs(), PauseEndUs());
         // A frame before the last one the client took: the movie looped or jumped back. The
         // clock restarts when the client takes it; until then every frame would look late.
-        if (!due || m_decoded.front().pts < m_clock.LastAcquiredPts() ||
+        if (!due || m_decoded.Front().pts < m_clock.LastAcquiredPts() ||
             ClientHeldImages() > MaxHeldForPacing) {
             m_dropped_in_a_row = 0;
             return false;
         }
-        while (m_decoded.size() >= 2 && m_dropped_in_a_row < MaxDroppedInARow) {
-            const Decoded& front = m_decoded[0];
-            const Decoded& next = m_decoded[1];
-            if (front.end || !front.picture || next.pts <= front.pts || next.pts > *due) {
-                break;
-            }
-            m_decoded.pop_front();
-            ++m_frames_dropped;
-            ++m_dropped_in_a_row;
-        }
-        const Decoded& front = m_decoded.front();
-        return m_decoded.size() == 1 && !m_inputs.Empty() && !front.end &&
+        const u32 dropped = m_decoded.DropOvertaken(*due, MaxDroppedInARow - m_dropped_in_a_row);
+        m_frames_dropped += dropped;
+        m_dropped_in_a_row += dropped;
+        const Decoded& front = m_decoded.Front();
+        return !m_parallel_decode && m_decoded.Size() == 1 && !m_inputs.Empty() && !front.end &&
                m_dropped_in_a_row < MaxDroppedInARow && front.pts + m_frame_interval < *due;
     }
 
@@ -4102,27 +4121,28 @@ private:
                              0, 0, 0});
     }
 
-    // The decode thread: turns queued input into decoded frames and decoded frames into output
-    // images, in order.
+    // The output thread owns conversion and image writes. Other codecs retain serial decoding;
+    // Ocarina's AV1 producer can decode ahead while this thread services a released image.
     void DecodeLoop() {
         Common::SetCurrentThreadName("nx2:vdec");
         std::unique_ptr<Tegra::Host1x::Nx2VideoDecoder> decoder;
         std::vector<Tegra::Host1x::Nx2Picture> pictures;
         std::vector<u8> bytes;
+        u64 decoder_generation{~u64{}};
+        Tegra::Host1x::Nx2VideoFrameConverter converter;
         std::unique_lock lk{m_mutex};
         while (true) {
             m_cv.wait(lk, [&] {
-                return m_quit || m_flush || (!m_decoded.empty() && !m_free.empty()) ||
-                       (!m_inputs.Empty() && m_decoded.size() < MaxDecodedAhead);
+                return m_quit || (!m_parallel_decode && m_flush) ||
+                       (!m_flush && !m_decoded.Empty() && !m_free.empty()) ||
+                       (!m_parallel_decode && !m_inputs.Empty() &&
+                        m_decoded.HasRoom(MaxDecodedAhead));
             });
             if (m_quit) {
                 return;
             }
-            if (m_flush) {
+            if (!m_parallel_decode && m_flush) {
                 m_flush = false;
-                m_decoded.clear();
-                m_last_decoded_pts = 0;
-                m_dropped_in_a_row = 0;
                 if (decoder) {
                     lk.unlock();
                     decoder->Reset();
@@ -4130,10 +4150,18 @@ private:
                 }
                 continue;
             }
-            if (!m_decoded.empty() && !m_free.empty() && !DropOvertakenFrames()) {
+            if (!m_decoded.Empty() && !m_free.empty() && !DropOvertakenFrames()) {
                 m_dropped_in_a_row = 0;
-                Decoded frame = std::move(m_decoded.front());
-                m_decoded.pop_front();
+                Decoded frame = m_decoded.Pop();
+                m_cv.notify_all();
+                const u64 generation = m_decoded.Generation();
+                const u64 decoded_frames = m_decoded_frames;
+                const std::string codec = m_codec;
+                const std::pair<u32, u32> configured_size{m_width, m_height};
+                const u32 completion_value =
+                    static_cast<u32>(
+                        system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(m_syncpoint)) +
+                    1;
                 const u32 image = m_free.front();
                 m_free.pop_front();
                 std::optional<Fence> fence;
@@ -4145,22 +4173,33 @@ private:
                 if (fence) {
                     WaitForRelease(*fence);
                 }
-                const auto [width, height] = WriteImage(decoder.get(), image, frame, bytes);
+                const auto [width, height] = WriteImage(converter, codec, decoded_frames,
+                                                        configured_size, image, frame, bytes);
                 lk.lock();
                 // Even an image written during a flush counts: the client waits for its value.
                 m_outputs.push_back({image, width, height, frame.pts, frame.end});
-                if (frame.end) {
+                const bool current_generation = generation == m_decoded.Generation();
+                if (frame.end && current_generation) {
                     m_stream_ended = true;
                     m_end_queued = false;
                     m_ready->room.store(false, std::memory_order_relaxed);
                 }
-                system.Host1x().GetSyncpointManager().IncrementGuest(m_syncpoint);
+                auto& syncpoints = system.Host1x().GetSyncpointManager();
+                // Stop/finalize may already have completed this value while WriteImage ran.
+                if (static_cast<s32>(
+                        completion_value -
+                        static_cast<u32>(syncpoints.GetGuestSyncpointValue(m_syncpoint))) > 0) {
+                    syncpoints.IncrementGuest(m_syncpoint);
+                }
                 m_last_output = m_outputs.back();
-                if (frame.end && m_inputs.Empty() && m_decoded.empty() &&
+                if (frame.end && current_generation && m_inputs.Empty() && m_decoded.Empty() &&
                     system.GetApplicationProcessProgramID() == Settings::MarioKartWorldProgramId) {
                     DrainFreeAsEndOfStream();
                 }
                 ++m_frames_out;
+                if (!current_generation) {
+                    continue;
+                }
                 const s64 written_us = HostTimeUs();
                 if (!m_stream_start) {
                     m_stream_start = {written_us, frame.pts};
@@ -4182,68 +4221,125 @@ private:
                 }
                 continue;
             }
-            Input input = m_inputs.Pop();
-            if (!m_stream_ended && !m_end_queued) {
-                m_ready->room.store(m_inputs.HasRoom(), std::memory_order_relaxed);
-            }
-            std::string codec = m_codec;
-            if (codec.empty() && Tegra::Host1x::IsH264Stream(input.data)) {
-                codec = "video/avc";
-                m_codec = codec;
-                LOG_INFO(Service, "{} empty codec, detected H.264 stream: using \"{}\"",
-                         GetServiceName(), codec);
-            }
-            lk.unlock();
-            if (!decoder || decoder->Name() != codec) {
-                if (codec.empty()) {
-                    LOG_WARNING(Service,
-                                "{} input without codec: size {}, pts {}, end {}, first bytes {:02x}",
-                                GetServiceName(), input.data.size(), input.pts, input.end,
-                                fmt::join(std::span<const u8>{input.data}.first(
-                                              std::min(input.data.size(), size_t{16})),
-                                          " "));
-                }
-                decoder = std::make_unique<Tegra::Host1x::Nx2VideoDecoder>(codec);
-            }
-            pictures.clear();
-            const auto decode_start = std::chrono::steady_clock::now();
-            decoder->Decode(input.data, input.pts, pictures);
-            if (input.end) {
-                decoder->Drain(pictures);
-            }
-            const auto decode_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                                       std::chrono::steady_clock::now() - decode_start)
-                                       .count();
-            lk.lock();
-            m_decoded_frames += pictures.size();
-            if (Nx2VideoTraceEnabled()) {
-                LOG_INFO(Service,
-                         "nx2:vdec trace decode syncpoint={} codec={} open={} pts={} eos={} "
-                         "pictures={} decoded_frames={} discarded_by_flush={} decode_us={}",
-                         m_syncpoint, decoder->Name(), decoder->IsOpen(), input.pts, input.end,
-                         pictures.size(), m_decoded_frames, m_flush, decode_us);
+            DecodeInput(decoder, decoder_generation, pictures, lk);
+        }
+    }
+
+    void DecodeAheadLoop() {
+        Common::SetCurrentThreadName("nx2:decode");
+        std::unique_ptr<Tegra::Host1x::Nx2VideoDecoder> decoder;
+        u64 decoder_generation{~u64{}};
+        std::vector<Tegra::Host1x::Nx2Picture> pictures;
+        std::unique_lock lk{m_mutex};
+        while (true) {
+            m_cv.wait(lk, [&] {
+                return m_quit || (m_parallel_decode &&
+                                  (m_flush || (!m_inputs.Empty() && m_decoded.HasRoom())));
+            });
+            if (m_quit) {
+                return;
             }
             if (m_flush) {
+                m_flush = false;
+                if (decoder) {
+                    lk.unlock();
+                    decoder->Reset();
+                    lk.lock();
+                }
+                m_cv.notify_all();
                 continue;
             }
-            for (auto& picture : pictures) {
-                const u64 pts = picture.pts;
-                if (pts > m_last_decoded_pts && pts - m_last_decoded_pts <= 100'000) {
-                    m_frame_interval = pts - m_last_decoded_pts;
-                }
-                m_last_decoded_pts = pts;
-                m_decoded.push_back({std::move(picture), pts, false});
+            DecodeInput(decoder, decoder_generation, pictures, lk);
+        }
+    }
+
+    void DecodeInput(std::unique_ptr<Tegra::Host1x::Nx2VideoDecoder>& decoder,
+                     u64& decoder_generation, std::vector<Tegra::Host1x::Nx2Picture>& pictures,
+                     std::unique_lock<std::mutex>& lk) {
+        Input input = m_inputs.Pop();
+        const u64 generation = m_decoded.Generation();
+        const bool parallel = m_parallel_decode;
+        if (!m_stream_ended && !m_end_queued) {
+            m_ready->room.store(m_inputs.HasRoom(), std::memory_order_relaxed);
+        }
+        std::string codec = m_codec;
+        if (codec.empty() && Tegra::Host1x::IsH264Stream(input.data)) {
+            codec = "video/avc";
+            m_codec = codec;
+            LOG_INFO(Service, "{} empty codec, detected H.264 stream: using \"{}\"",
+                     GetServiceName(), codec);
+        }
+        lk.unlock();
+        if (!decoder || decoder->Name() != codec) {
+            if (codec.empty()) {
+                LOG_WARNING(Service,
+                            "{} input without codec: size {}, pts {}, end {}, first bytes {:02x}",
+                            GetServiceName(), input.data.size(), input.pts, input.end,
+                            fmt::join(std::span<const u8>{input.data}.first(
+                                          std::min(input.data.size(), size_t{16})),
+                                      " "));
             }
-            if (input.end) {
-                // The client stops at the frame marked end of stream; give it one even when the
-                // last input held no picture.
-                if (m_decoded.empty()) {
-                    m_decoded.push_back({std::nullopt, input.pts, true});
-                } else {
-                    m_decoded.back().end = true;
-                }
+            decoder = std::make_unique<Tegra::Host1x::Nx2VideoDecoder>(codec);
+        } else if (decoder_generation != generation) {
+            decoder->Reset();
+        }
+        decoder_generation = generation;
+        pictures.clear();
+        const auto decode_start = std::chrono::steady_clock::now();
+        decoder->Decode(input.data, input.pts, pictures);
+        if (input.end) {
+            decoder->Drain(pictures);
+        }
+        const auto decode_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                   std::chrono::steady_clock::now() - decode_start)
+                                   .count();
+        lk.lock();
+        const bool discarded = m_flush || generation != m_decoded.Generation();
+        m_decoded_frames += pictures.size();
+        if (Nx2VideoTraceEnabled()) {
+            LOG_INFO(Service,
+                     "nx2:vdec trace decode syncpoint={} codec={} open={} pts={} eos={} "
+                     "pictures={} decoded_frames={} discarded_by_flush={} decode_us={}",
+                     m_syncpoint, decoder->Name(), decoder->IsOpen(), input.pts, input.end,
+                     pictures.size(), m_decoded_frames, discarded, decode_us);
+        }
+        if (discarded || m_quit) {
+            pictures.clear();
+            return;
+        }
+        const size_t capacity =
+            parallel ? Nx2VideoFrameQueue::Capacity : std::numeric_limits<size_t>::max();
+        for (size_t i = 0; i < pictures.size(); ++i) {
+            // A packet/drain can return several frames. Publish them one at a time so the shared
+            // queue stays bounded; do not decode another packet while this batch is pending.
+            m_cv.wait(lk, [&] {
+                return m_quit || generation != m_decoded.Generation() ||
+                       m_decoded.HasRoom(capacity);
+            });
+            if (m_quit || generation != m_decoded.Generation()) {
+                pictures.clear();
+                return;
+            }
+            auto& picture = pictures[i];
+            const u64 pts = picture.pts;
+            if (pts > m_last_decoded_pts && pts - m_last_decoded_pts <= 100'000) {
+                m_frame_interval = pts - m_last_decoded_pts;
+            }
+            m_last_decoded_pts = pts;
+            // Set EOS before publishing the last frame: the output worker may take it immediately.
+            m_decoded.Push({std::move(picture), pts, input.end && i + 1 == pictures.size()},
+                           generation, capacity);
+            m_cv.notify_all();
+        }
+        if (input.end && pictures.empty()) {
+            if (m_decoded.Empty()) {
+                m_decoded.Push({std::nullopt, input.pts, true}, generation, capacity);
+            } else {
+                m_decoded.Back().end = true;
             }
         }
+        pictures.clear();
+        m_cv.notify_all();
     }
 
     u32 DrainFreeAsEndOfStream() {
@@ -4281,7 +4377,9 @@ private:
     }
 
     // Writes a decoded frame into an output image; returns the size the frame reports.
-    std::pair<u32, u32> WriteImage(Tegra::Host1x::Nx2VideoDecoder* decoder, u32 image_id,
+    std::pair<u32, u32> WriteImage(Tegra::Host1x::Nx2VideoFrameConverter& converter,
+                                   const std::string& codec, u64 decoded_frames,
+                                   std::pair<u32, u32> configured_size, u32 image_id,
                                    const Decoded& frame, std::vector<u8>& bytes) {
         const auto image_mutex = m_objects->DecoderMutex(image_id);
         std::unique_lock<std::mutex> image_lock;
@@ -4301,7 +4399,7 @@ private:
                     LOG_INFO(Service, "nx2:vdec trace write skipped syncpoint={} image={} destroyed",
                              m_syncpoint, image_id);
                 }
-                return {m_width, m_height};
+                return configured_size;
             }
             layout = Nx2CalculateDecoderImageLayout(image->second.preference.data());
             block_linear = image->second.gpu_read &&
@@ -4313,14 +4411,14 @@ private:
                 parent_offset = memory->second.parent_offset + image->second.offset;
             }
         }
-        if (!frame.picture || decoder == nullptr || address == 0 ||
-            system.ApplicationProcess() == nullptr) {
+        if (!frame.picture || address == 0 || system.ApplicationProcess() == nullptr) {
             if (Nx2VideoTraceEnabled()) {
                 LOG_INFO(Service,
                          "nx2:vdec trace write skipped syncpoint={} image={} cpu={:#x} picture={} eos={}",
                          m_syncpoint, image_id, address, frame.picture.has_value(), frame.end);
             }
-            return {std::min(m_width, layout.width), std::min(m_height, layout.height)};
+            return {std::min(configured_size.first, layout.width),
+                    std::min(configured_size.second, layout.height)};
         }
         const auto trace_write = [&] {
             if (!Nx2VideoTraceEnabled()) {
@@ -4336,14 +4434,14 @@ private:
                      "nx2:vdec trace write syncpoint={} decoded_frames={} output={} codec={} "
                      "image={} cpu={:#x} gpu={:#x} gpu_known={} device={:#x} mapped={} "
                      "format={} block_linear={} pitch={} chroma={:#x} pts={} eos={}",
-                     m_syncpoint, m_decoded_frames, m_frames_out + 1, decoder->Name(), image_id,
-                     address, gpu_address.value_or(0), gpu_address.has_value(),
-                     device.value_or(0), device.has_value(), static_cast<u32>(layout.format),
-                     block_linear, layout.pitch, layout.chroma_offset, frame.pts, frame.end);
+                     m_syncpoint, decoded_frames, m_frames_out + 1, codec, image_id, address,
+                     gpu_address.value_or(0), gpu_address.has_value(), device.value_or(0),
+                     device.has_value(), static_cast<u32>(layout.format), block_linear,
+                     layout.pitch, layout.chroma_offset, frame.pts, frame.end);
             std::scoped_lock lk{m_objects->mutex};
             m_objects->last_video_write = Nx2NativeObjects::VideoTrace{
-                m_syncpoint, m_decoded_frames, image_id, gpu_address.value_or(0),
-                device.value_or(0), frame.pts, decoder->Name()};
+                m_syncpoint,        decoded_frames, image_id, gpu_address.value_or(0),
+                device.value_or(0), frame.pts,      codec};
         };
         // A frame larger than the image is scaled down to it.
         const u32 width = std::min(frame.picture->width, layout.width);
@@ -4353,8 +4451,8 @@ private:
         if (block_linear) {
             // Read on the GPU: RGBA (the blit's format 0xd5) in the native block-linear layout,
             // 16-GOB blocks, as our Eden tree writes these images.
-            decoder->Render(*frame.picture, Tegra::Host1x::Nx2PictureFormat::Rgba8, width, height,
-                            layout.pitch, 0, bytes);
+            converter.Render(*frame.picture, Tegra::Host1x::Nx2PictureFormat::Rgba8, width, height,
+                             layout.pitch, 0, bytes);
             DumpFrame(image_id, bytes, layout, width, height);
             m_tiled.resize(layout.size);
             Tegra::Texture::SwizzleTexture(m_tiled, bytes, 4, static_cast<u32>(layout.pitch / 4),
@@ -4367,8 +4465,8 @@ private:
             trace_write();
             return {width, height};
         }
-        decoder->Render(*frame.picture, layout.format, width, height, layout.pitch,
-                        layout.chroma_offset, bytes);
+        converter.Render(*frame.picture, layout.format, width, height, layout.pitch,
+                         layout.chroma_offset, bytes);
         DumpFrame(image_id, bytes, layout, width, height);
         memory.WriteBlock(address, bytes.data(), layout.pitch * height);
         if (layout.format == Tegra::Host1x::Nx2PictureFormat::Nv12) {
@@ -4446,7 +4544,7 @@ private:
     u32 m_dropped_in_a_row{};
     std::optional<std::pair<s64, u64>> m_stream_start; ///< Host time (us) and pts of its first frame
     Nx2VideoInputQueue m_inputs;
-    std::deque<Decoded> m_decoded;     ///< Waiting for a free output image
+    Nx2VideoFrameQueue m_decoded;      ///< Waiting for a free output image
     std::deque<u32> m_free;            ///< Output images, in the order the client acquires them
     std::map<u32, Fence> m_release_fences;
     std::deque<Output> m_outputs;      ///< Finished, for 213
@@ -4457,7 +4555,9 @@ private:
     bool m_end_queued{};
     bool m_flush{};
     bool m_quit{};
+    bool m_parallel_decode{};
     std::thread m_worker;
+    std::thread m_decode_worker;
 };
 
 // Placeholder for the Switch 2 graphics-system server that nn::gsv::BootWithRemoteMemory talks

@@ -32,6 +32,20 @@ enum class Nx2PictureFormat : u32 {
     Bgra8,
 };
 
+/// Converts decoded pictures without accessing a decoder context. Own one per output thread.
+class Nx2VideoFrameConverter {
+public:
+    Nx2VideoFrameConverter();
+    ~Nx2VideoFrameConverter();
+
+    void Render(const Nx2Picture& picture, Nx2PictureFormat format, u32 width, u32 height,
+                u64 pitch, u64 chroma_offset, std::span<u8> out);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl;
+};
+
 /// Checks if stream data begins with an H.264 Annex-B start code or avcC/MP4 length-prefixed NALUs.
 bool IsH264Stream(std::span<const u8> data);
 

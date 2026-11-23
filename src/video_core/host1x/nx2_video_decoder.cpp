@@ -94,7 +94,7 @@ struct Nx2VideoDecoder::Impl {
     std::optional<FFmpeg::Decoder> decoder;
     std::optional<FFmpeg::HardwareContext> hardware;
     std::optional<FFmpeg::DecoderContext> context;
-    SwsContext* scaler{};
+    Nx2VideoFrameConverter converter;
     bool open{};
     H264PacketConverter h264_packets;
     /// Timestamps of submitted frames not yet output. Frames copied back from a host GPU decoder
@@ -103,7 +103,6 @@ struct Nx2VideoDecoder::Impl {
     std::vector<u8> packet; ///< FFmpeg reads up to AV_INPUT_BUFFER_PADDING_SIZE past the data
 
     ~Impl() {
-        sws_freeContext(scaler);
         context.reset();
         hardware.reset();
     }
@@ -222,6 +221,22 @@ void Nx2VideoDecoder::Reset() {
 
 void Nx2VideoDecoder::Render(const Nx2Picture& picture, Nx2PictureFormat format, u32 width,
                              u32 height, u64 pitch, u64 chroma_offset, std::span<u8> out) {
+    impl->converter.Render(picture, format, width, height, pitch, chroma_offset, out);
+}
+
+struct Nx2VideoFrameConverter::Impl {
+    SwsContext* scaler{};
+
+    ~Impl() {
+        sws_freeContext(scaler);
+    }
+};
+
+Nx2VideoFrameConverter::Nx2VideoFrameConverter() : impl{std::make_unique<Impl>()} {}
+Nx2VideoFrameConverter::~Nx2VideoFrameConverter() = default;
+
+void Nx2VideoFrameConverter::Render(const Nx2Picture& picture, Nx2PictureFormat format, u32 width,
+                                    u32 height, u64 pitch, u64 chroma_offset, std::span<u8> out) {
     const AVFrame* f = picture.frame->GetFrame();
     const u64 needed = format == Nx2PictureFormat::Nv12
                            ? chroma_offset + pitch * ((u64{height} + 1) / 2)
