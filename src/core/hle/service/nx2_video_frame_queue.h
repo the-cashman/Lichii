@@ -62,15 +62,15 @@ public:
         return frame;
     }
 
-    // An undecoded packet or an empty EOS marker cannot replace a picture. Keep the last
-    // decoded picture available even when decoding its successor is taking too long.
-    u32 DropOvertaken(u64 due, u32 limit) {
+    // The parallel output path requires a real decoded successor; an empty EOS cannot replace
+    // its last picture. The serial path retains its existing handling of an EOS-only successor.
+    u32 DropOvertaken(u64 due, u32 limit, bool require_picture = true) {
         u32 dropped{};
         while (frames.size() >= 2 && dropped < limit) {
             const auto& front = frames[0];
             const auto& next = frames[1];
-            if (front.end || !front.picture || !next.picture || next.pts <= front.pts ||
-                next.pts > due) {
+            if (front.end || !front.picture || (require_picture && !next.picture) ||
+                next.pts <= front.pts || next.pts > due) {
                 break;
             }
             frames.pop_front();

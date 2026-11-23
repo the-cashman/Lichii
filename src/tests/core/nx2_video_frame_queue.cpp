@@ -92,3 +92,13 @@ TEST_CASE("NX2 video bounded catch-up leaves a real picture and its final EOS",
     REQUIRE(queue.Front().end);
     REQUIRE(queue.Pop().pts == 116'669);
 }
+
+TEST_CASE("NX2 serial video retains its existing EOS replacement rule", "[nx2_video_frames]") {
+    Nx2VideoFrameQueue queue;
+    REQUIRE(queue.Push(Picture(0), queue.Generation()));
+    REQUIRE(queue.Push({std::nullopt, 16'667, true}, queue.Generation()));
+    REQUIRE(queue.DropOvertaken(16'666, 30, false) == 0);
+    REQUIRE(queue.DropOvertaken(16'667, 30, false) == 1);
+    REQUIRE(queue.Front().end);
+    REQUIRE_FALSE(queue.Front().picture.has_value());
+}

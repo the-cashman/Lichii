@@ -3778,15 +3778,17 @@ private:
                  w[6], w[7]);
         {
             std::scoped_lock lk{m_mutex};
-            if (m_worker.joinable()) {
+            const bool parallel =
+                system.GetApplicationProcessProgramID() == 0x0400486024DEC000ULL &&
+                (codec == "video/av1" || codec == "video/av01");
+            if (m_worker.joinable() && (m_parallel_decode || parallel)) {
                 DiscardPendingFrames();
                 m_stream_ended = false;
                 m_end_queued = false;
                 m_ready->room.store(true, std::memory_order_relaxed);
             }
             m_codec = std::move(codec);
-            m_parallel_decode = system.GetApplicationProcessProgramID() == 0x0400486024DEC000ULL &&
-                                (m_codec == "video/av1" || m_codec == "video/av01");
+            m_parallel_decode = parallel;
             m_width = w[5];
             m_height = w[6];
             m_clock.Reset();
@@ -3981,7 +3983,13 @@ private:
                          m_decoded.Size(), m_outputs.size(), m_decoded_frames, m_frames_out,
                          m_stream_ended, m_end_queued);
             }
-            DiscardPendingFrames();
+            if (m_parallel_decode) {
+                DiscardPendingFrames();
+            } else {
+                // Preserve the serial worker's existing deferred flush and output ordering.
+                m_inputs.Clear();
+                m_flush = true;
+            }
             m_stream_ended = false;
             m_end_queued = false;
             m_clock.Reset();
@@ -4009,7 +4017,9 @@ private:
                          m_syncpoint, m_inputs.Size(), m_decoded.Size(), m_outputs.size(),
                          m_decoded_frames, m_frames_out, m_stream_ended, m_end_queued);
             }
-            DiscardPendingFrames();
+            if (m_parallel_decode) {
+                DiscardPendingFrames();
+            }
             CompleteHandedFences();
             m_clock.Reset();
             m_stream_start.reset();
@@ -4054,7 +4064,8 @@ private:
             m_dropped_in_a_row = 0;
             return false;
         }
-        const u32 dropped = m_decoded.DropOvertaken(*due, MaxDroppedInARow - m_dropped_in_a_row);
+        const u32 dropped =
+            m_decoded.DropOvertaken(*due, MaxDroppedInARow - m_dropped_in_a_row, m_parallel_decode);
         m_frames_dropped += dropped;
         m_dropped_in_a_row += dropped;
         const Decoded& front = m_decoded.Front();
@@ -4143,6 +4154,10 @@ private:
             }
             if (!m_parallel_decode && m_flush) {
                 m_flush = false;
+                m_decoded.Reset();
+                m_last_decoded_pts = 0;
+                m_dropped_in_a_row = 0;
+                decoder_generation = m_decoded.Generation();
                 if (decoder) {
                     lk.unlock();
                     decoder->Reset();
@@ -4155,6 +4170,7 @@ private:
                 Decoded frame = m_decoded.Pop();
                 m_cv.notify_all();
                 const u64 generation = m_decoded.Generation();
+                const bool parallel = m_parallel_decode;
                 const u64 decoded_frames = m_decoded_frames;
                 const std::string codec = m_codec;
                 const std::pair<u32, u32> configured_size{m_width, m_height};
@@ -4186,7 +4202,8 @@ private:
                 }
                 auto& syncpoints = system.Host1x().GetSyncpointManager();
                 // Stop/finalize may already have completed this value while WriteImage ran.
-                if (static_cast<s32>(
+                if ((!parallel && current_generation) ||
+                    static_cast<s32>(
                         completion_value -
                         static_cast<u32>(syncpoints.GetGuestSyncpointValue(m_syncpoint))) > 0) {
                     syncpoints.IncrementGuest(m_syncpoint);
@@ -4241,6 +4258,7 @@ private:
             }
             if (m_flush) {
                 m_flush = false;
+                decoder_generation = m_decoded.Generation();
                 if (decoder) {
                     lk.unlock();
                     decoder->Reset();
