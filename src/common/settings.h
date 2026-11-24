@@ -769,12 +769,6 @@ struct Values {
                                                   true,
                                                   true};
 
-    // The GPU render thread (video_core/gpu_split.cpp, the render follower): records Vulkan
-    // commands off the GPU back thread. Experimental, so off by default; EDEN_NX2_RENDER_FOLLOWER
-    // overrides it either way.
-    SwitchableSetting<bool> render_thread{linkage, false, "render_thread",
-                                          Category::RendererAdvanced};
-
 #ifdef __ANDROID__
     SwitchableSetting<bool> use_optimized_vertex_buffers{linkage,
                                                  false,

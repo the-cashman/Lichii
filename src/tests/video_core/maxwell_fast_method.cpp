@@ -95,19 +95,6 @@ struct GpuSplitTestAccess {
         return GpuSplit::RingWords - 1;
     }
 
-    /// EDEN_NX2_RENDER_WAITS_E's view of both positions and the guest write mark.
-    static void SetPositions(GpuSplit& split, u64 consumed, u64 played, u64 mark) {
-        split.two_positions = true;
-        split.waits_e = true;
-        split.consumed.store(consumed);
-        split.played.store(played);
-        split.guest_write_op.store(mark);
-    }
-
-    static bool Reached(const GpuSplit& split, u64 target, DrainSite site) {
-        return split.Reached(target, split.UsesEngine(site), std::memory_order_acquire);
-    }
-
     /// The front waits for the back to reach a position (WaitFor).
     static bool FrontWaits(const GpuSplit& split) {
         return split.wait_target.load() != ~u64{0};
@@ -1621,36 +1608,6 @@ TEST_CASE("Split command list fetches wait only for the writers before the last 
     other = true;
     later = true;
     split.Drain(VideoCommon::DrainSite::Other);
-}
-
-TEST_CASE("Front waits on game memory and lists end at the back's position past guest writes",
-          "[video_core][gpu_split_dependencies]") {
-    using Access = VideoCommon::GpuSplitTestAccess;
-    using VideoCommon::DrainSite;
-    const auto split_owner = std::make_unique<VideoCommon::GpuSplit>(); // Too big for the stack
-    VideoCommon::GpuSplit& split = *split_owner;
-
-    // No guest write op: the back's position, while GPURender is behind.
-    Access::SetPositions(split, 100, 40, 0);
-    REQUIRE(Access::Reached(split, 90, DrainSite::ListWriters));
-    REQUIRE(Access::Reached(split, 100, DrainSite::MacroDmaRead));
-    REQUIRE_FALSE(Access::Reached(split, 101, DrainSite::ListSync));
-    // Acquires and the other sites keep waiting for GPURender.
-    REQUIRE_FALSE(Access::Reached(split, 90, DrainSite::Acquire));
-    REQUIRE_FALSE(Access::Reached(split, 90, DrainSite::MacroDmaFlush));
-    REQUIRE_FALSE(Access::Reached(split, 90, DrainSite::SafeRead));
-
-    // A guest write op before the target: GPURender must have played it.
-    Access::SetPositions(split, 100, 40, 61);
-    REQUIRE_FALSE(Access::Reached(split, 90, DrainSite::SemaphoreFlush));
-    Access::SetPositions(split, 100, 61, 61);
-    REQUIRE(Access::Reached(split, 90, DrainSite::SemaphoreFlush));
-
-    // A newer op at or past the target hides older ones: GPURender's position.
-    Access::SetPositions(split, 100, 89, 96);
-    REQUIRE_FALSE(Access::Reached(split, 90, DrainSite::ListFlush));
-    Access::SetPositions(split, 100, 90, 96);
-    REQUIRE(Access::Reached(split, 90, DrainSite::ListFlush));
 }
 
 TEST_CASE("Split restart resets writer positions without replaying old releases",

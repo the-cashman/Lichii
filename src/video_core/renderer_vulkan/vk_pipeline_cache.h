@@ -138,29 +138,11 @@ public:
                            TextureCache& texture_cache, VideoCore::ShaderNotify& shader_notify_);
     ~PipelineCache();
 
-    /// key_unchanged: no register the key reads changed since this cache's last lookup, which
-    /// the caller made (EDEN_NX2_RENDER_UNLEND_FAST_DELTA).
-    [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline(bool key_unchanged = false);
-    [[nodiscard]] u64 GraphicsLookups() const noexcept {
-        return graphics_lookups;
-    }
-    /// Whether the last lookup kept the current pipeline without refreshing the key.
-    [[nodiscard]] bool LastLookupKept() const noexcept {
-        return last_lookup_kept;
-    }
-
-    [[nodiscard]] const DynamicFeatures& Features() const noexcept {
-        return dynamic_features;
-    }
+    [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
 
     void TickFrame();
 
     [[nodiscard]] ComputePipeline* CurrentComputePipeline(u64& native_key);
-    /// EDEN_NX2_RENDER_UNLEND_DISPATCH, on the back: CurrentComputePipeline when it is a plain
-    /// hit (the shader known, its entry built, no rebuild pending or due, no game hook acting);
-    /// nullptr, having created or retired nothing, otherwise. A retire stamps GPURender's tick,
-    /// which posted dispatches it has not recorded yet would outlive.
-    [[nodiscard]] ComputePipeline* UnlentComputePipeline(u64& native_key);
 
     /// Whether a Switch 2 dispatch whose compute pipeline is still building is skipped instead
     /// of waiting for the build, as native_async_draws decides for draws. Skipping leaves the
@@ -335,8 +317,6 @@ private:
     bool mesh_vertex_inputs_seeded{};
     /// graphics_key holds vertex input another key lent it instead of the registers'
     bool vertex_input_lent{};
-    u64 graphics_lookups{};
-    bool last_lookup_kept{};
 
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
     void EvictUnusedPipelines();

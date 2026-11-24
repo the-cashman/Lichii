@@ -119,14 +119,6 @@ public:
         *(payload_cursor++) = texel_buffer;
     }
 
-    /// EDEN_NX2_RENDER_UNLEND: a queue of the back's own collects an unlent draw's buffer entries
-    /// from the start of its payload, without the scheduler (GraphicsPipeline::ConfigureBack).
-    void BeginCapture(bool use_descriptor_buffer_) {
-        use_descriptor_buffer = supports_descriptor_buffer && use_descriptor_buffer_;
-        rejected_texel_buffer = false;
-        payload_start = payload_cursor = upload_start = payload.get();
-    }
-
     /// Entries an earlier draw added (delta draws).
     void AddEntries(std::span<const DescriptorUpdateEntry> entries) {
         std::memcpy(payload_cursor, entries.data(), entries.size_bytes());

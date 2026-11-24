@@ -89,12 +89,9 @@ size_t GetStreamBufferSize(const Device& device) {
 } // Anonymous namespace
 
 StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& memory_allocator_,
-                                     Scheduler& scheduler_, const VideoCommon::ArenaClock* clock_,
-                                     u32 stream_divisor)
-    : device{device_}, memory_allocator{memory_allocator_}, scheduler{scheduler_}, clock{clock_},
-      stream_buffer_size{Common::AlignDown(GetStreamBufferSize(device) / stream_divisor,
-                                           MAX_ALIGNMENT)},
-      region_size{stream_buffer_size /
+                                     Scheduler& scheduler_)
+    : device{device_}, memory_allocator{memory_allocator_}, scheduler{scheduler_},
+      stream_buffer_size{GetStreamBufferSize(device)}, region_size{stream_buffer_size /
                                                                    StagingBufferPool::NUM_SYNCS} {
     VkBufferCreateInfo stream_ci = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -129,17 +126,6 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
 
 StagingBufferPool::~StagingBufferPool() = default;
 
-u64 StagingBufferPool::Now() const noexcept {
-    return clock ? clock->Now() : scheduler.CurrentTick();
-}
-
-bool StagingBufferPool::IsFree(u64 tick) const noexcept {
-    if (!clock) {
-        return scheduler.IsFree(tick);
-    }
-    return clock->IsFree(tick, [this](u64 real) { return scheduler.IsFree(real); });
-}
-
 StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool deferred) {
     if (!deferred && usage == MemoryUsage::Upload && size <= region_size) {
         return GetStreamBuffer(size);
@@ -151,7 +137,7 @@ void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
     StagingBuffers& cache_level = GetCache(ref.usage)[ref.log2_level];
     auto node = cache_level.deferred.extract(ref.index);
     ASSERT(!node.empty());
-    node.mapped().tick = Now();
+    node.mapped().tick = scheduler.CurrentTick();
     cache_level.entries.push_back(std::move(node.mapped()));
 }
 
@@ -169,7 +155,7 @@ StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
         // Avoid waiting for the previous usages to be free
         return GetStagingBuffer(size, MemoryUsage::Upload);
     }
-    const u64 current_tick = Now();
+    const u64 current_tick = scheduler.CurrentTick();
     std::fill(sync_ticks.begin() + Region(used_iterator), sync_ticks.begin() + Region(iterator),
               current_tick);
     used_iterator = iterator;
@@ -201,8 +187,9 @@ StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
 }
 
 bool StagingBufferPool::AreRegionsActive(size_t region_begin, size_t region_end) const {
+    const u64 gpu_tick = scheduler.GetMasterSemaphore().KnownGpuTick();
     return std::any_of(sync_ticks.begin() + region_begin, sync_ticks.begin() + region_end,
-                       [this](u64 sync_tick) { return !IsFree(sync_tick); });
+                       [gpu_tick](u64 sync_tick) { return gpu_tick < sync_tick; });
 };
 
 StagingBufferRef StagingBufferPool::GetStagingBuffer(size_t size, MemoryUsage usage,
@@ -219,7 +206,7 @@ std::optional<StagingBufferRef> StagingBufferPool::TryGetReservedBuffer(size_t s
     StagingBuffers& cache_level = GetCache(usage)[Common::Log2Ceil(size)];
 
     const auto is_free = [this](const StagingBuffer& entry) {
-        return IsFree(entry.tick);
+        return scheduler.IsFree(entry.tick);
     };
     auto& entries = cache_level.entries;
     const auto hint_it = entries.begin() + cache_level.iterate_index;
@@ -234,7 +221,7 @@ std::optional<StagingBufferRef> StagingBufferPool::TryGetReservedBuffer(size_t s
     const StagingBufferRef ref = it->Ref();
     if (!deferred) {
         cache_level.iterate_index = position + 1;
-        it->tick = Now();
+        it->tick = scheduler.CurrentTick();
         return ref;
     }
     // The last entry takes its place, so the next lookup starts there.
@@ -328,7 +315,7 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
         .usage = usage,
         .log2_level = log2_size,
         .index = unique_ids++,
-        .tick = Now(),
+        .tick = scheduler.CurrentTick(),
     };
     const StagingBufferRef ref = entry.Ref();
     StagingBuffers& cache_level = GetCache(usage)[log2_size];
@@ -378,7 +365,7 @@ void StagingBufferPool::ReleaseIdleBuffers() {
     for (StagingBuffersCache* const cache : {&device_local_cache, &upload_cache, &download_cache}) {
         for (StagingBuffers& staging : *cache) {
             std::erase_if(staging.entries, [this](const StagingBuffer& entry) {
-                return IsFree(entry.tick);
+                return scheduler.IsFree(entry.tick);
             });
             staging.delete_index = 0;
             staging.iterate_index = 0;
@@ -405,7 +392,7 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
     if (&cache == &upload_cache && log2 <= KeepMaxLog2) {
         size_t idle = 0;
         std::erase_if(entries, [this, &idle](const StagingBuffer& entry) {
-            return IsFree(entry.tick) && ++idle > KeepPerLevel;
+            return scheduler.IsFree(entry.tick) && ++idle > KeepPerLevel;
         });
         staging.delete_index = 0;
         if (staging.iterate_index > entries.size()) {
@@ -415,7 +402,7 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
     }
 
     const auto is_deletable = [this](const StagingBuffer& entry) {
-        return IsFree(entry.tick);
+        return scheduler.IsFree(entry.tick);
     };
     // Deferred checkouts take entries out of the vector since the last sweep.
     const size_t begin_offset = (std::min)(staging.delete_index, old_size);

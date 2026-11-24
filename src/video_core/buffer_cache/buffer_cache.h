@@ -214,7 +214,6 @@ void BufferCache<P>::TickFrame() {
         RunGarbageCollector(total_used_memory >= critical_memory);
     }
     ++frame_tick;
-    VideoCommon::GpuSplit::Get().CheckBufferFree();
     delayed_destruction_ring.Tick();
 
     // Pages draws wrote: their early downloads, now that the frame's work is recorded.
@@ -295,40 +294,27 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
     // guest CPU writes come through TryCacheInvalidation, which sends such pages to the GPU thread.
     const DAddr page_begin = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
     const DAddr page_end = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE);
-    if (keep_page_gpu_data && gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
-        const bool owner = VideoCommon::GpuSplit::OwnsScheduler();
-        // EDEN_NX2_RENDER_GATHER_E: the back uploads too, its commands collected for GPURender.
-        bool collects = false;
-        if constexpr (requires { runtime.CollectsCommands(); }) {
-            collects = runtime.CollectsCommands();
-        }
+    if (keep_page_gpu_data &&
+        VideoCommon::GpuSplit::OwnsScheduler() &&
+        gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
         // Switch 2 titles: upload the CPU's bytes into the buffer instead, as CachedWriteMemory
         // does, so the page stays GPU-owned and nothing waits for the host GPU.
-        if ((owner || collects) && InlinesPageWrite(device_addr, size)) {
+        static const int forced = [] {
+            const char* value = std::getenv("EDEN_NX2_INLINE_PAGE_WRITES");
+            return value == nullptr ? -1 : (value[0] == '0' ? 0 : 1);
+        }();
+        const bool inline_writes =
+            forced >= 0 ? forced == 1 : Tegra::g_nx2_ampere.load(std::memory_order_relaxed);
+        if (inline_writes && IsRegionRegistered(device_addr, size)) {
             tmp_buffer.resize_destructive(size);
             device_memory.ReadBlockUnsafe(device_addr, tmp_buffer.data(), size);
             InlineMemoryImplementation(device_addr, size, tmp_buffer);
             return;
         }
-        if (owner) {
-            DownloadMemory(page_begin, page_end - page_begin);
-        } else if (VideoCommon::GpuSplit::OnBackThread()) {
-            VideoCommon::GpuSplit::Get().NoteGpuPageOffOwner();
-        }
+        DownloadMemory(page_begin, page_end - page_begin);
     }
     memory_tracker.MarkRegionAsCpuModified(device_addr, size);
     MarkVertexBuffersStale(device_addr, size);
-}
-
-template <class P>
-bool BufferCache<P>::InlinesPageWrite(DAddr device_addr, u64 size) {
-    static const int forced = [] {
-        const char* value = std::getenv("EDEN_NX2_INLINE_PAGE_WRITES");
-        return value == nullptr ? -1 : (value[0] == '0' ? 0 : 1);
-    }();
-    const bool inline_writes =
-        forced >= 0 ? forced == 1 : Tegra::g_nx2_ampere.load(std::memory_order_relaxed);
-    return inline_writes && IsRegionRegistered(device_addr, size);
 }
 
 template <class P>
@@ -1619,7 +1605,6 @@ std::pair<typename P::Buffer*, u32> BufferCache<P>::ObtainCPUBuffer(
 template <class P>
 void BufferCache<P>::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr,
                                                u32 size) {
-    VideoCommon::GpuSplit::BackOwned("BufferCache::BindGraphicsUniformBuffer");
     const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
     if (!device_addr) {
         channel_state->uniform_buffers[stage][index] = NULL_BINDING;
@@ -1645,7 +1630,6 @@ void BufferCache<P>::DisableGraphicsUniformBuffer(size_t stage, u32 index) {
 
 template <class P>
 void BufferCache<P>::UpdateGraphicsBuffers(bool is_indexed) {
-    VideoCommon::GpuSplit::BackOwned("BufferCache::UpdateGraphicsBuffers");
     do {
         channel_state->has_deleted_buffers = false;
         DoUpdateGraphicsBuffers(is_indexed);
@@ -1654,7 +1638,6 @@ void BufferCache<P>::UpdateGraphicsBuffers(bool is_indexed) {
 
 template <class P>
 void BufferCache<P>::UpdateComputeBuffers() {
-    VideoCommon::GpuSplit::BackOwned("BufferCache::UpdateComputeBuffers");
     do {
         channel_state->has_deleted_buffers = false;
         DoUpdateComputeBuffers();
@@ -1894,15 +1877,6 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
             return false;
         }
         ssbo_addr = holder + indirect_offset;
-        if constexpr (requires { runtime.Nx2Owes(DAddr{}, u64{}); }) {
-            // An unlent draw's back reads the entry itself: its constant buffers were checked.
-            if (VideoCommon::GpuSplit::Unlends()) {
-                const auto device = gpu_memory->GpuToCpuAddress(ssbo_addr);
-                if (device && runtime.Nx2Owes(*device, 2 * sizeof(u64))) {
-                    VideoCommon::GpuSplit::Get().NoteOwedTableRead();
-                }
-            }
-        }
     }
     const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
     const bool indirect = indirect_offset != ~0U;

@@ -20,9 +20,8 @@
 
 #include "common/thread_worker.h"
 #include "shader_recompiler/shader_info.h"
-#include "video_core/buffer_cache/command_arena.h"
-#include "video_core/engines/maxwell_3d.h"
 #include "video_core/evicted_pointer_slots.h"
+#include "video_core/engines/maxwell_3d.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/pipeline_build.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
@@ -284,35 +283,6 @@ public:
 
     void RecordPreparedBinding(const PreparedBinding& binding);
 
-    /// EDEN_NX2_RENDER_UNLEND: the back's half of an unlent draw, by value.
-    struct BackHalf {
-        /// Not value-initialized: the small vectors' inline storage stays untouched.
-        BackHalf() {}
-
-        /// Texture and image handles as read from memory, in descriptor order.
-        boost::container::small_vector<u32, 32> handles;
-        /// Buffer descriptor entries, stage by stage.
-        boost::container::small_vector<DescriptorUpdateEntry, 32> entries;
-        std::array<u16, NUM_STAGES> stage_entries{};
-        /// The buffer commands, played on GPURender as the draw's stamp.
-        VideoCommon::CommandArena commands;
-        u64 stamp{};
-    };
-    /// Per stage, the constant buffers the back reads handles and storage buffer descriptors
-    /// from (all of them where a handle is computed at draw time).
-    [[nodiscard]] const std::array<u32, NUM_STAGES>& HandleConstBuffers() const noexcept {
-        return handle_cbufs;
-    }
-    /// Whether the pipeline's draws can go unlent: built, no texture or image buffers. Task and
-    /// mesh pipelines need EDEN_NX2_RENDER_UNLEND_MESH and native mesh shaders (the rasterizer).
-    [[nodiscard]] bool CanUnlend() const noexcept {
-        return !unlend_texel_buffers && IsBuilt() && !Failed();
-    }
-    /// The back: the buffer bindings and the handle values, from the engine set by SetEngine.
-    void ConfigureBack(bool is_indexed, BackHalf& half, GuestDescriptorQueue& capture);
-    /// GPURender: the images, the descriptors and the binding, from `view`.
-    bool ConfigureRender(const BackHalf& half, const Tegra::Engines::Maxwell3D& view);
-
     bool Configure(bool is_indexed, std::optional<PreparedBinding>* deferred = nullptr) {
         return configure_func(this, is_indexed, deferred);
     }
@@ -495,9 +465,6 @@ private:
     DescriptorBufferRing& descriptor_buffer_ring;
 
     bool (*configure_func)(GraphicsPipeline*, bool, std::optional<PreparedBinding>*){};
-    std::array<bool, NUM_STAGES> stages_present{};
-    bool unlend_texel_buffers{};
-    bool unlend_images{};
 
     std::vector<GraphicsPipelineCacheKey> transition_keys;
     std::vector<GraphicsPipeline*> transitions;
@@ -510,7 +477,6 @@ private:
     std::array<std::vector<u8>, NUM_STAGES> kept_spirv; ///< zstd, after the build
 
     std::array<Shader::Info, NUM_STAGES> stage_infos;
-    std::array<u32, NUM_STAGES> handle_cbufs{};
     std::array<u32, 5> enabled_uniform_buffer_masks{};
     VideoCommon::UniformBufferSizes uniform_buffer_sizes{};
     u32 num_descriptor_entries{};

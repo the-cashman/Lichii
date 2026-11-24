@@ -218,11 +218,6 @@ struct GPU::Impl {
     }
 
     /// Tick pending requests within the GPU.
-    bool HasSyncRequests() {
-        std::scoped_lock lck{sync_request_mutex};
-        return !sync_requests.empty();
-    }
-
     void TickWork() {
         // Every draw ticks: take the mutex only with a request queued. Each request run advances
         // current_sync_fence, so they match once all ran.
@@ -478,12 +473,8 @@ struct GPU::Impl {
         };
         // A fence another thread reached waits for the owner's next tick. That thread may be one
         // the GPU threads wait for, so it doesn't wait.
-        // A posted op playing on GPURender owns the scheduler but not the back's state the
-        // composite ticks (the back runs on): it hands the present off as any other thread.
         due_composites.Reached(
-            layers,
-            VideoCommon::GpuSplit::OwnsScheduler() && !VideoCommon::GpuSplit::PlayingUnlent(),
-            composite, [this, composite] {
+            layers, VideoCommon::GpuSplit::OwnsScheduler(), composite, [this, composite] {
                 (void)RequestSyncOperation([this, composite] { due_composites.Run(composite); });
                 gpu_thread.TickGPU(true);
             },
@@ -654,10 +645,6 @@ void GPU::WaitForSyncOperation(u64 fence) {
 
 void GPU::TickWork() {
     impl->TickWork();
-}
-
-bool GPU::HasSyncRequests() {
-    return impl->HasSyncRequests();
 }
 
 /// Gets a mutable reference to the Host1x interface

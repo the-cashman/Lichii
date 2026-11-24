@@ -15,7 +15,6 @@ endif()
 add_library(video_core STATIC
     buffer_cache/buffer_base.h
     buffer_cache/buffer_cache_base.h
-    buffer_cache/command_arena.h
     buffer_cache/buffer_cache.cpp
     buffer_cache/buffer_cache.h
     buffer_cache/compute_write_grid.h
@@ -151,8 +150,6 @@ add_library(video_core STATIC
     nx2_list_indirect_stats.h
     nx2_owed_words.h
     nx2_profile.h
-    nx2_render_view.cpp
-    nx2_render_view.h
     nx2_stutter_trace.cpp
     nx2_stutter_trace.h
     nx2_perf.h
@@ -230,8 +227,6 @@ add_library(video_core STATIC
     renderer_vulkan/vk_blit_screen.cpp
     renderer_vulkan/vk_blit_screen.h
     renderer_vulkan/vk_buffer_cache_base.cpp
-    renderer_vulkan/vk_buffer_arena.cpp
-    renderer_vulkan/vk_buffer_arena.h
     renderer_vulkan/vk_buffer_cache.cpp
     renderer_vulkan/vk_buffer_cache.h
     renderer_vulkan/vk_texel_buffer_range.h
@@ -288,8 +283,6 @@ add_library(video_core STATIC
     renderer_vulkan/upload_batch.h
     renderer_vulkan/vk_render_pass_cache.cpp
     renderer_vulkan/vk_render_pass_cache.h
-    renderer_vulkan/vk_render_view.cpp
-    renderer_vulkan/vk_render_view.h
     renderer_vulkan/vk_resource_pool.cpp
     renderer_vulkan/vk_resource_pool.h
     renderer_vulkan/frame_pacer.h

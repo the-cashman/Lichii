@@ -160,8 +160,6 @@ add_executable(tests
     video_core/command_fetch_order.cpp
     video_core/gpu_trace.cpp
     video_core/nx2_render_follower.cpp
-    video_core/buffer_arena.cpp
-    video_core/nx2_render_view.cpp
     video_core/gpu_written_pages.cpp
     video_core/nx2_semaphore_mirror.cpp
     video_core/command_writer.cpp

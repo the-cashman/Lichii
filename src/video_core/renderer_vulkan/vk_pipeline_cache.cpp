@@ -1023,26 +1023,14 @@ void PipelineCache::SaveUsedPipelines() {
                               VideoCommon::ShaderCacheV2::EncodeUsed(record));
 }
 
-GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline(bool key_unchanged) {
-    VideoCommon::GpuSplit::BackOwned("PipelineCache::CurrentGraphicsPipeline");
+GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
 
-    ++graphics_lookups;
-    last_lookup_kept = false;
-    const std::array<u64, 6> hashes = graphics_key.unique_hashes;
     if (!RefreshStages(graphics_key.unique_hashes)) {
         current_pipeline = nullptr;
         return nullptr;
     }
     const bool mesh_draw =
         maxwell3d->GetNativeMacroEngine().native_turing && maxwell3d->regs.IsMeshEnabled();
-    // Refresh would rebuild the key current_pipeline was found with: same registers, programs and
-    // topology (its parts kept behind dirty flags come from the same registers).
-    if (key_unchanged && current_pipeline != nullptr && !mesh_draw && !vertex_input_lent &&
-        hashes == graphics_key.unique_hashes) {
-        last_lookup_kept = true;
-        current_pipeline->MarkUsed(frame_count);
-        return BuiltPipeline(current_pipeline);
-    }
     if (vertex_input_lent && !mesh_draw) {
         // Refresh keeps the key's vertex input until the registers change it.
         vertex_input_lent = false;
@@ -1151,7 +1139,6 @@ bool PipelineCache::StaleNullPointerSlot(const ComputePipelineCacheEntry& entry)
 }
 
 ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
-    VideoCommon::GpuSplit::BackOwned("PipelineCache::CurrentComputePipeline");
 
     const ShaderInfo* const shader{ComputeShader()};
     if (!shader) {
@@ -1224,36 +1211,6 @@ ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
     }
     return entry.Get(kepler_compute->IsNativeMode(),
                      kepler_compute->regs.code_loc.Address() + qmd.program_start, key);
-}
-
-ComputePipeline* PipelineCache::UnlentComputePipeline(u64& native_key) {
-    VideoCommon::GpuSplit::BackOwned("PipelineCache::UnlentComputePipeline");
-    const ShaderInfo* const shader{KnownComputeShader()};
-    if (!shader) {
-        return nullptr;
-    }
-    const auto& qmd{kepler_compute->launch_description};
-    const ComputePipelineCacheKey key{
-        .unique_hash = shader->unique_hash,
-        .shared_memory_size = qmd.shared_alloc,
-        .workgroup_size{qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z},
-    };
-    const auto it{compute_cache.find(key)};
-    if (it == compute_cache.end()) {
-        return nullptr;
-    }
-    ComputePipelineCacheEntry& entry{it->second};
-    if (!entry.pipeline || entry.pending_rebuild ||
-        (!entry.null_pointer_slots.empty() && entry.rebuilds < MaxComputeRebuilds &&
-         StaleNullPointerSlot(entry)) ||
-        !KnownComputeShaderChecks(shader)) {
-        return nullptr;
-    }
-    native_key = shader->lowered_native ? shader->lowered_native->native_program_key : 0;
-    if (VideoCommon::StutterTrace::Enabled() && !std::exchange(entry.used, true)) {
-        VideoCommon::StutterTrace::CountLookup(VideoCommon::StutterTrace::Lookup::ComputePrebuilt);
-    }
-    return entry.pipeline.get();
 }
 
 void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
@@ -2741,27 +2698,16 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) noexc
                regs.color_mask[regs.color_mask_common ? 0 : rt_index].raw != 0;
     };
     const bool depth_tested =
-        native
-            ? mode != NativePendingMode::Wait && regs.zeta_enable != 0 &&
-                  regs.depth_test_enable != 0 && !regs.IsMeshEnabled() &&
-                  ColorWritesHaveHistory(
-                      std::min<u32>(regs.rt_control.count,
-                                    static_cast<u32>(Maxwell::NumRenderTargets)),
-                      [&regs](u32 i) { return regs.rt_control.Map(i); }, writes_color,
-                      [this](u32 rt_index) {
-                          if (!VideoCommon::GpuSplit::LendsToRender()) {
-                              return texture_cache.ColorTargetWrittenBeforeThisFrame(rt_index);
-                          }
-                          // An unlent draw's lookup asks GPURender's texture cache.
-                          auto& split = VideoCommon::GpuSplit::Get();
-                          split.NoteLookupLend();
-                          bool written{};
-                          split.LendRender([&] {
-                              written = texture_cache.ColorTargetWrittenBeforeThisFrame(rt_index);
-                          });
-                          return written;
-                      })
-            : regs.zeta_enable != 0;
+        native ? mode != NativePendingMode::Wait && regs.zeta_enable != 0 &&
+                     regs.depth_test_enable != 0 && !regs.IsMeshEnabled() &&
+                     ColorWritesHaveHistory(
+                         std::min<u32>(regs.rt_control.count,
+                                       static_cast<u32>(Maxwell::NumRenderTargets)),
+                         [&regs](u32 i) { return regs.rt_control.Map(i); }, writes_color,
+                         [this](u32 rt_index) {
+                             return texture_cache.ColorTargetWrittenBeforeThisFrame(rt_index);
+                         })
+               : regs.zeta_enable != 0;
     // Native draws are judged by the heuristic only when a mode other than Wait is chosen.
     const bool can_discard = CanDiscardPendingDraw(
         native, depth_tested, draw_state.draw_element_count, draw_state.draw_element_count,

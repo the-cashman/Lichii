@@ -36,7 +36,6 @@
 #include "video_core/nx2_mme_capture.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
-#include "video_core/nx2_render_view.h"
 #include "video_core/query_cache/frame_trace.h"
 #include "video_core/query_dma.h"
 #include "video_core/rasterizer_interface.h"
@@ -750,9 +749,6 @@ void Maxwell3D::StoreStateRegisters(std::span<const u64, 4> flags, std::span<con
         if (tracked) {
             shadow_state.reg_array[method] = value;
         }
-        if (render_view_writes) [[unlikely]] {
-            render_view_writes->Note(method);
-        }
     }
     for (size_t word = 0; word < flags.size(); ++word) {
         for (u64 bits = flags[word]; bits != 0; bits &= bits - 1) {
@@ -1187,9 +1183,6 @@ void Maxwell3D::ProcessCBBind(size_t stage_index) {
     }
     buffer.address = regs.const_buffer.Address();
     buffer.size = regs.const_buffer.size;
-    if (render_view_writes) [[unlikely]] {
-        render_view_writes->NoteBind(stage_index, bind_data.shader_slot);
-    }
 
     const bool is_enabled = bind_data.valid.Value() != 0;
     if (!is_enabled) {

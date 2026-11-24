@@ -425,10 +425,6 @@ public:
     template <typename Ranges>
     void ClaimCpuWrites(const Ranges& ranges);
 
-    /// Whether WriteMemory uploads a write on a page holding GPU-written data into its buffer
-    /// (Switch 2 titles, a buffer registered there) instead of downloading the page first.
-    [[nodiscard]] bool InlinesPageWrite(DAddr device_addr, u64 size);
-
     /// Return true when there are uncommitted buffers to be downloaded
     [[nodiscard]] bool HasUncommittedFlushes() const noexcept;
 
@@ -462,13 +458,6 @@ public:
             nx2_list_copy_requests.clear();
         }
     }
-    [[nodiscard]] bool Nx2HasListCopyRequests() const {
-        return !nx2_list_copy_requests.empty();
-    }
-    /// Pages a dispatch's NoteWorkRecorded records early downloads of.
-    [[nodiscard]] bool HasEarlyDownloads() const {
-        return !early_pages.empty();
-    }
     /// True when it recorded copies, which the GPU completes at `tick` (the caller submits).
     bool Nx2CopyListPages(u64 tick);
     enum class Nx2ListRead { Unknown, Copied, Synced, NeedsSync, Pending };
@@ -491,19 +480,6 @@ public:
 
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(DAddr addr, size_t size);
-
-    /// Whether DownloadMemory(device_addr, size) would download nothing: no deferred CPU read
-    /// ranges, and no GPU-modified range on the pages it visits.
-    [[nodiscard]] bool DownloadsNothing(DAddr device_addr, u64 size) {
-        if constexpr (USE_MEMORY_MAPS) {
-            if (download_cpu_read_ranges) {
-                return false;
-            }
-        }
-        const DAddr begin = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
-        const DAddr end = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
-        return !IsRegionGpuModified(begin, end - begin);
-    }
 
     /// Whether every byte the bound compute storage and texture buffers would mark GPU-written
     /// for this dispatch already holds GPU writes. Call before the bindings are made (and mark).

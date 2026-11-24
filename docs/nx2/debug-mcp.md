@@ -224,11 +224,6 @@ not list it.
 (`EDEN_NX2_HOSTTIMING_STATS`) on or off and returns the `previous` and current `stats` state.
 Read the lines with `log_tail` (`contains: "HostTiming wait"`).
 
-**`render_follower`** `{on?}`. With `EDEN_NX2_RENDER_FOLLOWER=1`, stops (`false`) or resumes
-(`true`) posting draws to GPURender, so one scene can be timed with and without it; the back
-records every draw itself while it is off. Returns the `previous` and current `on` state, and
-fails when the follower isn't running.
-
 **`capture_bundle`** `{description?, size_limit_mib?, timeout_s?}` (`index?` in the adapter). It
 writes the bug-report bundle that Help → Report a Bug writes ([bug-bundle.md](bug-bundle.md)):
 logs, system and settings, screenshot, the last 10 s of frame times, and the next frame captured
