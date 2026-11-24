@@ -680,6 +680,22 @@ void MemoryManager::WriteConstantBufferData(DAddr device_addr, const void* data,
     constant_buffer_writes.emplace_back(device_addr, size);
 }
 
+bool MemoryManager::ConstantBufferDataMatches(DAddr device_addr, const void* data,
+                                              std::size_t size) {
+    const auto* src = static_cast<const u8*>(data);
+    for (DAddr address = device_addr; address < device_addr + size;) {
+        const std::size_t amount = (std::min<std::size_t>)(
+            device_addr + size - address, Core::DEVICE_PAGESIZE - (address & Core::DEVICE_PAGEMASK));
+        const u8* const physical = memory.GetPointer<u8>(address);
+        if (physical == nullptr || std::memcmp(physical, src, amount) != 0) {
+            return false;
+        }
+        address += amount;
+        src += amount;
+    }
+    return true;
+}
+
 void MemoryManager::FlushRegion(GPUVAddr gpu_addr, size_t size,
                                 VideoCommon::CacheType which) const {
     auto do_nothing = [&]([[maybe_unused]] std::size_t page_index,

@@ -431,6 +431,7 @@ jobs:
             -DLICHII_ROOM=OFF \
             -DLICHII_ROOM_STANDALONE=OFF \
             -DLICHII_USE_BUNDLED_QT=OFF \
+            -DENABLE_FLYHIGH=ON \
             -DENABLE_QT_TRANSLATION=ON \
             -DLICHII_USE_BUNDLED_SDL3=ON \
             -DENABLE_UPDATE_CHECKER=ON \
@@ -628,9 +629,9 @@ jobs:
         if: startsWith(matrix.platform, 'windows')
         shell: pwsh
         run: |
-          foreach ($exe in 'lichii.exe', 'eden-cli.exe') {
-            if (-not (Test-Path "build/release/bin/$exe")) {
-              throw "build/release/bin/$exe was not produced"
+          foreach ($file in 'lichii.exe', 'eden-cli.exe', 'flyhigh.dll', 'licenses/flyhigh/LICENSE', 'licenses/flyhigh/NOTICE') {
+            if (-not (Test-Path "build/release/bin/$file" -PathType Leaf)) {
+              throw "build/release/bin/$file was not produced"
             }
           }
           # Symbols ship as their own artifact, not in the release zip.
@@ -639,6 +640,11 @@ jobs:
           windeployqt --release --no-translations build/release/bin/lichii.exe
           if (Get-ChildItem -Recurse build/release/bin -Filter 'GFSDK_*') {
             throw 'build/release/bin holds Nsight Aftermath files, which must not ship'
+          }
+          $excluded = 'flyhighfg.bin', 'flyhighfg.json', 'graph.json', 'models.json', 'WEIGHTS_LICENSE.md'
+          $unshippable = Get-ChildItem -Recurse -File build/release/bin | Where-Object { $_.Name -in $excluded }
+          if ($unshippable) {
+            throw "build/release/bin holds FlyHigh model files, which must not ship: $($unshippable.FullName -join ', ')"
           }
 
       # A self-contained app bundle: macdeployqt copies Qt and every other Homebrew library both

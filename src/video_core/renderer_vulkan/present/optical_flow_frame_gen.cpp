@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <vector>
 
 #include "video_core/renderer_vulkan/present/optical_flow_frame_gen.h"
 #include "video_core/renderer_vulkan/present/util.h"
@@ -10,7 +11,8 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 
 #include "video_core/host_shaders/frame_gen_interpolation_comp_spv.h"
-#include "video_core/host_shaders/frame_gen_optical_flow_comp_spv.h"
+#include "video_core/host_shaders/frame_gen_flow_search_comp_spv.h"
+#include "video_core/host_shaders/frame_gen_luma_downsample_comp_spv.h"
 
 namespace Vulkan {
 
@@ -32,14 +34,6 @@ VkImageMemoryBarrier MakeBarrier(VkImage image, VkAccessFlags src_access,
         .image = image,
         .subresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
     };
-}
-
-void BarrierComputeWriteToRead(vk::CommandBuffer cmdbuf, VkImage image) {
-    const auto barrier = MakeBarrier(image, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-                                     VK_IMAGE_LAYOUT_GENERAL,
-                                     VK_IMAGE_LAYOUT_GENERAL);
-    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, {}, {}, barrier);
 }
 
 void DiscardForComputeWrite(vk::CommandBuffer cmdbuf, VkImage image) {
@@ -141,13 +135,18 @@ void CopyImageToImage(vk::CommandBuffer cmdbuf, VkImage source, VkImage destinat
 
 } // anonymous namespace
 
-struct FlowPushConstants {
-    float inv_render_w;
-    float inv_render_h;
-    float render_w;
-    float render_h;
-    float search_radius;
-    float block_size;
+struct DownsamplePushConstants {
+    s32 destination_width;
+    s32 destination_height;
+    s32 is_color;
+};
+
+struct SearchPushConstants {
+    s32 width;
+    s32 height;
+    s32 radius;
+    s32 has_coarse;
+    s32 subpixel;
 };
 
 struct InterpPushConstants {
@@ -159,14 +158,96 @@ struct InterpPushConstants {
     float flow_scale;
 };
 
+namespace {
+
+/// Full search radius at the coarsest level, in its pixels (32 frame pixels each).
+constexpr s32 COARSE_SEARCH_RADIUS = 6;
+
+vk::DescriptorSetLayout CreateComputeSetLayout(const Device& device, u32 samplers) {
+    std::vector<VkDescriptorSetLayoutBinding> bindings;
+    for (u32 binding = 0; binding <= samplers; ++binding) {
+        bindings.push_back(VkDescriptorSetLayoutBinding{
+            .binding = binding,
+            .descriptorType = binding < samplers ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                                                 : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+            .pImmutableSamplers = nullptr,
+        });
+    }
+    return device.GetLogical().CreateDescriptorSetLayout(VkDescriptorSetLayoutCreateInfo{
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .bindingCount = static_cast<u32>(bindings.size()),
+        .pBindings = bindings.data(),
+    });
+}
+
+vk::PipelineLayout CreateComputePipelineLayout(const Device& device,
+                                               const vk::DescriptorSetLayout& set_layout,
+                                               u32 push_size) {
+    const VkPushConstantRange range{
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        .offset = 0,
+        .size = push_size,
+    };
+    return device.GetLogical().CreatePipelineLayout(VkPipelineLayoutCreateInfo{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .setLayoutCount = 1,
+        .pSetLayouts = set_layout.address(),
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &range,
+    });
+}
+
+vk::Pipeline CreateComputePipeline(const Device& device, const vk::PipelineLayout& layout,
+                                   const vk::ShaderModule& shader) {
+    return device.GetLogical().CreateComputePipeline(VkComputePipelineCreateInfo{
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .stage{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+            .module = *shader,
+            .pName = "main",
+            .pSpecializationInfo = nullptr,
+        },
+        .layout = *layout,
+        .basePipelineHandle = VK_NULL_HANDLE,
+        .basePipelineIndex = 0,
+    });
+}
+
+void ComputeToComputeBarrier(vk::CommandBuffer cmdbuf) {
+    static constexpr VkMemoryBarrier barrier{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .pNext = nullptr,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+    };
+    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, barrier);
+}
+
+u32 GroupCount(u32 size) {
+    return (size + 15) / 16;
+}
+
+} // Anonymous namespace
+
 OpticalFlowFrameGen::OpticalFlowFrameGen(const Device& device, MemoryAllocator& memory_allocator,
                                          VkExtent2D extent, VkFormat format)
-    : m_allocator{memory_allocator}, m_extent{extent},
-      m_flow_extent{(std::max)(1u, extent.width / 2), (std::max)(1u, extent.height / 2)},
-      m_format{format} {
+    : m_allocator{memory_allocator}, m_extent{extent}, m_format{format} {
     CreateResources(device);
     CreateShaders(device);
     CreatePipelines(device);
+    WriteFlowDescriptors(device);
     m_initialized = true;
 }
 
@@ -181,6 +262,8 @@ void OpticalFlowFrameGen::CreateResources(const Device& device) {
     // Current-frame copy for interpolation shader
     m_current_image = m_allocator.CreateImage(VkImageCreateInfo{
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
         .imageType = VK_IMAGE_TYPE_2D,
         .format = m_format,
         .extent = {m_extent.width, m_extent.height, 1},
@@ -191,111 +274,156 @@ void OpticalFlowFrameGen::CreateResources(const Device& device) {
         .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                  VK_IMAGE_USAGE_SAMPLED_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0,
+        .pQueueFamilyIndices = nullptr,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
     });
     m_current_view = CreateWrappedImageView(device, m_current_image, m_format);
 
-    // Half-resolution motion vector image
-    m_motion_image = CreateWrappedImage(m_allocator, m_flow_extent, VK_FORMAT_R16G16_SFLOAT);
-    m_motion_view = CreateWrappedImageView(device, m_motion_image, VK_FORMAT_R16G16_SFLOAT);
+    VkExtent2D level_extent = m_extent;
+    for (FlowLevel& level : m_levels) {
+        level_extent = {(std::max)(1u, (level_extent.width + 1) / 2),
+                        (std::max)(1u, (level_extent.height + 1) / 2)};
+        level.extent = level_extent;
+        for (size_t parity = 0; parity < 2; ++parity) {
+            level.luma[parity] =
+                CreateWrappedImage(m_allocator, level_extent, VK_FORMAT_R16_SFLOAT);
+            level.luma_view[parity] =
+                CreateWrappedImageView(device, level.luma[parity], VK_FORMAT_R16_SFLOAT);
+        }
+        level.motion = CreateWrappedImage(m_allocator, level_extent, VK_FORMAT_R16G16_SFLOAT);
+        level.motion_view = CreateWrappedImageView(device, level.motion, VK_FORMAT_R16G16_SFLOAT);
+    }
 
+    constexpr u32 SETS = 2 * 2 * FLOW_LEVELS;
     const std::array pool_sizes{
-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2},
-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * 4 * FLOW_LEVELS},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, SETS},
     };
     m_desc_pool = device.GetLogical().CreateDescriptorPool(VkDescriptorPoolCreateInfo{
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = 1,
+        .pNext = nullptr,
+        .flags = 0,
+        .maxSets = SETS,
         .poolSizeCount = static_cast<u32>(pool_sizes.size()),
         .pPoolSizes = pool_sizes.data(),
     });
 }
 
 void OpticalFlowFrameGen::CreateShaders(const Device& device) {
-    m_flow_shader = BuildShader(device, FRAME_GEN_OPTICAL_FLOW_COMP_SPV);
+    m_downsample_shader = BuildShader(device, FRAME_GEN_LUMA_DOWNSAMPLE_COMP_SPV);
+    m_search_shader = BuildShader(device, FRAME_GEN_FLOW_SEARCH_COMP_SPV);
     m_interp_shader = BuildShader(device, FRAME_GEN_INTERPOLATION_COMP_SPV);
 }
 
 void OpticalFlowFrameGen::CreatePipelines(const Device& device) {
-    // ── Optical Flow Pipeline ──────────────────────────────────────────
-    const std::array flow_bindings{
-        VkDescriptorSetLayoutBinding{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-        VkDescriptorSetLayoutBinding{1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-        VkDescriptorSetLayoutBinding{2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+    m_downsample_desc_layout = CreateComputeSetLayout(device, 1);
+    m_downsample_pipe_layout = CreateComputePipelineLayout(device, m_downsample_desc_layout,
+                                                           sizeof(DownsamplePushConstants));
+    m_downsample_pipeline =
+        CreateComputePipeline(device, m_downsample_pipe_layout, m_downsample_shader);
+
+    m_search_desc_layout = CreateComputeSetLayout(device, 3);
+    m_search_pipe_layout = CreateComputePipelineLayout(device, m_search_desc_layout,
+                                                       sizeof(SearchPushConstants));
+    m_search_pipeline = CreateComputePipeline(device, m_search_pipe_layout, m_search_shader);
+
+    m_interp_desc_layout = CreateComputeSetLayout(device, 3);
+    m_interp_pipe_layout = CreateComputePipelineLayout(device, m_interp_desc_layout,
+                                                       sizeof(InterpPushConstants));
+    m_interp_pipeline = CreateComputePipeline(device, m_interp_pipe_layout, m_interp_shader);
+
+    std::vector<VkDescriptorSetLayout> downsample_layouts(2 * FLOW_LEVELS,
+                                                          *m_downsample_desc_layout);
+    std::vector<VkDescriptorSetLayout> search_layouts(2 * FLOW_LEVELS, *m_search_desc_layout);
+    m_downsample_desc_sets = CreateWrappedDescriptorSets(m_desc_pool, downsample_layouts);
+    m_search_desc_sets = CreateWrappedDescriptorSets(m_desc_pool, search_layouts);
+}
+
+void OpticalFlowFrameGen::WriteFlowDescriptors(const Device& device) {
+    std::vector<VkDescriptorImageInfo> image_infos;
+    image_infos.reserve(2 * 2 * 4 * FLOW_LEVELS);
+    std::vector<VkWriteDescriptorSet> updates;
+    const auto storage = [&](VkImageView view, VkDescriptorSet set, u32 binding) {
+        image_infos.push_back(VkDescriptorImageInfo{
+            .sampler = VK_NULL_HANDLE,
+            .imageView = view,
+            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+        });
+        updates.push_back(VkWriteDescriptorSet{
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .pNext = nullptr,
+            .dstSet = set,
+            .dstBinding = binding,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .pImageInfo = &image_infos.back(),
+            .pBufferInfo = nullptr,
+            .pTexelBufferView = nullptr,
+        });
     };
-
-    m_flow_desc_layout = device.GetLogical().CreateDescriptorSetLayout(VkDescriptorSetLayoutCreateInfo{
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = static_cast<u32>(flow_bindings.size()),
-        .pBindings = flow_bindings.data(),
-    });
-
-    const VkPushConstantRange flow_push_range{
-        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-        .offset = 0,
-        .size = sizeof(FlowPushConstants),
+    const auto sampled = [&](VkImageView view, VkDescriptorSet set, u32 binding) {
+        updates.push_back(
+            CreateWriteDescriptorSet(image_infos, *m_linear_sampler, view, set, binding));
     };
+    for (u32 parity = 0; parity < 2; ++parity) {
+        for (size_t level = 0; level < FLOW_LEVELS; ++level) {
+            const FlowLevel& here = m_levels[level];
+            const VkDescriptorSet downsample = m_downsample_desc_sets[parity * FLOW_LEVELS + level];
+            sampled(level == 0 ? *m_current_view : *m_levels[level - 1].luma_view[parity],
+                    downsample, 0);
+            storage(*here.luma_view[parity], downsample, 1);
 
-    m_flow_pipe_layout = device.GetLogical().CreatePipelineLayout(VkPipelineLayoutCreateInfo{
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-        .setLayoutCount = 1,
-        .pSetLayouts = m_flow_desc_layout.address(),
-        .pushConstantRangeCount = 1,
-        .pPushConstantRanges = &flow_push_range,
-    });
+            const VkDescriptorSet search = m_search_desc_sets[parity * FLOW_LEVELS + level];
+            sampled(*here.luma_view[parity], search, 0);
+            sampled(*here.luma_view[parity ^ 1], search, 1);
+            // The coarsest level has no coarser motion; it binds the finest, which it never reads.
+            sampled(level + 1 < FLOW_LEVELS ? *m_levels[level + 1].motion_view
+                                            : *m_levels[0].motion_view,
+                    search, 2);
+            storage(*here.motion_view, search, 3);
+        }
+    }
+    device.GetLogical().UpdateDescriptorSets(updates, {});
+}
 
-    m_flow_pipeline = device.GetLogical().CreateComputePipeline(VkComputePipelineCreateInfo{
-        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .stage = {
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-            .module = *m_flow_shader,
-            .pName = "main",
-        },
-        .layout = *m_flow_pipe_layout,
-    });
-
-    // ── Frame Interpolation Pipeline ───────────────────────────────────
-    const std::array interp_bindings{
-        VkDescriptorSetLayoutBinding{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-        VkDescriptorSetLayoutBinding{1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-        VkDescriptorSetLayoutBinding{2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-        VkDescriptorSetLayoutBinding{3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-    };
-
-    m_interp_desc_layout = device.GetLogical().CreateDescriptorSetLayout(VkDescriptorSetLayoutCreateInfo{
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = static_cast<u32>(interp_bindings.size()),
-        .pBindings = interp_bindings.data(),
-    });
-
-    const VkPushConstantRange interp_push_range{
-        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-        .offset = 0,
-        .size = sizeof(InterpPushConstants),
-    };
-
-    m_interp_pipe_layout = device.GetLogical().CreatePipelineLayout(VkPipelineLayoutCreateInfo{
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-        .setLayoutCount = 1,
-        .pSetLayouts = m_interp_desc_layout.address(),
-        .pushConstantRangeCount = 1,
-        .pPushConstantRanges = &interp_push_range,
-    });
-
-    m_interp_pipeline = device.GetLogical().CreateComputePipeline(VkComputePipelineCreateInfo{
-        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .stage = {
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-            .module = *m_interp_shader,
-            .pName = "main",
-        },
-        .layout = *m_interp_pipe_layout,
-    });
-
-    // Allocate descriptor sets
-    m_flow_desc_sets = CreateWrappedDescriptorSets(m_desc_pool, {*m_flow_desc_layout});
+void OpticalFlowFrameGen::RecordFlow(vk::CommandBuffer cmdbuf, u32 parity, bool search) const {
+    ComputeToComputeBarrier(cmdbuf);
+    cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *m_downsample_pipeline);
+    for (size_t level = 0; level < FLOW_LEVELS; ++level) {
+        const VkExtent2D extent = m_levels[level].extent;
+        cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *m_downsample_pipe_layout, 0,
+                                  m_downsample_desc_sets[parity * FLOW_LEVELS + level], {});
+        cmdbuf.PushConstants(*m_downsample_pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                             DownsamplePushConstants{
+                                 .destination_width = static_cast<s32>(extent.width),
+                                 .destination_height = static_cast<s32>(extent.height),
+                                 .is_color = level == 0 ? 1 : 0,
+                             });
+        cmdbuf.Dispatch(GroupCount(extent.width), GroupCount(extent.height), 1);
+        ComputeToComputeBarrier(cmdbuf);
+    }
+    if (!search) {
+        return;
+    }
+    cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *m_search_pipeline);
+    for (size_t level = FLOW_LEVELS; level-- > 0;) {
+        const VkExtent2D extent = m_levels[level].extent;
+        const bool coarsest = level + 1 == FLOW_LEVELS;
+        cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *m_search_pipe_layout, 0,
+                                  m_search_desc_sets[parity * FLOW_LEVELS + level], {});
+        cmdbuf.PushConstants(*m_search_pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                             SearchPushConstants{
+                                 .width = static_cast<s32>(extent.width),
+                                 .height = static_cast<s32>(extent.height),
+                                 .radius = coarsest ? COARSE_SEARCH_RADIUS : 1,
+                                 .has_coarse = coarsest ? 0 : 1,
+                                 .subpixel = level == 0 ? 1 : 0,
+                             });
+        cmdbuf.Dispatch(GroupCount(extent.width), GroupCount(extent.height), 1);
+        ComputeToComputeBarrier(cmdbuf);
+    }
 }
 
 void OpticalFlowFrameGen::Process(const Device& device, Scheduler& scheduler, VkImage current_frame,
@@ -304,78 +432,40 @@ void OpticalFlowFrameGen::Process(const Device& device, Scheduler& scheduler, Vk
         m_has_history = false;
         m_flow_valid = false;
     }
+    const u32 parity = m_parity;
+    m_parity ^= 1;
     if (!m_has_history) {
-        // First frame: populate history and current-frame copy via batched dual-copy
-        scheduler.Record([this, current_frame](vk::CommandBuffer cmdbuf) {
+        // First frame: populate history, the current-frame copy and this frame's luma pyramid.
+        scheduler.Record([this, current_frame, parity](vk::CommandBuffer cmdbuf) {
             CopyImageToTwo(cmdbuf, current_frame, *m_history_image, *m_current_image, m_extent);
-            DiscardForComputeWrite(cmdbuf, *m_motion_image);
+            std::vector<VkImageMemoryBarrier> barriers;
+            for (const FlowLevel& level : m_levels) {
+                barriers.push_back(MakeBarrier(*level.luma[0], 0, VK_ACCESS_SHADER_WRITE_BIT,
+                                               VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL));
+                barriers.push_back(MakeBarrier(*level.luma[1], 0, VK_ACCESS_SHADER_WRITE_BIT,
+                                               VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL));
+                barriers.push_back(MakeBarrier(*level.motion, 0, VK_ACCESS_SHADER_WRITE_BIT,
+                                               VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL));
+            }
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, {}, {}, barriers);
+            RecordFlow(cmdbuf, parity, false);
         });
         m_has_history = true;
         m_last_frame_count = frame_count;
         return;
     }
 
-    // ── Duplicate-frame detection ──────────────────────────────────────
     if (frame_count == m_last_frame_count) {
+        m_parity ^= 1;
         return;
     }
     m_last_frame_count = frame_count;
 
-    // ── Descriptor caching ─────────────────────────────────────────────
-    if (!m_flow_descriptors_initialized) {
-        std::vector<VkDescriptorImageInfo> image_infos;
-        image_infos.reserve(4);
-        std::vector<VkWriteDescriptorSet> updates{
-            CreateWriteDescriptorSet(image_infos, *m_linear_sampler, *m_current_view, m_flow_desc_sets[0], 0),
-            CreateWriteDescriptorSet(image_infos, *m_linear_sampler, *m_history_view, m_flow_desc_sets[0], 1),
-        };
-
-        const VkDescriptorImageInfo motion_store_info{
-            .imageView = *m_motion_view,
-            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-        };
-        updates.push_back(VkWriteDescriptorSet{
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = m_flow_desc_sets[0],
-            .dstBinding = 2,
-            .descriptorCount = 1,
-            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-            .pImageInfo = &motion_store_info,
-        });
-        device.GetLogical().UpdateDescriptorSets(updates, {});
-        m_flow_descriptors_initialized = true;
-    }
-
-    // Dispatch Optical Flow at half resolution
-    const u32 flow_w = m_flow_extent.width;
-    const u32 flow_h = m_flow_extent.height;
-    const FlowPushConstants constants{
-        .inv_render_w = 1.0f / static_cast<float>(flow_w),
-        .inv_render_h = 1.0f / static_cast<float>(flow_h),
-        .render_w = static_cast<float>(flow_w),
-        .render_h = static_cast<float>(flow_h),
-        .search_radius = 2.0f,
-        .block_size = 2.0f,
-    };
-
-    scheduler.Record([this, constants, current_frame, flow_w, flow_h](vk::CommandBuffer cmdbuf) {
+    scheduler.Record([this, current_frame, parity](vk::CommandBuffer cmdbuf) {
         CopyImageToImage(cmdbuf, *m_current_image, *m_history_image, m_extent);
         CopyImageToImage(cmdbuf, current_frame, *m_current_image, m_extent);
-
-        const auto barrier = MakeBarrier(*m_motion_image,
-                                         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-                                         VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL,
-                                         VK_IMAGE_LAYOUT_GENERAL);
-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, {}, {}, barrier);
-
-        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *m_flow_pipeline);
-        cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *m_flow_pipe_layout, 0,
-                                  m_flow_desc_sets[0], {});
-        cmdbuf.PushConstants(*m_flow_pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, constants);
-        cmdbuf.Dispatch((flow_w + 15) / 16, (flow_h + 15) / 16, 1);
-
-        BarrierComputeWriteToRead(cmdbuf, *m_motion_image);
+        RecordFlow(cmdbuf, parity, true);
     });
 
     m_flow_valid = true;
@@ -400,7 +490,7 @@ void OpticalFlowFrameGen::Generate(const Device& device, Scheduler& scheduler, V
     std::vector<VkWriteDescriptorSet> updates{
         CreateWriteDescriptorSet(image_infos, *m_linear_sampler, *m_current_view, set, 0),
         CreateWriteDescriptorSet(image_infos, *m_linear_sampler, *m_history_view, set, 1),
-        CreateWriteDescriptorSet(image_infos, *m_linear_sampler, *m_motion_view, set, 2),
+        CreateWriteDescriptorSet(image_infos, *m_linear_sampler, *m_levels[0].motion_view, set, 2),
     };
 
     const VkDescriptorImageInfo dest_info{

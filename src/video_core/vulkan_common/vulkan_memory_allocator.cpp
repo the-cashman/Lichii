@@ -268,6 +268,17 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
         }
     }
     const bool huge = IsTooLargeToBack(texels, bytes);
+    if (huge && may_fail) {
+        static std::atomic<u32> rejected{};
+        if (rejected.fetch_add(1, std::memory_order_relaxed) < 32) {
+            LOG_WARNING(Render_Vulkan,
+                        "Image {}x{}x{} ({} levels, {} layers, format {}) exceeds the dense "
+                        "image limit; rejecting the allocation",
+                        ci.extent.width, ci.extent.height, ci.extent.depth, ci.mipLevels,
+                        ci.arrayLayers, static_cast<u32>(ci.format));
+        }
+        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    }
     VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
                            : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
@@ -289,12 +300,7 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
         pressure_events.fetch_add(1, std::memory_order_relaxed);
     }
-    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && ci.imageType != VK_IMAGE_TYPE_1D &&
-        UsesUnbackedFallback(texels, bytes, may_fail)) {
-        // Too big to back at all, e.g. title 1's sparse virtual texture arrays (8192x8192,
-        // 68 layers, ~23 GB): on the console only resident tiles have memory. Use an image with
-        // nothing bound, so views and copies still work, instead of aborting. A smaller image
-        // gets one only for a caller that would throw otherwise.
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !may_fail) {
         if (vk::Image sparse = CreateUnbackedImage(ci)) {
             LOG_WARNING(Render_Vulkan,
                         "Image {}x{}x{} ({} levels, {} layers, format {}) does not fit; using an "
@@ -380,8 +386,17 @@ void MemoryAllocator::NoteHostPlacement(VmaAllocation allocation, VkDeviceSize s
 }
 
 vk::Image MemoryAllocator::CreateUnbackedImage(const VkImageCreateInfo &ci, bool aliased) const {
-    if (ci.imageType == VK_IMAGE_TYPE_1D) {
+    if (ci.imageType != VK_IMAGE_TYPE_2D || !device.IsSparseResidencyImage2DSupported() ||
+        (aliased && !device.IsSparseResidencyAliasedSupported())) {
         return vk::Image{};
+    }
+    const auto& dld = device.GetDispatchLoader();
+    u32 sparse_formats{};
+    dld.vkGetPhysicalDeviceSparseImageFormatProperties(device.GetPhysical(), ci.format, ci.imageType,
+                                                       ci.samples, ci.usage, ci.tiling,
+                                                       &sparse_formats, nullptr);
+    if (sparse_formats == 0) {
+        return {};
     }
     VkImageCreateInfo sparse_ci = ci;
     sparse_ci.flags |= VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT;
@@ -389,12 +404,10 @@ vk::Image MemoryAllocator::CreateUnbackedImage(const VkImageCreateInfo &ci, bool
         sparse_ci.flags |= VK_IMAGE_CREATE_SPARSE_ALIASED_BIT;
     }
     VkImage sparse{};
-    if (device.GetDispatchLoader().vkCreateImage(*device.GetLogical(), &sparse_ci, nullptr,
-                                                 &sparse) != VK_SUCCESS) {
+    if (dld.vkCreateImage(*device.GetLogical(), &sparse_ci, nullptr, &sparse) != VK_SUCCESS) {
         return vk::Image{};
     }
-    return vk::Image(sparse, ci.usage, *device.GetLogical(), allocator, VK_NULL_HANDLE,
-                     device.GetDispatchLoader());
+    return vk::Image(sparse, ci.usage, *device.GetLogical(), allocator, VK_NULL_HANDLE, dld);
 }
 
 VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements &requirements,

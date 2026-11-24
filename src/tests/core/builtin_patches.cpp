@@ -377,6 +377,64 @@ TEST_CASE("Yoshi 2.0.0 Full Scene Resolution with FXAA is an exact opt-in patch"
     }
 }
 
+TEST_CASE("Wonder Switch 2 Edition 60 FPS pins its rate and interval together", "[patch_manager]") {
+    constexpr u64 TitleId = 0x040015100B514001;
+    constexpr std::string_view Name = "60 FPS (built-in)";
+    struct Site {
+        size_t offset;
+        u32 original;
+        u32 replacement;
+    };
+    constexpr std::array Sites{
+        Site{0x1BBFB0, 0x1ACA0D01, 0x52800781}, // sdiv w1, w8, w10 -> mov w1, #60
+        Site{0x1BBFCC, 0xB9404281, 0x52800021}, // ldr w1, [x20, #0x40] -> mov w1, #1
+        Site{0x1BC04C, 0xB9405281, 0x52800781}, // ldr w1, [x20, #0x50] -> mov w1, #60
+    };
+    PatchManagerTestContext context;
+    const auto manager = context.Manager(TitleId);
+    Settings::values.disabled_addons.erase(TitleId);
+    SCOPE_EXIT {
+        Settings::values.disabled_addons.erase(TitleId);
+    };
+
+    Loader::NSOHeader header{};
+    header.magic = Common::MakeMagic('N', 'S', 'O', '0');
+    header.build_id = {0xEC, 0x47, 0xE6, 0xF8, 0x84, 0x6D, 0x2A, 0x7B, 0x68, 0x92,
+                       0xE2, 0x68, 0x28, 0x45, 0xC7, 0x25, 0x5F, 0x71, 0x17, 0xAE};
+    std::vector<u8> nso(sizeof(header) + Sites.back().offset + sizeof(u32));
+    std::memcpy(nso.data(), &header, sizeof(header));
+    const auto write = [](std::vector<u8>& data, size_t offset, u32 value) {
+        std::memcpy(data.data() + sizeof(Loader::NSOHeader) + offset, &value, sizeof(value));
+    };
+    for (const auto& site : Sites) {
+        write(nso, site.offset, site.original);
+    }
+
+    SECTION("Listed checked and applied by default") {
+        const auto patches = manager.GetPatches();
+        const auto patch = std::ranges::find(patches, Name, &FileSys::Patch::name);
+        REQUIRE(patch != patches.end());
+        CHECK_FALSE(patch->off_by_default);
+        CHECK(patch->enabled);
+        CHECK(manager.HasNSOPatch(header.build_id, "main"));
+        auto expected = nso;
+        for (const auto& site : Sites) {
+            write(expected, site.offset, site.replacement);
+        }
+        REQUIRE(manager.PatchNSO(nso, "main") == expected);
+    }
+
+    SECTION("An unexpected original word leaves every site unchanged") {
+        write(nso, Sites[1].offset, 0xB9404681);
+        REQUIRE(manager.PatchNSO(nso, "main") == nso);
+    }
+
+    SECTION("Disabled in Add-Ons skips") {
+        Settings::values.disabled_addons[TitleId] = {std::string{Name}};
+        REQUIRE(manager.PatchNSO(nso, "main") == nso);
+    }
+}
+
 TEST_CASE("Built-in Max Resolution patch defers to a user mod at the same offset",
           "[patch_manager]") {
     SECTION("A different word from the mod is kept") {

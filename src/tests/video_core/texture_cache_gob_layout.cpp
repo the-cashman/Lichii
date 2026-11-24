@@ -10,6 +10,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "common/page_table.h"
+#include "common/scope_exit.h"
 #include "core/core.h"
 #include "core/device_memory.h"
 #include "core/hle/kernel/k_process.h"
@@ -26,6 +27,7 @@ namespace {
 
 struct TestAsyncBuffer {
     std::span<u8> mapped_span;
+    size_t offset{};
 };
 
 struct TestRuntime {
@@ -37,8 +39,22 @@ struct TestRuntime {
     }
     void FreeDeferredStagingBuffer(TestAsyncBuffer&) {
         staging.clear();
+        freed_staging_tick = CurrentTick();
     }
-    u64 CurrentTick() const { return 1; }
+    TestAsyncBuffer UploadStagingBuffer(size_t size, bool deferred = false) {
+        REQUIRE(deferred);
+        staging.resize(size);
+        return {staging};
+    }
+    void AccelerateImageUpload(auto&, const TestAsyncBuffer&,
+                               std::span<const VideoCommon::SwizzleParameters>, u32, u32) {
+        ++unswizzle_uploads;
+    }
+    void InsertUploadMemoryBarrier() {}
+    bool CanReportMemoryUsage() const { return true; }
+    u64 GetDeviceMemoryUsage() const { return 0; }
+    void TickFrame() {}
+    u64 CurrentTick() const { return current_tick; }
     bool IsFree(u64 tick) const { return completed_tick >= tick; }
     void FlushDeferredClear() {}
     void Finish() { FAIL("A texture lookup must not wait for the GPU"); }
@@ -50,8 +66,11 @@ struct TestRuntime {
         return false;
     }
     std::vector<u8> staging;
+    u64 current_tick{1};
     u64 completed_tick{};
+    u64 freed_staging_tick{};
     u32 downloads{};
+    u32 unswizzle_uploads{};
 };
 
 struct TestImage : VideoCommon::ImageBase {
@@ -63,10 +82,15 @@ struct TestImage : VideoCommon::ImageBase {
     TestImage& operator=(TestImage&&) = default;
     void DownloadMemory(const TestAsyncBuffer& map,
                         std::span<const VideoCommon::BufferImageCopy>) {
-        REQUIRE(map.mapped_span.size() == gpu_bytes.size());
-        std::ranges::copy(gpu_bytes, map.mapped_span.begin());
+        auto dest = map.mapped_span.subspan(map.offset);
+        REQUIRE(dest.size() >= gpu_bytes.size());
+        std::ranges::copy(gpu_bytes, dest.begin());
+    }
+    void UploadMemory(const TestAsyncBuffer&, std::span<const VideoCommon::BufferImageCopy>) {
+        FAIL("Unexpected CPU decode upload");
     }
     std::vector<u8> gpu_bytes;
+    std::shared_ptr<int> lifetime;
 };
 
 struct TestImageView : VideoCommon::ImageViewBase {
@@ -109,7 +133,7 @@ struct Policy {
     static constexpr bool FRAMEBUFFER_BLITS = false;
     static constexpr bool HAS_EMULATED_COPIES = false;
     static constexpr bool HAS_DEVICE_MEMORY_INFO = false;
-    static constexpr bool IMPLEMENTS_ASYNC_DOWNLOADS = false;
+    static constexpr bool IMPLEMENTS_ASYNC_DOWNLOADS = true;
     static constexpr bool HAS_MSAA_DOWNLOADS = false;
 };
 
@@ -160,6 +184,62 @@ struct TextureCacheTestAccess {
     template <class C>
     static const ImageInfo& Info(C& cache, ImageId id) {
         return cache.slot_images[id].info;
+    }
+    template <class C>
+    static void CacheLutView(C& cache, ImageId id, const Tegra::Texture::TICEntry& tic) {
+        auto& channel = *cache.channel_state;
+        auto& image = cache.slot_images[id];
+        const auto view = cache.FindOrEmplaceImageView(id, ImageViewInfo{tic, 0});
+        image.xc2_lut_view = true;
+        channel.image_views.emplace(tic, view);
+        cache.image_view_descriptors[view].emplace_back(cache.current_channel_id, tic);
+    }
+    template <class C>
+    static bool HasCachedView(C& cache, const Tegra::Texture::TICEntry& tic) {
+        return cache.channel_state->image_views.contains(tic);
+    }
+    template <class C>
+    static u64 DescriptorRevision(C& cache) {
+        return cache.channel_state->graphics_image_table.changes;
+    }
+    template <class C>
+    static void LinkOverlap(C& cache, ImageId left, ImageId right) {
+        cache.slot_images[left].overlapping_images.push_back(right);
+        cache.slot_images[right].overlapping_images.push_back(left);
+    }
+    template <class C>
+    static void Delete(C& cache, ImageId id) {
+        const auto alloc = cache.slot_image_allocs.insert();
+        cache.image_allocs_table.emplace(cache.slot_images[id].gpu_addr, alloc);
+        cache.slot_image_allocs[alloc].images.push_back(id);
+        cache.UnregisterImage(id);
+        cache.DeleteImage(id);
+    }
+    template <class C>
+    static auto& Image(C& cache, ImageId id) {
+        return cache.slot_images[id];
+    }
+    template <class C>
+    static void QueueDownload(C& cache, ImageId id) {
+        cache.uncommitted_downloads.push_back({.is_swizzle = true, .object_id = id});
+    }
+    template <class C>
+    static void QueueUnswizzle(C& cache, ImageId id) {
+        cache.QueueAsyncUnswizzle(cache.slot_images[id], id);
+    }
+    template <class C>
+    static void ProcessOneUnswizzleSlice(C& cache) {
+        cache.swizzle_chunk_size = 512;
+        cache.swizzle_slices_per_batch = 1;
+        cache.TickAsyncUnswizzle();
+    }
+    template <class C>
+    static std::vector<ImageId> QueuedUnswizzles(const C& cache) {
+        std::vector<ImageId> ids;
+        for (const auto& task : cache.unswizzle_queue) {
+            ids.push_back(task.image_id);
+        }
+        return ids;
     }
 };
 
@@ -220,6 +300,78 @@ struct Fixture {
 };
 
 } // namespace
+
+TEST_CASE("Async image downloads and the delete tick both hold the image alive",
+          "[video_core][texture_cache][image_lifetime]") {
+    Fixture f;
+    auto& cache = *f.cache;
+    const auto id = Access::Insert(cache, MakeInfo(), 0x100000, 0x10000);
+    auto& image = Access::Image(cache, id);
+    image.lifetime = std::make_shared<int>();
+    const std::weak_ptr<int> lifetime = image.lifetime;
+    Access::WriteGpu(cache, id, std::vector<u8>(image.unswizzled_size_bytes, 0xA5));
+    Access::QueueDownload(cache, id);
+
+    SECTION("An older download can finish before later GPU work") {
+        cache.CommitAsyncFlushes();
+        f.runtime.current_tick = 2;
+        Access::Delete(cache, id);
+        REQUIRE(Access::Insert(cache, MakeInfo(), 0x102000, 0x12000) == id);
+
+        f.runtime.completed_tick = 1;
+        cache.PopAsyncFlushes();
+        cache.TickFrame();
+        CHECK(f.bytes[0] == 0xA5);
+        CHECK_FALSE(lifetime.expired());
+
+        f.runtime.completed_tick = 2;
+        cache.TickFrame();
+        CHECK(lifetime.expired());
+    }
+    SECTION("A newer download can still be uncommitted when the delete tick completes") {
+        Access::Delete(cache, id);
+        REQUIRE(Access::Insert(cache, MakeInfo(), 0x102000, 0x12000) == id);
+
+        f.runtime.completed_tick = 1;
+        f.runtime.current_tick = 2;
+        cache.TickFrame();
+        REQUIRE_FALSE(lifetime.expired());
+        cache.CommitAsyncFlushes();
+        f.runtime.completed_tick = 2;
+        cache.PopAsyncFlushes();
+        CHECK(f.bytes[0] == 0xA5);
+        CHECK(lifetime.expired());
+    }
+}
+
+TEST_CASE("Deleting an image cancels only its queued unswizzle",
+          "[video_core][texture_cache][image_lifetime]") {
+    Fixture f;
+    auto& cache = *f.cache;
+    auto info = MakeInfo();
+    info.type = VideoCommon::ImageType::e3D;
+    info.format = VideoCore::Surface::PixelFormat::BC1_RGBA_UNORM;
+    info.size = {32, 32, 8};
+    const auto id = Access::Insert(cache, info, 0x100000, 0x10000);
+    const auto other = Access::Insert(cache, info, 0x104000, 0x14000);
+    Access::QueueUnswizzle(cache, id);
+    Access::QueueUnswizzle(cache, other);
+
+    bool initialized = false;
+    SECTION("Before processing starts") {}
+    SECTION("With deferred staging already in use") {
+        f.runtime.current_tick = 4;
+        Access::ProcessOneUnswizzleSlice(cache);
+        REQUIRE(f.runtime.unswizzle_uploads == 1);
+        initialized = true;
+    }
+    f.runtime.current_tick = 5;
+    Access::Delete(cache, id);
+
+    REQUIRE(Access::Insert(cache, MakeInfo(), 0x108000, 0x18000) == id);
+    CHECK(Access::QueuedUnswizzles(cache) == std::vector{other});
+    CHECK(f.runtime.freed_staging_tick == (initialized ? 5u : 0u));
+}
 
 TEST_CASE("Sparse texture iteration skips segments that cannot be translated",
           "[video_core][texture_cache][sparse_segments]") {
@@ -387,5 +539,82 @@ TEST_CASE("Hinted BC7 lookup waits for GPU-written native overlap bytes",
         CHECK(Access::Find(*f.cache, gob, gpu_addr) == hinted);
         CHECK(f.runtime.downloads == 0);
         CHECK(f.bytes[0x40] == 0x73);
+    }
+}
+
+TEST_CASE("Cached XC2 LUT layout is invalidated by a conflicting write",
+          "[video_core][texture_cache][gob_layout]") {
+    using namespace VideoCommon;
+    using namespace Tegra::Texture;
+
+    Fixture f;
+    const u64 saved_program_id = Settings::GetCurrentProgramID();
+    SCOPE_EXIT { Settings::SetCurrentProgramID(saved_program_id); };
+    Settings::SetCurrentProgramID(Xc2ProgramId);
+    constexpr GPUVAddr gpu_addr = 0x100000;
+    constexpr DAddr cpu_addr = 0x10000;
+    TICEntry tic{};
+    tic.address_low = gpu_addr;
+    tic.format.Assign(TextureFormat::A8B8G8R8);
+    tic.r_type.Assign(ComponentType::UNORM);
+    tic.g_type.Assign(ComponentType::UNORM);
+    tic.b_type.Assign(ComponentType::UNORM);
+    tic.a_type.Assign(ComponentType::UNORM);
+    tic.texture_type.Assign(TextureType::Texture3D);
+    tic.header_version.Assign(TICHeaderVersion::BlockLinear);
+    tic.load_store_hint.Assign(1);
+    tic.width_minus_one.Assign(15);
+    tic.height_minus_1.Assign(15);
+    tic.depth_minus_1.Assign(15);
+    auto native = ImageInfo{tic};
+    native.native_tiling = true;
+    auto maxwell = native;
+    maxwell.native_tiling = false;
+    maxwell.maxwell_gob_layout = true;
+    auto& cache = *f.cache;
+    const auto target = Access::Insert(cache, native, gpu_addr, cpu_addr);
+    const auto lookup = Access::Insert(cache, maxwell, gpu_addr, cpu_addr);
+    Access::LinkOverlap(cache, target, lookup);
+    cache.MarkModification(target);
+    Access::CacheLutView(cache, target, tic);
+    const auto revision = Access::DescriptorRevision(cache);
+    REQUIRE(Access::HasCachedView(cache, tic));
+
+    SECTION("A render to the same native target keeps the selected view") {
+        cache.MarkModification(target);
+        CHECK(Access::HasCachedView(cache, tic));
+        CHECK(Access::DescriptorRevision(cache) == revision);
+    }
+    SECTION("A guest write forces unchanged descriptors to resolve the layout again") {
+        cache.WriteMemory(cpu_addr, CalculateGuestSizeInBytes(native));
+        CHECK_FALSE(Access::HasCachedView(cache, tic));
+        CHECK(Access::DescriptorRevision(cache) > revision);
+    }
+    SECTION("A GPU write to the Maxwell overlap invalidates the native view") {
+        cache.MarkModification(lookup);
+        CHECK_FALSE(Access::HasCachedView(cache, tic));
+        CHECK(Access::DescriptorRevision(cache) > revision);
+    }
+    SECTION("A GPU write to another non-native overlap also invalidates the native view") {
+        maxwell.maxwell_gob_layout = false;
+        const auto other = Access::Insert(cache, maxwell, gpu_addr, cpu_addr);
+        Access::LinkOverlap(cache, target, other);
+        cache.MarkModification(other);
+        CHECK_FALSE(Access::HasCachedView(cache, tic));
+        CHECK(Access::DescriptorRevision(cache) > revision);
+    }
+    SECTION("A GPU write to the native overlap invalidates the Maxwell view") {
+        cache.MarkModification(lookup);
+        REQUIRE_FALSE(Access::HasCachedView(cache, tic));
+        Access::CacheLutView(cache, lookup, tic);
+        const auto maxwell_revision = Access::DescriptorRevision(cache);
+
+        cache.MarkModification(lookup);
+        CHECK(Access::HasCachedView(cache, tic));
+        CHECK(Access::DescriptorRevision(cache) == maxwell_revision);
+
+        cache.MarkModification(target);
+        CHECK_FALSE(Access::HasCachedView(cache, tic));
+        CHECK(Access::DescriptorRevision(cache) > maxwell_revision);
     }
 }

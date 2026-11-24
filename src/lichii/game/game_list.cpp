@@ -169,6 +169,10 @@ bool GameList::IsEmpty() const {
     return item_model->IsEmpty();
 }
 
+bool GameList::IsPopulating() const {
+    return m_populating;
+}
+
 void GameList::OnPopulate() {
     m_populating = true;
     m_currentView->setEnabled(false);
@@ -190,8 +194,8 @@ void GameList::PopulateAsync(QVector<UISettings::GameDir>& game_dirs) {
     item_model->PopulateAsync(game_dirs);
 }
 
-void GameList::SetScanEnabled(bool enabled) {
-    item_model->SetScanEnabled(enabled);
+void GameList::SetScanEnabled(bool enabled, bool stop_worker) {
+    item_model->SetScanEnabled(enabled, stop_worker);
 }
 
 void GameList::SaveInterfaceLayout() {

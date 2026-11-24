@@ -180,6 +180,10 @@ public:
 
     /// Whether the active render pass is the one RequestRenderpass(framebuffer) would keep.
     bool RenderPassMatches(const Framebuffer* framebuffer, bool dynamic = false) const;
+    bool IsBetweenRenderPasses() const {
+        return state.renderpass == VK_NULL_HANDLE && deferred_clear.framebuffer == nullptr;
+    }
+
     /// Changes whenever a render pass begins or ends.
     u64 RenderPassSerial() const {
         return render_pass_serial;

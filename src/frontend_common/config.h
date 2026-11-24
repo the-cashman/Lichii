@@ -57,7 +57,7 @@ protected:
     void Initialize(const std::string& config_name = "config");
     void Initialize(std::optional<std::string> config_path);
 
-    void WriteToIni() const;
+    bool WriteToIni() const;
 
     void SetUpIni();
     [[nodiscard]] bool IsCustomConfig() const;

@@ -343,6 +343,14 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
 
         info.dual_source_blend = key.state.attachment0_dual_source_blend != 0;
 
+        const auto zeta_format{static_cast<Tegra::DepthFormat>(key.state.depth_format.Value())};
+        info.quantize_frag_depth_d24 = key.state.depth_enabled != 0 &&
+                                       !device.SupportsD24DepthBuffer() &&
+                                       (zeta_format == Tegra::DepthFormat::Z24_UNORM_S8_UINT ||
+                                        zeta_format == Tegra::DepthFormat::X8Z24_UNORM ||
+                                        zeta_format == Tegra::DepthFormat::S8Z24_UNORM ||
+                                        zeta_format == Tegra::DepthFormat::V8Z24_UNORM);
+
         if (device.IsMoltenVK()) {
             for (size_t i = 0; i < 8; ++i) {
                 const auto format = static_cast<Tegra::RenderTargetFormat>(key.state.color_formats[i]);

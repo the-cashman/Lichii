@@ -748,6 +748,9 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     supports_d24_depth =
         IsFormatSupported(VK_FORMAT_D24_UNORM_S8_UINT,
                           VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT, FormatType::Optimal);
+    if (!supports_d24_depth) {
+        LOG_INFO(Render_Vulkan, "No D24S8 depth attachments: Z24 depth is stored as a float");
+    }
 
     supports_conditional_barriers =
         !is_intel_windows && driver_id != VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
@@ -1378,14 +1381,31 @@ VkFormat Device::GetSupportedFormat(VkFormat wanted_format, VkFormatFeatureFlags
     return wanted_format;
 }
 
-void Device::ReportLoss() const {
+namespace {
+// The first thread to report a lost or unresponsive device ends the process; the others park.
+void ClaimDeviceReport() {
     static std::atomic_flag reported;
     if (reported.test_and_set()) {
-        // The first thread to see the loss reports it and ends the process.
         for (;;) {
             std::this_thread::sleep_for(std::chrono::hours{1});
         }
     }
+}
+} // Anonymous namespace
+
+void Device::ReportUnresponsive() const {
+    ClaimDeviceReport();
+    LOG_CRITICAL(Render_Vulkan,
+                 "Closing Lichii: the GPU stopped making progress (EDEN_NX2_GPU_WATCHDOG)");
+    Common::Log::Flush();
+#ifdef _WIN32
+    TerminateProcess(GetCurrentProcess(), EXIT_FAILURE);
+#endif
+    std::_Exit(EXIT_FAILURE);
+}
+
+void Device::ReportLoss() const {
+    ClaimDeviceReport();
     LOG_CRITICAL(Render_Vulkan, "Device loss occurred!");
     ReportDeviceFault();
     if (nsight_aftermath_tracker) {

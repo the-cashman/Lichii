@@ -2759,7 +2759,6 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     const DAddr device_addr = binding.device_addr;
     const u32 size = (std::min)(binding.size, (*channel_state->uniform_buffer_sizes)[stage][index]);
     Buffer& buffer = slot_buffers[binding.buffer_id];
-    TouchBuffer(buffer, binding.buffer_id);
     const bool has_host_buffer = binding.buffer_id != NULL_BUFFER_ID;
     const u32 offset = has_host_buffer ? buffer.Offset(device_addr) : 0;
     const bool needs_alignment_stream = [&]() {
@@ -3428,6 +3427,15 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
         return;
     }
     const auto& array = maxwell3d->regs.vertex_streams[index];
+    if (array.enable == 0) {
+        // Nothing binds a disabled stream (BindHostVertexBuffers takes the enabled ones), so its
+        // flag stayed set and every later change of another stream resolved it again: Donkey
+        // Kong Bananza enables 10 of 32 and resolved ~13 streams a draw.
+        maxwell3d->dirty.flags[Dirty::VertexBuffer0 + index] = false;
+        channel_state->vertex_buffers[index] = NULL_BINDING;
+        UpdateVertexBufferSlot(index, NULL_BINDING);
+        return;
+    }
     const auto& limit = maxwell3d->regs.vertex_stream_limits[index];
     const GPUVAddr gpu_addr_begin = array.Address();
     const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
@@ -4072,24 +4080,44 @@ BufferId BufferCache<P>::FindBuffer(DAddr device_addr, u32 size, bool sparse_com
     if (device_addr == 0 || page >= page_table.size()) {
         return NULL_BUFFER_ID;
     }
+    // A recent result for the page, found without touching the buffer (draws look up ~20 ranges
+    // each). Only a deletion takes a buffer off the page table: a bigger one joining it deletes it.
+    // pace: keyed by binding_epoch (every create, join and delete bumps it) for upstream's
+    // buffer_deletions, which this tree doesn't keep.
+    const bool should_sync = Settings::IsGPUFenceBehaviorAccurate();
+    FindMemo& memo = find_memos[page % find_memos.size()];
+    const bool memo_hit = !should_sync && memo.page == page &&
+                          memo.epoch == binding_epoch && device_addr >= memo.begin &&
+                          device_addr + size <= memo.end &&
+                          (memo.sparse_compatible || !sparse_compatible);
+    if (memo_hit && !Nx2Perf::Verify()) {
+        return memo.buffer_id;
+    }
     const BufferId buffer_id = page_table[page];
     if (buffer_id) {
         Buffer& buffer = slot_buffers[buffer_id];
         if (buffer.IsInBounds(device_addr, size)) {
-            const bool should_sync = Settings::IsGPUFenceBehaviorAccurate();
             if (should_sync) {
                 SynchronizeBufferWrites(buffer);
             }
-            bool usable = true;
+            bool sparse = true;
             if constexpr (requires { buffer.IsSparseCompatible(); }) {
-                if (sparse_compatible && !buffer.IsSparseCompatible()) {
-                    usable = false;
-                }
+                sparse = buffer.IsSparseCompatible();
             }
-            if (usable) {
+            if (!sparse_compatible || sparse) {
+                if (memo_hit && memo.buffer_id != buffer_id) {
+                    LOG_ERROR(HW_GPU, "Nx2Perf find buffer: {:#x}+{:#x} remembered in {}, found in {}",
+                              device_addr, size, memo.buffer_id.index, buffer_id.index);
+                }
+                memo = {page, binding_epoch, buffer.CpuAddr(),
+                        buffer.CpuAddr() + buffer.SizeBytes(), buffer_id, sparse};
                 return buffer_id;
             }
         }
+    }
+    if (memo_hit) {
+        LOG_ERROR(HW_GPU, "Nx2Perf find buffer: {:#x}+{:#x} remembered in {}, not in the page table",
+                  device_addr, size, memo.buffer_id.index);
     }
     return CreateBuffer(device_addr, size, sparse_compatible, caller);
 }

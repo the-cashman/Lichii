@@ -173,7 +173,7 @@ ENUM(MeshShaderMode, Automatic, Native, Compute);
 ENUM(GpuLogLevel, Off, Errors, Standard, Verbose, All)
 ENUM(GameListMode, TreeView, GridView, CarouselView);
 ENUM(SpeedMode, Standard, Turbo, Slow);
-ENUM(FrameGenType, Lsfg, OpticalFlow, NvidiaDlssG);
+ENUM(FrameGenType, Lsfg, OpticalFlow, NvidiaDlssG, FlyHigh);
 
 template <typename Type>
 inline std::string_view CanonicalizeEnum(Type id) {

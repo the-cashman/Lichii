@@ -1,40 +1,45 @@
 {
-  "summary": "A third GPU thread, better Switch 2 Edition support, and game fixes.",
+  "summary": "Browse mods in Lichii, get back the FPS lost in build 366, and try new frame generation options.",
   "changes": [
     {
-      "icon": "cpu",
-      "title": "A third GPU thread",
-      "body": "Eligible Switch 2 Vulkan draws use a third recording thread."
-    },
-    {
-      "icon": "clock",
-      "title": "Ocarina of Time above 60 FPS",
-      "body": "FPS Unlock fixes Epona's fence jump, the day/night clock and the Deku Tree webs. The game no longer freezes after closing the R1 menu."
-    },
-    {
       "icon": "apps",
-      "title": "Switch 2 games in HOME and better Edition support",
-      "body": "Launch games from HOME without installing them. Lichii better detects and launches Switch 2 Editions, applies matching upgrade packs, and keeps update information in NUPs."
+      "title": "Mod Store",
+      "body": "Open Tools → Mod Store or Add-Ons → Browse Mods. Find GameBanana mods and over 11,000 Switch 1 listings for 60 FPS and ultrawide patches and cheats. Lichii checks patch build IDs against your game."
     },
     {
-      "icon": "download",
-      "title": "Precompile All Shaders",
-      "body": "Turn it on for individual games in their right-click menu. Precompilation can now find compute shaders in asset packs such as Kirby Air Riders' packs."
-    },
-    {
-      "icon": "bug",
-      "title": "Xenoblade DE and Yoshi fixes",
-      "body": "Fixes Xenoblade DE's title-screen textures and docked/handheld crash. Yoshi no longer crashes when Vulkan rejects a texture-buffer view."
-    },
-    {
-      "icon": "globe",
-      "title": "Multiplayer room connections",
-      "body": "The room proxy keeps the right player address and port and drops packets left over from earlier connections."
+      "icon": "cpu",
+      "title": "FPS recovery after build 366",
+      "body": "Build 366's third GPU thread cut FPS by about 70% in one Ocarina of Time test. It's back off by default. To try the reworked version, go to Graphics → Advanced → Render thread (experimental)."
     },
     {
       "icon": "sparkles",
-      "title": "What's New in Lichii",
-      "body": "See the highlights after an update or reopen them anytime from Help, even offline."
+      "title": "FlyHigh on Windows",
+      "body": "FlyHigh is an optional neural frame generator for Vulkan games in SDR on x86-64 Windows. Choose it in the frame generation menu and accept the model license to download it."
+    },
+    {
+      "icon": "clock",
+      "title": "Better Lichii Optical Flow",
+      "body": "Optical Flow tracks faster camera pans and small sprite movements more accurately. Generated frames show less ghosting around moving outlines."
+    },
+    {
+      "icon": "gamepad",
+      "title": "Wonder, Pokopia, and Ori",
+      "body": "Mario Wonder's Switch 2 Edition gets a built-in 60 FPS patch. Pokopia 2.0.1 boots again, and Ori and the Will of the Wisps can replace Spirit Trial ghosts without freezing on Windows."
+    },
+    {
+      "icon": "bug",
+      "title": "Game graphics fixes",
+      "body": "Fixes broken battle sprites in Final Fantasy Resonance on AMD, missing gloom in Hyrule Warriors: Age of Imprisonment, and black or flickering trims in Ocarina of Time."
+    },
+    {
+      "icon": "layers",
+      "title": "Less texture spill on low-VRAM GPUs",
+      "body": "Lichii decodes large ASTC texture arrays in smaller batches so their temporary images don't spill into system RAM."
+    },
+    {
+      "icon": "download",
+      "title": "Better shader precompilation",
+      "body": "Turning on Precompile All Shaders sets shader precache to Always for that game. Lichii reuses pipelines built earlier in the same session and shows how many shader builds remain."
     }
   ]
 }

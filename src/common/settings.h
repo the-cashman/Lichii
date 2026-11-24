@@ -552,6 +552,15 @@ struct Values {
                                                         false,
                                                         &frame_gen};
 
+    SwitchableSetting<bool> frame_gen_flyhigh_protect_hud{linkage,
+                                                          true,
+                                                          "frame_gen_flyhigh_protect_hud",
+                                                          Category::Renderer,
+                                                          Specialization::Default,
+                                                          true,
+                                                          false,
+                                                          &frame_gen};
+
     SwitchableSetting<bool> frame_gen_dump_flow{linkage, false, "frame_gen_dump_flow",
                                                 Category::Renderer};
 

@@ -2089,8 +2089,11 @@ void EmitContext::DefineInputs(const IR::Program& program) {
         std::ranges::any_of(info.interpolation, [](Interpolation mode) {
             return mode == Interpolation::NoPerspective;
         })};
+    const bool quantized_frag_depth{stage == Stage::Fragment && info.stores_frag_depth &&
+                                    runtime_info.quantize_frag_depth_d24};
     if (loads.AnyComponent(IR::Attribute::PositionX) ||
-        info.passthrough.AnyComponent(IR::Attribute::PositionX) || noperspective_as_smooth) {
+        info.passthrough.AnyComponent(IR::Attribute::PositionX) || noperspective_as_smooth ||
+        quantized_frag_depth) {
         const bool is_fragment{stage == Stage::Fragment};
         if (!is_fragment && profile.has_broken_spirv_position_input) {
             need_input_position_indirect = true;

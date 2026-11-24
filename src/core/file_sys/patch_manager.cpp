@@ -879,6 +879,21 @@ constexpr std::array YOSHI_SCENE_PROFILE_RECORDS{
     BuiltinPatchRecord{0x7582677, YOSHI_SCENE_PROFILE_FULL, YOSHI_SCENE_PROFILE_ORIGINAL},
 };
 
+// Super Mario Bros. Wonder's frame-rate controller picks present interval 2 from its second frame
+// on under emulation and steps the game by 1/30 s (#2390); on the console it holds 60. Pin its
+// simulation rate (the divide and the fallback load) to 60 and its present interval to 1 together,
+// or the game runs at twice its speed. Ported from Orchid's wonder_fps_patch.h (MythosOfs/Orchid).
+constexpr std::array<u8, 4> WONDER_RATE_DIVIDE{0x01, 0x0D, 0xCA, 0x1A};   // sdiv w1, w8, w10
+constexpr std::array<u8, 4> WONDER_INTERVAL_LOAD{0x81, 0x42, 0x40, 0xB9}; // ldr w1, [x20, #0x40]
+constexpr std::array<u8, 4> WONDER_FALLBACK_LOAD{0x81, 0x52, 0x40, 0xB9}; // ldr w1, [x20, #0x50]
+constexpr std::array<u8, 4> WONDER_RATE_60{0x81, 0x07, 0x80, 0x52};       // mov w1, #60
+constexpr std::array<u8, 4> WONDER_INTERVAL_1{0x21, 0x00, 0x80, 0x52};    // mov w1, #1
+constexpr std::array WONDER_60FPS_RECORDS{
+    BuiltinPatchRecord{0x1BBFB0, WONDER_RATE_60, WONDER_RATE_DIVIDE},
+    BuiltinPatchRecord{0x1BBFCC, WONDER_INTERVAL_1, WONDER_INTERVAL_LOAD},
+    BuiltinPatchRecord{0x1BC04C, WONDER_RATE_60, WONDER_FALLBACK_LOAD},
+};
+
 // Convert elapsed time to 60 Hz steps. Short steps keep a per-web fraction (x19+0x8f8).
 // The original clamp after this conversion still limits pauses to three steps; large
 // deltas go down the original path and do not add to the pending fraction.
@@ -1178,6 +1193,16 @@ constexpr std::array BUILTIN_PATCHES{
         .description = "Yoshi and the Mysterious Book 2.0.0 only. Renders gameplay at full "
                        "scene resolution with FXAA instead of temporal AA for a sharper image. "
                        "Expect more aliasing in motion and likely higher GPU cost.",
+    },
+    BuiltinPatch{
+        .name = "60 FPS (built-in)",
+        .title_id = 0x040015100B514001,
+        .module = "main",
+        .build_id = "EC47E6F8846D2A7B6892E2682845C7255F7117AE",
+        .records = WONDER_60FPS_RECORDS,
+        .description = "Runs the game at 60 FPS, as on the console. A PC that can't hold 60 FPS "
+                       "plays slow frames in slow motion; turn this off for the game's own 30 FPS "
+                       "mode. Restart the game to apply.",
     },
 };
 

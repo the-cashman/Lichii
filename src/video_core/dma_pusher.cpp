@@ -512,10 +512,6 @@ bool DmaPusher::Step() {
             }
         }
         if (command_resume_offset == 0) {
-            // A method's data continues across GP entries, whatever their level: title 4 ends a
-            // main entry after a macro's first word and supplies the remaining parameters in a
-            // 5-word subroutine entry. EDEN_NX2_PARK_SPLIT_METHODS restores the old guess (an
-            // entry elsewhere is a call that starts clean; resume where the split one ended).
             static const bool park_split_methods = std::getenv("EDEN_NX2_PARK_SPLIT_METHODS") != nullptr;
             if (g_nx2_ampere) {
                 if (static u32 split_logs{}; dma_state.method_count != 0 && split_logs < 64) {
@@ -533,8 +529,26 @@ bool DmaPusher::Step() {
                     LOG_DEBUG(HW_GPU, "  previous entry ends {:08x}; next entry starts {:08x}",
                               fmt::join(prev_words, " "), fmt::join(next_words, " "));
                 }
-                if (park_split_methods) {
-                    ResolveSplitMethod(header.addr);
+                // Macro payloads can span noncontiguous entries of any size. For a register
+                // write, treat a mismatched entry as a call only if the split resumes later at
+                // the end of the previous entry.
+                const bool park_call =
+                    !park_split_methods && dma_state.method_count != 0 &&
+                    dma_state.method < MacroRegistersStart && header.addr != split_method_end &&
+                    header.size != dma_state.method_count &&
+                    SplitResumesLater(command_list, dma_pushbuffer_subindex + 1);
+                if (park_call) {
+                    static std::atomic<u32> reported{};
+                    if (reported.fetch_add(1) < 8) {
+                        LOG_INFO(HW_GPU,
+                                 "Split method {:#x} ({} left) on ch {}: entry {:#x}+{} is a "
+                                 "call, the method resumes at {:#x}",
+                                 dma_state.method, dma_state.method_count, channel_state.bind_id,
+                                 u64{header.addr}, u64{header.size}, split_method_end);
+                    }
+                }
+                if (park_split_methods || park_call || !parked_methods.empty()) {
+                    ResolveSplitMethod(header.addr, park_split_methods || park_call);
                 }
             }
             if (dma_pushbuffer_subindex < command_list.submit_hashes.size()) {
@@ -836,18 +850,19 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
 }
 
 // NVN on Switch 2 ends GPFIFO entries in the middle of a method's data and calls another command
-// buffer (e.g. a compute dispatch) before the entry that carries the rest, which starts right
-// where the first one ended. An entry starting anywhere else is such a call: run it with a clean
-// method state and resume the unfinished method when the stream continues at that address.
-void DmaPusher::ResolveSplitMethod(GPUVAddr entry_address) {
+// buffer before the entry that carries the rest. Run the call with a clean method state and
+// resume the unfinished method when the stream continues at its split address.
+void DmaPusher::ResolveSplitMethod(GPUVAddr entry_address, bool park) {
     const auto continued = std::ranges::find(parked_methods, entry_address,
                                              &ParkedMethod::resume_address);
+    const bool can_park =
+        park || (continued != parked_methods.end() && dma_state.method < MacroRegistersStart);
     std::optional<ParkedMethod> resume;
     if (continued != parked_methods.end()) {
         resume = *continued;
         parked_methods.erase(continued);
     }
-    if (dma_state.method_count != 0 && entry_address != split_method_end) {
+    if (can_park && dma_state.method_count != 0 && entry_address != split_method_end) {
         if (parked_methods.size() == MaxParkedMethods) {
             static std::atomic<u32> reported{};
             if (reported.fetch_add(1) < 8) {
@@ -876,7 +891,17 @@ void DmaPusher::ResolveSplitMethod(GPUVAddr entry_address) {
         dma_state.method_count = resume->method_count;
         dma_state.non_incrementing = resume->non_incrementing;
         dma_increment_once = resume->increment_once;
+        split_method_end = entry_address;
     }
+}
+
+bool DmaPusher::SplitResumesLater(const CommandList& list, size_t from) const {
+    for (size_t i = from; i < list.command_lists.size(); ++i) {
+        if (list.command_lists[i].size > 0 && list.command_lists[i].addr == split_method_end) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void DmaPusher::SetState(const CommandHeader& command_header) {

@@ -237,8 +237,10 @@ public:
 
     void RendererFrameEndNotify();
 
+    /// `on_composited` runs on the GPU thread once the renderer has composited these layers.
     void RequestComposite(std::vector<Tegra::FramebufferConfig>&& layers,
-                          std::vector<Service::Nvidia::NvFence>&& fences);
+                          std::vector<Service::Nvidia::NvFence>&& fences,
+                          std::function<void()> on_composited = {});
 
     void WaitForComposite();
 

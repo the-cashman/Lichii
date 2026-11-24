@@ -283,6 +283,9 @@ try
 
 RendererVulkan::~RendererVulkan() {
     scheduler.RegisterOnSubmit([] {});
+#ifdef HAS_FLYHIGH
+    frame_gen.DrainFlyHighSubmissions();
+#endif
     void(device.GetLogical().WaitIdle());
 }
 

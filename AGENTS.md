@@ -38,16 +38,19 @@ Users report game bugs with Lichii logs (`eden_log.txt`, `eden_log.txt.old`). Ea
 | 040032B023CA4000 | Orbitals |
 | 0400921025B32000 | Sonic Frontiers (Switch 2 Edition) |
 | 04003F40232DE000 | Hyrule Warriors: Age of Imprisonment |
+| 010015100B514000 | Super Mario Bros. Wonder (Switch 1) |
 | 040015100B514001 | Super Mario Bros. Wonder - Nintendo Switch 2 Edition + Meetup in Bellabel Park |
 | 01004D300C5AE000 | Kirby and the Forgotten Land (Switch 1) |
 | 04004D300C5AE001 | Kirby and the Forgotten Land - Nintendo Switch 2 Edition |
 | 01007EF00011E000 | The Legend of Zelda: Breath of the Wild (Switch 1) |
+| 01008DD013200000 | Ori and the Will of the Wisps (Switch 1) |
 | 0100F2C0115B6000 | The Legend of Zelda: Tears of the Kingdom (Switch 1) |
 | 01006D0017F7A000 | Mario & Luigi: Brothership (Switch 1) |
 | 010051F0207B2000 | Tomodachi Life: Living the Dream (Switch 1) |
 | 01006BB00C6F0000 | The Legend of Zelda: Link's Awakening (Switch 1) |
 | 01003EC027CC8000 | Deep Rock Galactic: Survivor (Switch 1) |
 | 01001F5010DFA000 | Pokémon Legends: Arceus (Switch 1) |
+| 01006A800016E000 | Super Smash Bros. Ultimate (Switch 1) |
 | 0100F43008C44000 | Pokémon Legends Z-A |
 | 0400FF500E34A001 | Xenoblade Chronicles: Definitive Edition - Nintendo Switch 2 Edition |
 | 0400E95004038001 | Xenoblade Chronicles 2 - Nintendo Switch 2 Edition |
@@ -133,6 +136,7 @@ Use these before guessing. All are off unless the variable is set; pass them as 
 | Device loss (`Device loss occurred!`) | Always on | The `Device fault` lines after it: what VK_EXT_device_fault reports (fault addresses and their type, vendor fault codes). `not supported by the driver` means the driver has no such data. Lichii then logs `Closing Lichii: the GPU driver lost the Vulkan device` and exits, so a device loss leaves no `Host crash` line or minidump. |
 | Device loss: what each fault address belonged to (a live, freed or neighbouring buffer or image) | `EDEN_NX2_FAULT_MAP=1` | Each `Device fault address N:` line gets a second one naming the binding the driver reported at that address (VK_EXT_device_address_binding_report): the live buffer, image, device memory or driver-internal object and the offset into it, else the freed one that held it and how long before the loss it was unbound, else the nearest live bindings below and above. Buffer cache, staging and texture cache objects carry their debug names (guest address, format, size). The boot log says `EDEN_NX2_FAULT_MAP: device address binding reports on`, or `not supported by the driver`. |
 | Device loss on RADV: which draw or dispatch faulted | `RADV_DEBUG=hang` (Mesa's own variable; very slow) | RADV syncs after every submit and, at the hang, writes `$HOME/radv_dumps_<pid>_<time>/`: `trace.log` (the annotated command stream; the hung work follows the last trace point the GPU reached), `pipeline.log` (the bound pipelines' NIR and ISA) with their SPIR-V as `<blake3>.spv`, `vm_fault.log`, `bo_history.log` (`radv_check_va.py` names the BO at a fault address), then aborts. With it set, Lichii puts `OpSourceExtension "lichii <hash>"` in every guest shader's SPIR-V, so `spirv-dis` on a dumped `.spv` names the program, and a device loss waits 60 s for the report instead of exiting. The dump holds game shaders: keep it private. |
+| A hang with no device loss (picture and log stop, GPU thread stuck in `MasterSemaphore::Wait`; NVIDIA Xid 69 on Pascal, #2396) | `EDEN_NX2_GPU_WATCHDOG=<seconds>` (at least 30; any non-number means 45) | When submitted GPU work makes no progress for that long, logs `GPU unresponsive:` with the tick waited for, the GPU's tick, the last accepted submit and the last present submit (tick and ms ago) and the present submit count, then `Closing Lichii: the GPU stopped making progress` and exits. Ticks not yet submitted (shader builds on the worker) don't count. Off by default: a submission that waits on a swapchain image the compositor holds back (a hidden window) also makes no progress. |
 | Out of memory (`Image ... failed: -2`, `No memory for the ... image`) | Always on | The `Memory trace` lines before the first failed image: system commit against its limit, DXGI local and non-local use, and each heap's driver usage and budget. On Windows, commit at its limit means RAM plus the page file ran out, not the card; other hosts report no commit limit and log `0 of 0`, which says nothing. The `Host memory:` line under `Texture cache thresholds` says whether host commit or the device budget bounds the cache. |
 | A draw copies its own render target (GPU-bound frames with thousands of short passes; `DKB gpu_site` time at `TextureCacheRuntime::CopyImage`) | `EDEN_NX2_ALIAS_COPY_TRACE=1` | Every 10 s, `Alias copies in 10 s: N between M pairs`, then the 8 pairs with the most copies: both images (address, format, size, levels, layers, samples), how many copies came from a bound render target and the surface clip at the first. A target and a texture at one address that differ only in width are one image given two sizes. |
 | Written graphics storage bindings marked GPU-written whole (command lists on draw-written pages, list flushes) | `EDEN_NX2_DRAW_WRITE_TRACE=1` | Every 10 s, `Draw write extents in 10 s`: written native storage bindings draws bound with a store extent, how many were marked short of the binding, MiB bound and MiB marked. |

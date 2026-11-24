@@ -17,7 +17,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#if defined(__linux__) && defined(__x86_64__)
+#if defined(__linux__) && defined(ARCHITECTURE_x86_64) && !defined(_M_ARM64EC)
 #include <spawn.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
@@ -42,6 +42,8 @@ extern char** environ;
 #pragma GCC diagnostic pop
 #endif
 
+// Prefer the project's arch macro (covers MSVC _M_X64). Exclude ARM64EC, which also defines _M_X64.
+#if defined(ARCHITECTURE_x86_64) && !defined(_M_ARM64EC)
 namespace {
 
 using namespace Dynarmic;
@@ -213,6 +215,9 @@ bool BranchesIntoBlock(u32 inst, u64 pc, u64 start, u64 end) {
 
 } // namespace
 
+// Codegen options under test are x64-only (see A64::UserConfig). On arm64 the backend also
+// UNREACHABLE()s some encodings the random fuzzer hits (e.g. FPHalfToFixedS64), so gate like
+// the fastmem case below rather than Apple-only.
 TEST_CASE("JIT codegen options: random blocks", "[jit_codegen_options]") {
     const std::vector<Encoding> encodings = TestableEncodings();
     std::mt19937_64 rng{150};
@@ -277,8 +282,9 @@ TEST_CASE("JIT codegen options: random blocks", "[jit_codegen_options]") {
         REQUIRE(states[0] == states[1]);
     }
 }
+#endif
 
-#if defined(__linux__) && defined(__x86_64__)
+#if defined(__linux__) && defined(ARCHITECTURE_x86_64) && !defined(_M_ARM64EC)
 
 namespace {
 

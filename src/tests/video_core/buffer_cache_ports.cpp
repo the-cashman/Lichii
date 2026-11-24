@@ -231,6 +231,23 @@ struct Policy {
 
 using Cache = VideoCommon::BufferCache<Policy>;
 
+/// Splits storage ranges over several device ranges as the Vulkan runtime does
+/// (ResolveMultiRangeStorage).
+struct MultiRangeRuntime : Runtime {
+    bool PrefersSparseSources() const noexcept {
+        return false;
+    }
+    bool BindMultiRangeStorageBuffer(u64, bool) {
+        return true;
+    }
+};
+
+struct MultiRangePolicy : Policy {
+    using Runtime = ::MultiRangeRuntime;
+};
+
+using MultiRangeCache = VideoCommon::BufferCache<MultiRangePolicy>;
+
 /// Streams small uniform buffers as the Vulkan runtime does (StreamUniformReusable).
 struct KeepRuntime : Runtime {
     struct StreamUniformRef {
@@ -410,6 +427,14 @@ struct BufferCacheTestAccess {
     }
     static void UpdateUniforms(Cache& cache, size_t stage) {
         cache.UpdateUniformBuffers(stage);
+    }
+    /// A graphics storage binding of [gpu_addr, gpu_addr + size), split into device ranges.
+    static Binding ResolveSegments(MultiRangeCache& cache, Tegra::MemoryManager& memory,
+                                   GPUVAddr gpu_addr, u32 size) {
+        cache.gpu_memory = &memory;
+        Binding binding{.gpu_addr = gpu_addr, .size = size};
+        cache.ResolveMultiRangeStorage(binding, false, cache.graphics_segments);
+        return binding;
     }
 };
 
@@ -615,6 +640,23 @@ private:
 };
 
 } // namespace
+
+TEST_CASE("Storage ranges with a gap are not remembered as one segment", "[buffer_ports]") {
+    BasicFixture<MultiRangeRuntime, MultiRangeCache> f;
+    constexpr GPUVAddr base = 0x200000;
+    // Two pages on nonadjacent device pages, then an unmapped one.
+    f.memory->Map(base, 0x20000, 0x1000, Tegra::PTEKind::PITCH, false);
+    f.memory->Map(base + 0x1000, 0x40000, 0x1000, Tegra::PTEKind::PITCH, false);
+    REQUIRE(Access::ResolveSegments(*f.cache, *f.memory, base, 0x3000).segment_count == 0);
+    // The shorter range at the same address is split in two.
+    for (int i = 0; i < 2; ++i) {
+        const auto binding = Access::ResolveSegments(*f.cache, *f.memory, base, 0x2000);
+        REQUIRE(binding.segment_count == 2);
+    }
+    // One segment: its prefixes need no splitting either.
+    REQUIRE(Access::ResolveSegments(*f.cache, *f.memory, base, 0x1000).segment_count == 0);
+    REQUIRE(Access::ResolveSegments(*f.cache, *f.memory, base, 0x800).segment_count == 0);
+}
 
 TEST_CASE("Storage binding cache tracks map changes and descriptor dependencies",
           "[buffer_ports]") {

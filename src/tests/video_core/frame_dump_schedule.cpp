@@ -14,6 +14,15 @@ using Vulkan::FrameDumpSchedule;
 using Step = FrameDumpSchedule::Step;
 } // Anonymous namespace
 
+TEST_CASE("Frame dump first pass accepts only a decimal pass number", "[frame_dump_schedule]") {
+    CHECK(Vulkan::ParseFrameDumpFirstPass("0") == 0);
+    CHECK(Vulkan::ParseFrameDumpFirstPass("220") == 220);
+    CHECK_FALSE(Vulkan::ParseFrameDumpFirstPass(""));
+    CHECK_FALSE(Vulkan::ParseFrameDumpFirstPass("-1"));
+    CHECK_FALSE(Vulkan::ParseFrameDumpFirstPass("220f"));
+    CHECK_FALSE(Vulkan::ParseFrameDumpFirstPass("4294967296"));
+}
+
 TEST_CASE("Frame dump schedule is idle until configured or armed", "[frame_dump_schedule]") {
     FrameDumpSchedule schedule;
     REQUIRE(schedule.Tick(100.0) == Step::None);

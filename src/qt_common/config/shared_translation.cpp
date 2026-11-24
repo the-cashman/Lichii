@@ -319,7 +319,8 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "Optical Flow Interpolation is built in. LSFG requires Lossless.dll in the "
               "user directory's lossless folder."));
     INSERT(Settings, frame_gen_type, tr("Frame Generation Type"),
-           tr("Lichii Optical Flow Frame Generation is built in and runs on any GPU.\nNVIDIA "
+           tr("Lichii Optical Flow Frame Generation is built in and runs on any GPU.\nFlyHigh needs a compatible Vulkan driver and a one-time model "
+              "download. It falls back to Lichii Optical Flow when unavailable.\nNVIDIA "
               "DLSS Frame Generation (Windows only) needs a GeForce RTX 40 series or newer GPU (3x "
               "and 4x need an RTX 50 series), Hardware-accelerated GPU scheduling on in Windows' "
               "graphics settings, \"Use NVIDIA DLSS\" on and NVIDIA's files from the NVIDIA DLSS "
@@ -333,6 +334,9 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, frame_gen_flow_scale_auto, tr("Auto Flow Scale"), QString());
     INSERT(Settings, frame_gen_flow_scale, tr("Flow Scale"), QString());
     INSERT(Settings, frame_gen_queue_target, tr("Queue Target"), QString());
+    INSERT(Settings, frame_gen_flyhigh_protect_hud, tr("Keep HUD Still (FlyHigh)"),
+           tr("Pixels that have not changed for several frames, such as a HUD, are shown as they "
+              "are instead of being interpolated."));
     INSERT(Settings, frame_gen_dump_flow, tr("Dump Optical Flow"), QString());
 
     // Renderer (Advanced Graphics)
@@ -726,6 +730,7 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
              PAIR(FrameGenType, Lsfg, tr("Lossless Scaling (LSFG)")),
              PAIR(FrameGenType, OpticalFlow, tr("Lichii Optical Flow Frame Generation")),
              PAIR(FrameGenType, NvidiaDlssG, tr("NVIDIA DLSS Frame Generation")),
+             PAIR(FrameGenType, FlyHigh, tr("FlyHigh")),
          }});
     translations->insert({Settings::EnumMetadata<Settings::ScalingFilter>::Index(),
                           {

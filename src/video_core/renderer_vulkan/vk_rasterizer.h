@@ -217,7 +217,7 @@ private:
     void TrackOotTonemappedImage();
     bool TryNx2IndirectReset(bool is_indexed, u32 instance_count);
 
-    void FlushWork();
+    void FlushWork(bool ends_pass = false);
 
     void TraceRenderState(bool is_indexed, const char* outcome, const Framebuffer* framebuffer);
 

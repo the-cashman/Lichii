@@ -136,7 +136,7 @@ void Config::SaveGameValue(const std::string& config_name, const Settings::Basic
     GameConfigWriter{config_name}.Save(setting, value);
 }
 
-void Config::WriteToIni() const {
+bool Config::WriteToIni() const {
     std::string config_type;
     switch (type) {
     case ConfigType::GlobalConfig:
@@ -170,7 +170,7 @@ void Config::WriteToIni() const {
 #endif
     if (!writable && errno != ENOENT) {
         LOG_ERROR(Frontend, "Config file could not be saved: it can't be written");
-        return;
+        return false;
     }
     // A name of its own per save, created exclusively and owner-only, so overlapping saves don't
     // write into each other's file and the contents are never readable by others.
@@ -199,7 +199,7 @@ void Config::WriteToIni() const {
     }
     if (fp == nullptr) {
         LOG_ERROR(Frontend, "Config file could not be saved!");
-        return;
+        return false;
     }
 
     CSimpleIniA::FileWriter writer(fp);
@@ -216,7 +216,7 @@ void Config::WriteToIni() const {
     if (!synced || !closed) {
         LOG_ERROR(Frontend, "Config file could not be saved!");
         std::filesystem::remove(temporary, error);
-        return;
+        return false;
     }
     const auto status = std::filesystem::status(target, error);
     if (!error && std::filesystem::exists(status)) {
@@ -236,7 +236,7 @@ void Config::WriteToIni() const {
         if (error) {
             LOG_ERROR(Frontend, "Config file could not be saved: {}", error.message());
             std::filesystem::remove(temporary, error);
-            return;
+            return false;
         }
     }
     // Replaces the target if it exists (MoveFileExW with MOVEFILE_REPLACE_EXISTING on Windows)
@@ -244,7 +244,7 @@ void Config::WriteToIni() const {
     if (error) {
         LOG_ERROR(Frontend, "Config file could not be saved: {}", error.message());
         std::filesystem::remove(temporary, error);
-        return;
+        return false;
     }
 #ifndef _WIN32
     // The rename is a change to the folder: it survives a power loss only once the folder is on
@@ -259,6 +259,7 @@ void Config::WriteToIni() const {
         close(folder_fd);
     }
 #endif
+    return true;
 }
 
 void Config::SetUpIni() {

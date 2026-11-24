@@ -336,6 +336,8 @@ ConfigurePerGame::ConfigurePerGame(QWidget* parent, u64 title_id_, const std::st
                                                 : fmt::format("{:016X}", title_id);
     game_config = std::make_unique<QtConfig>(config_file_name, Config::ConfigType::PerGameConfig);
     addons_tab = std::make_unique<ConfigurePerGameAddons>(system_, this);
+    connect(addons_tab.get(), &ConfigurePerGameAddons::BrowseModsRequested, this,
+            &ConfigurePerGame::BrowseModsRequested);
     audio_tab = std::make_unique<ConfigureAudio>(system_, tab_group, *builder, this);
     cpu_tab = std::make_unique<ConfigureCpu>(system_, tab_group, *builder, this);
     graphics_advanced_tab =
@@ -499,6 +501,10 @@ void ConfigurePerGame::HandleApplyButtonClicked() {
 void ConfigurePerGame::LoadFromFile(FileSys::VirtualFile file_) {
     file = std::move(file_);
     LoadConfiguration();
+}
+
+void ConfigurePerGame::ReloadAddonsAfterModStore(const QSet<QString>& store_toggled) {
+    addons_tab->ReloadAfterModStore(store_toggled);
 }
 
 void ConfigurePerGame::LoadConfiguration() {

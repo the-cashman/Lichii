@@ -360,7 +360,8 @@ public:
         bool increment_once;
         GPUVAddr resume_address; ///< Where the entry that continues the method starts
     };
-    void ResolveSplitMethod(GPUVAddr entry_address);
+    void ResolveSplitMethod(GPUVAddr entry_address, bool park);
+    bool SplitResumesLater(const CommandList& list, size_t from) const;
     static constexpr size_t MaxParkedMethods = 16;
 
     // Read per channel, not at static initialization, which runs before the frontend loads
@@ -383,7 +384,7 @@ public:
     std::array<ParsedEntry, 64> parsed_entries{};
     size_t parsed_entry_count{};
     std::vector<ParkedMethod> parked_methods;
-    GPUVAddr split_method_end{}; ///< End of the last entry that ended inside a method
+    GPUVAddr split_method_end{}; ///< Expected contiguous address for the unfinished method
 
     std::array<Engines::EngineInterface*, max_subchannels> subchannels{};
     std::array<Engines::EngineTypes, max_subchannels> subchannel_type;

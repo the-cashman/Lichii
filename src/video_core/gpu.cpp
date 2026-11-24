@@ -536,7 +536,8 @@ struct GPU::Impl {
         gpu_thread.FlushAndInvalidateRegion(addr, size, is_async);
     }
 
-    void RequestComposite(std::vector<Tegra::FramebufferConfig>&& layers, std::vector<Service::Nvidia::NvFence>&& fences) {
+    void RequestComposite(std::vector<Tegra::FramebufferConfig>&& layers, std::vector<Service::Nvidia::NvFence>&& fences,
+                          std::function<void()> on_composited) {
         VideoCommon::GpuTrace::NotePresent(layers, fences);
         const size_t num_fences{fences.size()};
         size_t current_request_counter{};
@@ -553,13 +554,13 @@ struct GPU::Impl {
         }
         pending_composite_fence = RequestSyncOperation(
             [this, current_request_counter, num_fences, composite_layers = std::move(layers),
-             composite_fences = std::move(fences)] {
+             composite_fences = std::move(fences), done = std::move(on_composited)] {
                 if (num_fences == 0) {
-                    CompositeOnOwner(composite_layers);
+                    CompositeOnOwner(composite_layers, done);
                     return;
                 }
                 auto& syncpoint_manager = system.Host1x().GetSyncpointManager();
-                const auto executer = [this, current_request_counter, composite_layers]() {
+                const auto executer = [this, current_request_counter, composite_layers, done]() {
                     {
                         std::unique_lock<std::mutex> lk(request_swap_mutex);
                         if (--request_swap_counters[current_request_counter] != 0) {
@@ -567,7 +568,7 @@ struct GPU::Impl {
                         }
                         free_swap_counters.push_back(current_request_counter);
                     }
-                    CompositeOnOwner(composite_layers);
+                    CompositeOnOwner(composite_layers, done);
                 };
                 for (size_t i = 0; i < num_fences; i++) {
                     syncpoint_manager.RegisterGuestAction(composite_fences[i].id,
@@ -579,7 +580,8 @@ struct GPU::Impl {
 
     /// A present whose fences were all reached, on the thread that reached the last one. Every
     /// present goes through due_composites, so none overtakes one queued for the owner.
-    void CompositeOnOwner(const VideoCommon::DueComposites::Layers& layers) {
+    void CompositeOnOwner(const VideoCommon::DueComposites::Layers& layers,
+                          std::function<void()> done) {
         const auto composite = [this](const VideoCommon::DueComposites::Layers& due) {
             renderer->Composite(due);
             // EDEN_NX2_AB_PERIOD: arms flip between frames, on the owner after the composite.
@@ -591,7 +593,8 @@ struct GPU::Impl {
             layers, VideoCommon::GpuSplit::OwnsScheduler(), composite, [this, composite] {
                 (void)RequestSyncOperation([this, composite] { due_composites.Run(composite); });
                 gpu_thread.TickGPU(true);
-            });
+            },
+            std::move(done));
     }
 
     void WaitForComposite() {
@@ -819,8 +822,9 @@ const VideoCore::ShaderNotify& GPU::ShaderNotify() const {
 }
 
 void GPU::RequestComposite(std::vector<Tegra::FramebufferConfig>&& layers,
-                           std::vector<Service::Nvidia::NvFence>&& fences) {
-    impl->RequestComposite(std::move(layers), std::move(fences));
+                           std::vector<Service::Nvidia::NvFence>&& fences,
+                           std::function<void()> on_composited) {
+    impl->RequestComposite(std::move(layers), std::move(fences), std::move(on_composited));
 }
 
 void GPU::WaitForComposite() {

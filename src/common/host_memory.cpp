@@ -10,6 +10,8 @@
 #include <boost/icl/separate_interval_set.hpp>
 #include <windows.h>
 #include <psapi.h>
+#include <shared_mutex>
+#include <span>
 #include <vector>
 #include "common/dynamic_library.h"
 
@@ -277,7 +279,9 @@ public:
         ASSERT(placeholders.find({virtual_offset, virtual_offset + length}) == placeholders.end());
         TrackPlaceholder(virtual_offset, host_offset, length);
 
-        MapView(virtual_offset, host_offset, length);
+        if (!MapView(virtual_offset, host_offset, length)) {
+            LOG_CRITICAL(HW_Memory, "Failed to map placeholder, error {}", GetLastError());
+        }
     }
 
     void Unmap(size_t virtual_offset, size_t length) {
@@ -301,15 +305,14 @@ public:
         }
         const size_t virtual_end = virtual_offset + length;
 
-        // Nearly every call protects a range inside one mapped view, which VirtualProtect does
-        // whole without the lock. It refuses a range that reaches a placeholder or a second view
-        // (one Map or Unmap is making or taking apart, or a range across views): those take the
-        // lock below, which gives the whole range the same flags. Map and Unmap hold the lock
-        // across their kernel calls, which slow down when a game maps memory in bulk (zone
-        // changes): write-trap protections, thousands a second, then queued behind them.
+        // Protect within one view without the placeholder lock. Only partial remaps block this
+        // path; a failed call drops the shared lock before looking up views under placeholder_mutex.
         DWORD old_flags{};
-        if (VirtualProtect(virtual_base + virtual_offset, length, new_flags, &old_flags)) {
-            return;
+        {
+            std::shared_lock lock{protect_mutex};
+            if (VirtualProtect(virtual_base + virtual_offset, length, new_flags, &old_flags)) {
+                return;
+            }
         }
 
         std::scoped_lock lock{placeholder_mutex};
@@ -411,26 +414,40 @@ private:
         const bool split_left = unmap_begin > placeholder_begin;
         const bool split_right = unmap_end < placeholder_end;
 
+        // Keep Protect from changing a retained page between the snapshot and its restore.
+        std::unique_lock protect_lock{protect_mutex, std::defer_lock};
+        kept_protections.clear();
+        size_t left_runs = 0;
+        if (split_left || split_right) {
+            protect_lock.lock();
+            if (split_left) {
+                FindProtectionRuns(placeholder_begin, unmap_begin);
+                left_runs = kept_protections.size();
+            }
+            if (split_right) {
+                FindProtectionRuns(unmap_end, placeholder_end);
+            }
+        }
+        const std::span<const ProtectionRun> runs{kept_protections};
+
         if (!pfn_UnmapViewOfFile2(process, virtual_base + placeholder_begin,
                                   MEM_PRESERVE_PLACEHOLDER)) {
             LOG_CRITICAL(HW_Memory, "Failed to unmap placeholder");
         }
-        // If we have to remap memory regions due to partial unmaps, we are in a data race as
-        // Windows doesn't support remapping memory without unmapping first. Avoid adding any extra
-        // logic within the panic region described below.
-
-        // Panic region, we are in a data race right now
+        // Guest accesses can still race the remap, including the brief interval between mapping
+        // a kept view read-write and restoring its protections.
         if (split_left || split_right) {
             Split(unmap_begin, unmap_end - unmap_begin);
+            if (split_left) {
+                MapKeptPiece(placeholder_begin, host_offset, unmap_begin - placeholder_begin,
+                             runs.first(left_runs));
+            }
+            if (split_right) {
+                MapKeptPiece(unmap_end, host_offset + unmap_end - placeholder_begin,
+                             placeholder_end - unmap_end, runs.subspan(left_runs));
+            }
+            protect_lock.unlock();
         }
-        if (split_left) {
-            MapView(placeholder_begin, host_offset, unmap_begin - placeholder_begin);
-        }
-        if (split_right) {
-            MapView(unmap_end, host_offset + unmap_end - placeholder_begin,
-                    placeholder_end - unmap_end);
-        }
-        // End panic region
 
         size_t coalesce_begin = unmap_begin;
         if (!split_left) {
@@ -461,11 +478,54 @@ private:
         return true;
     }
 
-    void MapView(size_t virtual_offset, size_t host_offset, size_t length) {
-        if (!pfn_MapViewOfFile3(backing_handle, process, virtual_base + virtual_offset, host_offset,
-                                length, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0)) {
-            LOG_CRITICAL(HW_Memory, "Failed to map placeholder");
+    struct ProtectionRun {
+        size_t offset;
+        size_t length;
+        DWORD flags;
+    };
+
+    void FindProtectionRuns(size_t offset, size_t end) {
+        while (offset < end) {
+            MEMORY_BASIC_INFORMATION info{};
+            if (VirtualQuery(virtual_base + offset, &info, sizeof(info)) != sizeof(info)) {
+                UNREACHABLE_MSG("Failed to query protection at {:#x}, error {}", offset,
+                                GetLastError());
+            }
+            if (info.State != MEM_COMMIT || info.Protect == 0) {
+                UNREACHABLE_MSG("Expected committed pages at {:#x}, got state {:#x}, protection {:#x}",
+                                offset, info.State, info.Protect);
+            }
+            const size_t region_end =
+                static_cast<size_t>(static_cast<u8*>(info.BaseAddress) - virtual_base) +
+                info.RegionSize;
+            const size_t run_end = (std::min)(region_end, end);
+            if (info.Protect != PAGE_READWRITE) {
+                kept_protections.push_back({offset, run_end - offset, info.Protect});
+            }
+            offset = run_end;
         }
+    }
+
+    void MapKeptPiece(size_t virtual_offset, size_t host_offset, size_t length,
+                      std::span<const ProtectionRun> runs) {
+        // Map read-write so a later Protect can make the pages writable again.
+        if (!MapView(virtual_offset, host_offset, length)) {
+            UNREACHABLE_MSG("Failed to remap kept view at {:#x}, error {}", virtual_offset,
+                            GetLastError());
+        }
+        for (const auto& run : runs) {
+            DWORD old_flags{};
+            if (!VirtualProtect(virtual_base + run.offset, run.length, run.flags, &old_flags)) {
+                UNREACHABLE_MSG("Failed to restore protection {:#x} for {:#x} bytes at {:#x}, error {}",
+                                run.flags, run.length, run.offset, GetLastError());
+            }
+        }
+    }
+
+    bool MapView(size_t virtual_offset, size_t host_offset, size_t length) {
+        return pfn_MapViewOfFile3(backing_handle, process, virtual_base + virtual_offset, host_offset,
+                                  length, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr,
+                                  0) != nullptr;
     }
 
     void Split(size_t virtual_offset, size_t length) {
@@ -513,6 +573,8 @@ private:
     PFN_UnmapViewOfFile2 pfn_UnmapViewOfFile2{};
 
     std::mutex placeholder_mutex;                                 ///< Mutex for placeholders
+    std::shared_mutex protect_mutex;
+    std::vector<ProtectionRun> kept_protections;
     boost::icl::separate_interval_set<size_t> placeholders;       ///< Mapped placeholders
     ::Common::unordered_map<size_t, size_t> placeholder_host_pointers; ///< Placeholder backing offset
 };

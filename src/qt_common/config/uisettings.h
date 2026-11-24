@@ -156,6 +156,9 @@ struct Values {
 
     // Discord RPC
     Setting<bool> enable_discord_presence{linkage, false, "enable_discord_presence", Category::Ui};
+    Setting<std::string> mod_store_api_url{linkage, "https://lichii-api.zortos.me",
+                                           "mod_store_api_url", Category::Ui,
+                                           Settings::Specialization::Default, false};
 
     // logging
     Setting<bool> show_console{linkage, false, "showConsole", Category::Ui};

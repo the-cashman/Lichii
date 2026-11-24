@@ -811,6 +811,96 @@ TEST_CASE("Constant buffer data goes through the bound buffer's translation and 
     f.memory.FlushCaching();
     REQUIRE(recorder.constant_data == Ranges{{0x30040, 4}});
 
+    // Data memory already holds stays out of the delta once a full resolve read memory, while
+    // the page's CPU writes notify, unless the page may be GPU-written. The GPU-written bitmap is
+    // process-wide: start from none.
+    Tegra::Nx2ClearGpuWrittenPages();
+    FastDraw::g_delta = {};
+    FastDraw::NoteHandlesRead();
+    call(CbOffset, 0x40);
+    call(CbData, 5);
+    // An unwatched page: guest CPU writes to it land unseen.
+    REQUIRE(FastDraw::g_delta.num_device_writes == 1);
+    REQUIRE(FastDraw::g_delta.device_begin[0] == 0x30040);
+    f.device_memory.UpdatePagesCachedCount(0x30000, 0x1000, 1);
+    SCOPE_EXIT {
+        f.device_memory.UpdatePagesCachedCount(0x30000, 0x1000, -1);
+    };
+    // Starting to watch it counts as a change: writes made before may not have been read.
+    FastDraw::g_delta = {};
+    call(CbOffset, 0x40);
+    call(CbData, 5);
+    REQUIRE(FastDraw::g_delta.num_device_writes == 1);
+    FastDraw::g_delta = {};
+    FastDraw::NoteHandlesRead();
+    call(CbOffset, 0x40);
+    call(CbData, 5);
+    REQUIRE(FastDraw::g_delta.num_writes == 0);
+    REQUIRE(FastDraw::g_delta.num_device_writes == 0);
+    call(CbData, 7);
+    REQUIRE(FastDraw::g_delta.num_device_writes == 1);
+    REQUIRE(FastDraw::g_delta.device_begin[0] == 0x30044);
+    FastDraw::g_delta = {};
+    Tegra::Nx2MarkGpuWritten(0x30040, 4);
+    call(CbOffset, 0x40);
+    call(CbData, 5);
+    Tegra::Nx2ClearGpuWrittenPages();
+    REQUIRE(FastDraw::g_delta.num_device_writes == 1);
+    REQUIRE(FastDraw::g_delta.device_begin[0] == 0x30040);
+
+    // A guest CPU write since that resolve (a handle A -> B), then an upload repeating B: the
+    // delta still records it, so the next draw finds its handle words written and reads them
+    // again instead of keeping A. A resolve that reads memory between the write's start and
+    // its store doesn't lose it: the write is landing, then flagged.
+    FastDraw::g_delta = {};
+    FastDraw::NoteHandlesRead();
+    FastDraw::BeginMemoryChange();
+    FastDraw::NoteHandlesRead();
+    const u32 cpu_word = 9;
+    std::memcpy(replacement + 0x40, &cpu_word, sizeof(cpu_word));
+    call(CbOffset, 0x40);
+    call(CbData, 9);
+    REQUIRE(FastDraw::g_delta.num_writes == 1);
+    REQUIRE(FastDraw::g_delta.num_device_writes == 1);
+    REQUIRE(FastDraw::g_delta.device_begin[0] == 0x30040);
+    FastDraw::EndMemoryChange();
+    {
+        FastDraw::Delta next;
+        FastDraw::TakeDelta(next);
+        FastDraw::DeviceSpans spans;
+        spans.Update(f.memory, 0x100040, 4);
+        const std::array<std::pair<u32, u32>, 1> handle_words{{{0x40, 0x44}}};
+        REQUIRE(next.ReachesWords(0x100000, handle_words, spans));
+    }
+    // Until a full resolve reads memory again.
+    call(CbOffset, 0x40);
+    call(CbData, 9);
+    REQUIRE(FastDraw::g_delta.num_device_writes == 1);
+    FastDraw::g_delta = {};
+    FastDraw::NoteHandlesRead();
+    call(CbOffset, 0x40);
+    call(CbData, 9);
+    REQUIRE(FastDraw::g_delta.num_device_writes == 0);
+    // Writes that don't tell the caches (WriteBlockUnsafe, audio capture buffers) count too.
+    const u32 unsafe_word = 11;
+    REQUIRE(process.GetMemory().WriteBlockUnsafe(0x20040, &unsafe_word, sizeof(unsafe_word)));
+    REQUIRE(word(replacement + 0x40) == 11);
+    REQUIRE(FastDraw::g_changes_landing.load() == 0);
+    call(CbOffset, 0x40);
+    call(CbData, 11);
+    REQUIRE(FastDraw::g_delta.num_device_writes == 1);
+    FastDraw::g_delta = {};
+    FastDraw::NoteHandlesRead();
+    // After anything the guest CPU could have synchronised with, it may have written pages the
+    // caches don't watch.
+    FastDraw::NoteSync();
+    call(CbOffset, 0x40);
+    call(CbData, 11);
+    REQUIRE(FastDraw::g_delta.num_device_writes == 1);
+    REQUIRE(FastDraw::g_delta.device_begin[0] == 0x30040);
+    f.memory.FlushCaching();
+    recorder.constant_data.clear();
+
     // A buffer the texture headers lie in takes the general path, which checks each write.
     engine.regs.tex_header.address_high = 0;
     engine.regs.tex_header.address_low = 0x100400;
