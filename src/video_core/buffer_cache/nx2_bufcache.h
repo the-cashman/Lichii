@@ -107,11 +107,6 @@ inline const bool g_shadow_refresh = EnvOn("EDEN_NX2_SHADOW_REFRESH");
 /// binding is looked up again, instead of reusing the ones unchanged since their last lookup.
 inline const bool g_storage_memo = EnvOn("EDEN_NX2_STORAGE_MEMO");
 
-/// EDEN_NX2_DRAW_TRIM=0 (Lichii #2215, adapted): a disabled vertex stream is resolved again after
-/// every change of another stream, and FindBuffer reads the page table and the buffer for every
-/// lookup, instead of leaving disabled streams alone and remembering recent results by page.
-inline const bool g_draw_trim = EnvOn("EDEN_NX2_DRAW_TRIM");
-
 /// EDEN_NX2_SYNC_PRECHECK=0: a sync whose SYNC_SKIP entry is gone always walks the tracker,
 /// instead of first checking (read only) that no page of its range is CPU-dirty or unprotected,
 /// in which case the walk would find and change nothing.

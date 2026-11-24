@@ -1441,16 +1441,6 @@ private:
     std::vector<MultiRangeSegment> compute_segments;
     /// Bumped whenever a buffer is created, deleted or joined: resolved bindings may be stale.
     u64 binding_epoch = 1;
-    /// FindBuffer's recent results by caching page (EDEN_NX2_DRAW_TRIM, Lichii #2215).
-    struct FindMemo {
-        u64 page{~u64{0}};
-        u64 epoch{}; ///< binding_epoch then
-        DAddr begin{};
-        DAddr end{};
-        BufferId buffer_id{};
-        bool sparse_compatible{};
-    };
-    std::array<FindMemo, 256> find_memos{};
     std::array<StorageResolveCache, NUM_STAGES> graphics_storage_resolve{};
     StorageResolveCache compute_storage_resolve{};
 

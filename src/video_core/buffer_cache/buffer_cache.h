@@ -3428,16 +3428,6 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
         return;
     }
     const auto& array = maxwell3d->regs.vertex_streams[index];
-    if (array.enable == 0 && Nx2BufCache::g_draw_trim) {
-        // Nothing binds a disabled stream (BindHostVertexBuffers takes the enabled ones), so its
-        // flag stayed set and every later change of another stream resolved it again (a page
-        // table walk each): Donkey Kong Bananza enables 10 of 32 (Lichii #2215). Enabling it
-        // writes vertex_streams[index], which sets the flag again.
-        maxwell3d->dirty.flags[Dirty::VertexBuffer0 + index] = false;
-        channel_state->vertex_buffers[index] = NULL_BINDING;
-        UpdateVertexBufferSlot(index, NULL_BINDING);
-        return;
-    }
     const auto& limit = maxwell3d->regs.vertex_stream_limits[index];
     const GPUVAddr gpu_addr_begin = array.Address();
     const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
@@ -4082,42 +4072,24 @@ BufferId BufferCache<P>::FindBuffer(DAddr device_addr, u32 size, bool sparse_com
     if (device_addr == 0 || page >= page_table.size()) {
         return NULL_BUFFER_ID;
     }
-    // A recent result for the page, found without reading the page table or the buffer (Lichii
-    // #2215). Only Register/Unregister change the page table, and both bump binding_epoch.
-    const bool should_sync = Settings::IsGPUFenceBehaviorAccurate();
-    FindMemo& memo = find_memos[page % find_memos.size()];
-    const bool memo_hit = Nx2BufCache::g_draw_trim && !should_sync && memo.page == page &&
-                          memo.epoch == binding_epoch && device_addr >= memo.begin &&
-                          device_addr + size <= memo.end &&
-                          (memo.sparse_compatible || !sparse_compatible);
-    if (memo_hit && !Nx2Perf::Verify()) {
-        return memo.buffer_id;
-    }
     const BufferId buffer_id = page_table[page];
     if (buffer_id) {
         Buffer& buffer = slot_buffers[buffer_id];
         if (buffer.IsInBounds(device_addr, size)) {
+            const bool should_sync = Settings::IsGPUFenceBehaviorAccurate();
             if (should_sync) {
                 SynchronizeBufferWrites(buffer);
             }
-            bool sparse = true;
+            bool usable = true;
             if constexpr (requires { buffer.IsSparseCompatible(); }) {
-                sparse = buffer.IsSparseCompatible();
-            }
-            if (!sparse_compatible || sparse) {
-                if (memo_hit && memo.buffer_id != buffer_id) {
-                    LOG_ERROR(HW_GPU, "Nx2Perf find buffer: {:#x}+{:#x} remembered in {}, found in {}",
-                              device_addr, size, memo.buffer_id.index, buffer_id.index);
+                if (sparse_compatible && !buffer.IsSparseCompatible()) {
+                    usable = false;
                 }
-                memo = {page, binding_epoch, buffer.CpuAddr(),
-                        buffer.CpuAddr() + buffer.SizeBytes(), buffer_id, sparse};
+            }
+            if (usable) {
                 return buffer_id;
             }
         }
-    }
-    if (memo_hit) {
-        LOG_ERROR(HW_GPU, "Nx2Perf find buffer: {:#x}+{:#x} remembered in {}, not in the page table",
-                  device_addr, size, memo.buffer_id.index);
     }
     return CreateBuffer(device_addr, size, sparse_compatible, caller);
 }
