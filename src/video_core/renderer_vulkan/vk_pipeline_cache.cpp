@@ -1026,14 +1026,9 @@ void PipelineCache::SaveUsedPipelines() {
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline(bool key_unchanged) {
     VideoCommon::GpuSplit::BackOwned("PipelineCache::CurrentGraphicsPipeline");
 
-    if (VideoCommon::GpuSplit::TracksGraphicsLookups()) {
-        ++graphics_lookups;
-        last_lookup_kept = false;
-    }
-    std::array<u64, 6> hashes;
-    if (key_unchanged) {
-        hashes = graphics_key.unique_hashes;
-    }
+    ++graphics_lookups;
+    last_lookup_kept = false;
+    const std::array<u64, 6> hashes = graphics_key.unique_hashes;
     if (!RefreshStages(graphics_key.unique_hashes)) {
         current_pipeline = nullptr;
         return nullptr;

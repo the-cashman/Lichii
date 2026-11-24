@@ -474,9 +474,6 @@ public:
     [[nodiscard]] static bool UnlendsFastDelta() {
         return on_back_thread && instance.unlend_fast_delta;
     }
-    [[nodiscard]] static bool TracksGraphicsLookups() {
-        return instance.unlend_fast_delta;
-    }
     void NoteFastDelta(bool kept) {
         ++(kept ? fast_delta.kept : fast_delta.looked_up);
     }
@@ -675,14 +672,12 @@ public:
     void MaybeStart(Core::System& system);
     /// The render_thread setting, or EDEN_NX2_RENDER_FOLLOWER over it either way when set.
     [[nodiscard]] static bool RenderThreadOn();
-    /// A render follower switch (EDEN_NX2_RENDER_*, EDEN_NX2_BUFFER_ARENA): on unless set to 0.
-    /// Callers read these only if RenderThreadOn was true at renderer creation.
+    /// A render follower switch (EDEN_NX2_RENDER_*, EDEN_NX2_BUFFER_ARENA): on unless set to 0,
+    /// and every one is off while the render thread is off (RenderThreadOn).
     [[nodiscard]] static bool RenderSwitch(const char* name);
     void Stop();
 
-    void ConfigureRenderFollower(bool requested, bool arena, bool supported) {
-        render_follower_requested = requested;
-        render_follower_arena = arena;
+    void SetRenderFollowerSupported(bool supported) {
         render_follower_supported = supported;
     }
     [[nodiscard]] bool CanPostRender() const {
@@ -1278,7 +1273,7 @@ private:
     /// Whether the front's wait for `target` is over: GPURender played it, or with `on_engine`
     /// the back ran it and GPURender played the newest op before it that writes game memory
     /// without a lend (MarkGuestWrite).
-    [[nodiscard]] bool ReachedOnEngine(u64 target, std::memory_order order) const;
+    [[nodiscard]] bool Reached(u64 target, bool on_engine, std::memory_order order) const;
     /// After the back published consumption or finished its idle hook.
     void NotifyFront() {
         if (front_waiting.load(std::memory_order_seq_cst)) {
@@ -1292,9 +1287,6 @@ private:
     /// has every packet before it recorded too (Fritchii's two positions, ead877857).
     [[nodiscard]] u64 FrontPosition(std::memory_order order) const {
         return two_positions ? played.load(order) : consumed.load(order);
-    }
-    [[nodiscard]] bool Reached(u64 target, bool on_engine, std::memory_order order) const {
-        return on_engine ? ReachedOnEngine(target, order) : FrontPosition(order) >= target;
     }
     /// The back after storing "consumed", GPURender after each packet: raises "played".
     void RaisePlayed();
@@ -1410,8 +1402,6 @@ private:
     static inline thread_local bool render_lent{};
     /// On GPURender while it plays an unlent draw: where the back posted it (TrackFencedWrite).
     static inline thread_local u64 playing_position{~u64{0}};
-    bool render_follower_requested{};
-    bool render_follower_arena{};
     bool render_follower_supported{};
     /// EDEN_NX2_RENDER_OWNS=1, set before the back and GPURender start.
     bool render_owns{};

@@ -407,7 +407,7 @@ BufferCacheRuntime::BufferCacheRuntime(const Device& device_, MemoryAllocator& m
         uint8_pass = std::make_unique<Uint8Pass>(device, scheduler, descriptor_pool, staging_pool,
                                                  compute_pass_descriptor_queue);
     }
-    if (scheduler.BufferArenaEnabled()) {
+    if (BufferArena::Enabled()) {
         upload_pool = std::make_unique<StagingBufferPool>(device, memory_allocator, scheduler,
                                                           arena.Clock(), 2);
     }
@@ -828,8 +828,13 @@ void BufferCacheRuntime::BindVertexBuffers(VideoCommon::HostBindings<Buffer>& bi
     if (binding_count == 0) {
         return;
     }
-    arena.BindVertices(bindings.min_index, std::span{buffer_handles}.first(binding_count),
-                       bindings.offsets, bindings.sizes, bindings.strides,
+    boost::container::static_vector<BufferArena::VertexBinding, VideoCommon::NUM_VERTEX_BUFFERS>
+        vertex_bindings;
+    for (u32 i = 0; i < binding_count; ++i) {
+        vertex_bindings.push_back({buffer_handles[i], bindings.offsets[i], bindings.sizes[i],
+                                   bindings.strides[i]});
+    }
+    arena.BindVertices(bindings.min_index, vertex_bindings,
                        device.IsExtExtendedDynamicStateSupported());
 }
 
@@ -847,9 +852,8 @@ void BufferCacheRuntime::BindTransformFeedbackBuffer(u32 index, VkBuffer buffer,
         offset = 0;
         size = 0;
     }
-    const u64 vk_offset = offset;
-    const u64 vk_size = size;
-    arena.BindTransformFeedback(index, {&buffer, 1}, {&vk_offset, 1}, {&vk_size, 1});
+    const std::array<BufferArena::VertexBinding, 1> binding{{{buffer, offset, size, 0}}};
+    arena.BindTransformFeedback(index, binding);
 }
 
 void BufferCacheRuntime::BindTransformFeedbackBuffers(VideoCommon::HostBindings<Buffer>& bindings) {
@@ -868,7 +872,12 @@ void BufferCacheRuntime::BindTransformFeedbackBuffers(VideoCommon::HostBindings<
         }
         buffer_handles[i] = handle;
     }
-    arena.BindTransformFeedback(0, buffer_handles, bindings.offsets, bindings.sizes);
+    boost::container::static_vector<BufferArena::VertexBinding, VideoCommon::NUM_VERTEX_BUFFERS>
+        feedback_bindings;
+    for (size_t i = 0; i < buffer_handles.size(); ++i) {
+        feedback_bindings.push_back({buffer_handles[i], bindings.offsets[i], bindings.sizes[i], 0});
+    }
+    arena.BindTransformFeedback(0, feedback_bindings);
 }
 
 void BufferCacheRuntime::ReserveNullBuffer() {

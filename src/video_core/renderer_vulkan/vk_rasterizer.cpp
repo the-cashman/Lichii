@@ -565,11 +565,11 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
                                    StateTracker& state_tracker_, Scheduler& scheduler_)
     : gpu{gpu_}, device_memory{device_memory_}, device{device_},
       memory_allocator{memory_allocator_}, state_tracker{state_tracker_}, scheduler{scheduler_},
-      staging_pool(device, memory_allocator, scheduler, nullptr,
-                   scheduler.BufferArenaEnabled() ? 2 : 1),
+      staging_pool(device, memory_allocator, scheduler, nullptr, BufferArena::Enabled() ? 2 : 1),
       descriptor_pool(device, scheduler),
       guest_descriptor_queue(device, UpdateDescriptorQueue::GUEST_FRAME_PAYLOAD_SIZE,
                              device.IsExtDescriptorBufferSupported()),
+      unlend_capture(device, 0x1000, device.IsExtDescriptorBufferSupported()),
       compute_pass_descriptor_queue(device, UpdateDescriptorQueue::COMPUTE_FRAME_PAYLOAD_SIZE),
       descriptor_buffer_ring(device, memory_allocator),
       blit_image(device, scheduler, state_tracker, descriptor_pool), render_pass_cache(device),
@@ -611,8 +611,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
         },
         this);
     VideoCommon::GpuSplit::Get().SetLendHooks(&LendEnter, &LendLeave, this);
-    VideoCommon::GpuSplit::Get().ConfigureRenderFollower(
-        scheduler.RenderRecordersEnabled(), scheduler.BufferArenaEnabled(),
+    VideoCommon::GpuSplit::Get().SetRenderFollowerSupported(
         device.GetDriverID() != VK_DRIVER_ID_AMD_PROPRIETARY && !device.IsMoltenVK() &&
         device.IsHostQueryResetSupported());
     VideoCommon::GpuSplit::Get().WatchRenderLocks({&buffer_cache.mutex, &texture_cache.mutex});
@@ -621,7 +620,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
 }
 
 RasterizerVulkan::~RasterizerVulkan() {
-    VideoCommon::GpuSplit::Get().ConfigureRenderFollower(false, false, false);
+    VideoCommon::GpuSplit::Get().SetRenderFollowerSupported(false);
     VideoCommon::GpuSplit::Get().WatchRenderLocks({});
     VideoCommon::GpuSplit::Get().SetIdleHook(nullptr, nullptr);
     // The channels are gone by now, and submitting invalidates the state tracker's flags.
@@ -1063,12 +1062,10 @@ template <typename Func>
 void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_indirect,
                                    std::optional<u32> direct_instances) {
     auto& split = VideoCommon::GpuSplit::Get();
-    std::optional<VideoCommon::Nx2RenderView::DrawCheck> view_check;
-    if (VideoCommon::Nx2RenderView::Enabled()) {
-        view_check.emplace(*maxwell3d, std::exchange(unlend_verify_draw, false));
-        if (auto* const view = view_check->View()) {
-            VerifyRenderViewBuild(*view, *maxwell3d, pipeline_cache.Features());
-        }
+    const VideoCommon::Nx2RenderView::DrawCheck view_check{
+        *maxwell3d, std::exchange(unlend_verify_draw, false)};
+    if (Tegra::Engines::Maxwell3D* const view = view_check.View()) {
+        VerifyRenderViewBuild(*view, *maxwell3d, pipeline_cache.Features());
     }
     DrawReuse reuse = DrawReuse::Count;
     DrawPath reuse_path = DrawPath::Full;
@@ -1383,8 +1380,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     std::optional<GraphicsPipeline::PreparedBinding> prepared;
     std::optional<GraphicsPipeline::PreparedBinding>* output = nullptr;
     static const bool native_draw_capture = std::getenv("EDEN_NATIVE_DRAW_CAPTURE") != nullptr;
-    if (direct_instances && scheduler.RenderRecordersEnabled() && split.CanPostRender() &&
-        !mesh_draw && !fast_draw_verify &&
+    if (direct_instances && split.CanPostRender() && !mesh_draw && !fast_draw_verify &&
         !frame_dump.Capturing() && !Common::DkbFrameTrace::Enabled() &&
         !VideoCommon::RenderTrace::Enabled() && !GPU::Logging::IsActive() &&
         !native_draw_capture &&
@@ -1432,8 +1428,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         reuse_probe_ns = VideoCommon::Nx2Profile::Now() - probe_start;
     }
 
-    if (OcarinaTemporalEnabled()) {
-        TrackOcarinaDraw(pipeline->ShaderHashes()[1], is_indexed, is_indirect);
+    if (const auto facts =
+            CaptureOcarinaFacts(pipeline->ShaderHashes()[1], is_indexed, is_indirect)) {
+        ApplyOcarinaFacts(*facts);
     }
     TracePendingCpuWrites(false, pipeline->ShaderHashes());
     TraceRenderState(is_indexed, "configured", texture_cache.GetFramebuffer());
@@ -1583,7 +1580,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
 void RasterizerVulkan::NoteOcarinaDraw(const GraphicsPipeline& pipeline) {
     constexpr u64 final_vertex = 0x16aff33d999f993fULL;
     constexpr u64 final_fragment = 0x52402d8e8ab55263ULL;
-    const auto& hashes = pipeline.ShaderHashes();
+    const auto hashes = pipeline.ShaderHashes();
     if (oot_4k_scene_frame == render_trace_frame && hashes[5] == final_fragment &&
         std::ranges::find(hashes, final_vertex) != hashes.end()) {
         const auto target_id = texture_cache.GetRenderTargets().color_buffer_ids[0];
@@ -1883,13 +1880,6 @@ struct RasterizerVulkan::UnlentDraw {
     }
 };
 
-GuestDescriptorQueue& RasterizerVulkan::UnlendCapture() {
-    if (!unlend_capture) {
-        unlend_capture.emplace(device, 0x1000, device.IsExtDescriptorBufferSupported());
-    }
-    return *unlend_capture;
-}
-
 bool RasterizerVulkan::TryUnlendDraw(bool is_indexed, u32 instance_count) {
     using Reason = VideoCommon::GpuSplit::UnlendReason;
     namespace Profile = VideoCommon::Nx2Profile;
@@ -2089,7 +2079,7 @@ bool RasterizerVulkan::TryUnlendDraw(bool is_indexed, u32 instance_count) {
     {
         Profile::Scope scope{Profile::Zone::Configure};
         const BufferArena::Collect collect{draw.half.commands};
-        pipeline->ConfigureBack(is_indexed, draw.half, UnlendCapture());
+        pipeline->ConfigureBack(is_indexed, draw.half, unlend_capture);
     }
     draw.ocarina = CaptureOcarinaFacts(pipeline->ShaderHashes()[1], is_indexed, false);
     buffer_cache.NoteWorkRecorded(false);
@@ -3329,7 +3319,7 @@ bool RasterizerVulkan::TryUnlendDispatch() {
         Profile::Scope scope{Profile::Zone::Configure};
         const BufferArena::Collect collect{dispatch.half.commands};
         pipeline->ConfigureBack(*kepler_compute, *gpu_memory, buffer_cache, dispatch.half,
-                                UnlendCapture());
+                                unlend_capture);
         if (indirect_address) {
             const auto [buffer, offset] =
                 VideoCommon::ObtainIndirectBuffer(buffer_cache, *indirect_address);
@@ -3793,8 +3783,8 @@ bool RasterizerVulkan::PostFenceReport(GPUVAddr gpu_addr, VideoCommon::QueryProp
     if (!GpuSplit::Get().Posts(GpuSplit::PostedOp::FenceReport)) {
         return false;
     }
-    const auto cpu_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
-    if (!cpu_addr || !FencePostable(GpuSplit::PostedOp::FenceReport)) {
+    const auto device = gpu_memory->GpuToCpuAddress(gpu_addr);
+    if (!device || !FencePostable(GpuSplit::PostedOp::FenceReport)) {
         return false;
     }
     // As the posted Z-pass reports: the buffer note, page mark and pending count at the report's
@@ -3802,18 +3792,18 @@ bool RasterizerVulkan::PostFenceReport(GPUVAddr gpu_addr, VideoCommon::QueryProp
     // GPURender, and query flushes wait for it to land.
     const bool wide = True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout);
     const QueryCache::PostedReport posted{
-        .device = *cpu_addr,
-        .noted = NoteReportPending(*cpu_addr, wide ? 16 : 4),
+        .device = *device,
+        .noted = NoteReportPending(*device, wide ? 16 : 4),
         .by_value = true,
     };
-    query_cache.page_filter.Mark(*cpu_addr, 16);
+    query_cache.page_filter.Mark(*device, 16);
     if (GpuSplit::TracksPendingReports()) {
-        query_cache.NotePendingReport(*cpu_addr);
+        query_cache.NotePendingReport(*device);
     }
     VideoCommon::Nx2FastDraw::NoteSync();
     // Its own fence's NotifyWFI synced the value to the host: PostCheckedFence collects that
     // sync and GPURender plays it before the fence, so nothing is owed after it.
-    back_payload_sync.push_back({*cpu_addr, payload, wide ? u64{8} : u64{4}});
+    back_payload_sync.push_back({*device, payload, wide ? u64{8} : u64{4}});
     PostCheckedFence(GpuSplit::PostedOp::FenceReport,
                      [this, gpu_addr, flags, payload, subreport, posted] {
                          query_cache.CounterReport(gpu_addr, VideoCommon::QueryType::Payload, flags,
@@ -3833,14 +3823,15 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
         fence_query_owed = true;
     }
     using VideoCommon::GpuSplit;
-    if (GpuSplit::PayloadsOnBack() && type == VideoCommon::QueryType::Payload &&
-        False(flags & VideoCommon::QueryPropertiesFlags::IsAFence) && !Settings::IsGPULevelHigh()) {
+    if (type == VideoCommon::QueryType::Payload &&
+        False(flags & VideoCommon::QueryPropertiesFlags::IsAFence) && !Settings::IsGPULevelHigh() &&
+        GpuSplit::PayloadsOnBack()) {
         // EDEN_NX2_RENDER_PAYLOAD_E: such a release registers no query and writes at once, so the
         // back writes it at its place in the stream. Its later writes follow on this thread; an
         // unplayed draw reading the pools there is waited for. The host sync waits in
         // back_payload_sync for the next lent call, and fence_query_owed lends the next sync.
-        const auto cpu_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
-        if (!cpu_addr) {
+        const auto device = gpu_memory->GpuToCpuAddress(gpu_addr);
+        if (!device) {
             return;
         }
         const bool wide = True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout);
@@ -3848,18 +3839,18 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
         const u64 size = wide ? 16 : 4;
         auto& split = GpuSplit::Get();
         split.GuardStreamWrite(gpu_addr, size);
-        split.StampWrite(*cpu_addr, size, GpuSplit::Writer::Payload);
+        split.StampWrite(*device, size, GpuSplit::Writer::Payload);
         VideoCommon::Nx2FastDraw::NoteSync();
         // A read download still to land there is finished on GPURender.
-        const bool lent = VideoCore::ReadDownloadsMayCover(*cpu_addr, size);
+        const bool lent = VideoCore::ReadDownloadsMayCover(*device, size);
         split.NotePayloadOnBack(lent);
         if (lent) {
             split.LendRender(
-                [&] { query_cache.WriteImmediate(gpu_addr, *cpu_addr, payload, wide, mirrored); });
+                [&] { query_cache.WriteImmediate(gpu_addr, *device, payload, wide, mirrored); });
         } else {
-            query_cache.WriteImmediate(gpu_addr, *cpu_addr, payload, wide, mirrored);
+            query_cache.WriteImmediate(gpu_addr, *device, payload, wide, mirrored);
         }
-        back_payload_sync.push_back({*cpu_addr, payload, wide ? u64{8} : u64{4}});
+        back_payload_sync.push_back({*device, payload, wide ? u64{8} : u64{4}});
         return;
     }
     if (type == VideoCommon::QueryType::ZPassPixelCount64 &&
@@ -3868,15 +3859,15 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
         // EDEN_NX2_RENDER_POST_QUERY: the back takes the report's buffer cache note and marks
         // its page at the report's place in the stream, so its later invalidations and flushes
         // there reach GPURender behind it. GPURender records and registers the report.
-        if (const auto cpu_addr = gpu_memory->GpuToCpuAddress(gpu_addr)) {
+        if (const auto device = gpu_memory->GpuToCpuAddress(gpu_addr)) {
             const bool wide = True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout);
             const QueryCache::PostedReport posted{
-                .device = *cpu_addr,
-                .noted = NoteReportPending(*cpu_addr, wide ? 16 : 4),
+                .device = *device,
+                .noted = NoteReportPending(*device, wide ? 16 : 4),
             };
-            query_cache.page_filter.Mark(*cpu_addr, 16);
+            query_cache.page_filter.Mark(*device, 16);
             if (GpuSplit::TracksPendingReports()) {
-                query_cache.NotePendingReport(*cpu_addr);
+                query_cache.NotePendingReport(*device);
             }
             VideoCommon::Nx2FastDraw::NoteSync();
             if (PostRenderOp(GpuSplit::PostedOp::QueryReport, [this, gpu_addr, type, flags, payload,
@@ -3885,7 +3876,7 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                 })) {
                 GpuSplit::Get().MarkGuestWrite();
                 if (GpuSplit::QuerySyncOnBack()) {
-                    samples_slots.push_back(*cpu_addr);
+                    samples_slots.push_back(*device);
                 }
                 return;
             }
@@ -4544,16 +4535,13 @@ void RasterizerVulkan::InvalidateCachedWrites(
         }
         return false;
     };
-    const bool texture_hit = !buffer_half_only && any(texture_cache.page_filter);
     // A draw the back wanted to unlend waits for these to reach GPURender's caches.
-    if (VideoCommon::GpuSplit::OnBackThread() && VideoCommon::GpuSplit::UnlendEnabled()) {
-        unlend_gather_hit = !buffer_half_only &&
-                            (texture_hit || any(query_cache.page_filter) ||
-                             any(pipeline_cache.page_filter));
-    }
+    unlend_gather_hit =
+        !buffer_half_only && (any(texture_cache.page_filter) || any(query_cache.page_filter) ||
+                              any(pipeline_cache.page_filter));
     // Even with skip_cpu_inner_invalidation: engines writing images in software (DMA pitch to
     // block linear copies of decoded video frames) reach the texture cache only through here.
-    if (texture_hit) {
+    if (!buffer_half_only && any(texture_cache.page_filter)) {
         std::scoped_lock lock{texture_cache.mutex};
         for (const auto& [addr, size] : sequences) {
             texture_cache.WriteMemory(addr, size);
@@ -5115,43 +5103,38 @@ bool RasterizerVulkan::OcarinaTemporalEnabled() const {
     return *oot_backend != VideoCommon::OcarinaUpscaleBackend::Native;
 }
 
-void RasterizerVulkan::TrackOcarinaDraw(u64 shader_hash, bool is_indexed, bool is_indirect) {
-    if (const auto* color = OcarinaCameraTarget()) {
-        if (const auto camera = CaptureOcarinaCamera()) {
-            ApplyOcarinaCamera(*color, *camera, gpu_memory);
-        }
-    }
-    if (shader_hash == 0x28c6e527634f814aULL && is_indexed && !is_indirect &&
-        oot_actor.frame != render_trace_frame) {
-        if (const auto actor = CaptureOcarinaActor()) {
-            ApplyOcarinaActor(*actor);
-        }
-    }
-}
-
 /// Capture the two camera matrices from a draw targeting the scene color and depth. Terrain and
-/// materials draw with several vertex shaders, so any draw into a scene-sized target qualifies.
-const ImageView* RasterizerVulkan::OcarinaCameraTarget() const {
+/// materials draw with several vertex shaders, so any draw into a scene-sized target qualifies;
+/// the camera buffer's contents are checked below.
+void RasterizerVulkan::ApplyOcarinaFacts(const OcarinaDrawFacts& facts) {
+    if (!OcarinaTemporalEnabled()) {
+        return;
+    }
+    if (facts.actor && oot_actor.frame != render_trace_frame) {
+        oot_previous_actor = oot_actor;
+        oot_actor = *facts.actor;
+        oot_actor.frame = render_trace_frame;
+    }
+    if (!facts.camera && !facts.camera_gpu_written) {
+        return;
+    }
+
     const auto& targets = texture_cache.GetRenderTargets();
     if (!targets.color_buffer_ids[0] || !targets.depth_buffer_id) {
-        return nullptr;
+        return;
     }
     const auto& color = texture_cache.GetImageView(targets.color_buffer_ids[0]);
     if (color.size.width < 640 || color.size.height < 360 ||
         color.format != VideoCore::Surface::PixelFormat::B10G11R11_FLOAT) {
-        return nullptr;
+        return;
     }
     // Reflections and half-size passes share the camera layout; the upscale reads the largest.
     if (oot_camera_sample_frame == render_trace_frame &&
         u64{color.size.width} * color.size.height <=
             u64{oot_motion.image_extent.width} * oot_motion.image_extent.height) {
-        return nullptr;
+        return;
     }
-    return &color;
-}
 
-void RasterizerVulkan::ApplyOcarinaCamera(const ImageView& color, const OcarinaCameraFacts& facts,
-                                          const Tegra::MemoryManager* channel) {
     const auto refuse = [&](const char* reason, f32 width, f32 height) {
         if (oot_camera_refusal && oot_camera_refusal->frame == render_trace_frame &&
             u64{color.size.width} * color.size.height <
@@ -5161,11 +5144,11 @@ void RasterizerVulkan::ApplyOcarinaCamera(const ImageView& color, const OcarinaC
         oot_camera_refusal = OcarinaCameraRefusal{render_trace_frame, reason, width, height,
                                                   color.size.width, color.size.height};
     };
-    if (facts.gpu_written) {
+    if (facts.camera_gpu_written) {
         refuse("no scene camera: its buffer is GPU-written", 0.0f, 0.0f);
         return;
     }
-    const auto& values = facts.values;
+    const VideoCommon::OcarinaCameraBuffer& values = *facts.camera;
     const auto camera = VideoCommon::DecodeOcarinaCamera(
         values, color.size.width, color.size.height,
         oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss);
@@ -5177,31 +5160,11 @@ void RasterizerVulkan::ApplyOcarinaCamera(const ImageView& color, const OcarinaC
         return;
     }
     oot_camera_sample_frame = render_trace_frame;
-    oot_motion.camera_channel = channel;
+    oot_motion.camera_channel = facts.channel;
     oot_motion.extent = {camera.width, camera.height};
     oot_motion.image_extent = {color.size.width, color.size.height};
     oot_motion.current = camera.current;
     oot_motion.previous = camera.previous;
-}
-
-void RasterizerVulkan::ApplyOcarinaActor(const OcarinaActorPose& pose) {
-    oot_previous_actor = oot_actor;
-    oot_actor = pose;
-    oot_actor.frame = render_trace_frame;
-}
-
-void RasterizerVulkan::ApplyOcarinaFacts(const OcarinaDrawFacts& facts) {
-    if (!OcarinaTemporalEnabled()) {
-        return;
-    }
-    if (facts.actor && oot_actor.frame != render_trace_frame) {
-        ApplyOcarinaActor(*facts.actor);
-    }
-    if (facts.camera) {
-        if (const auto* color = OcarinaCameraTarget()) {
-            ApplyOcarinaCamera(*color, *facts.camera, facts.channel);
-        }
-    }
 }
 
 void RasterizerVulkan::UpdateOcarinaJitter() {
@@ -5251,47 +5214,35 @@ std::unique_ptr<RasterizerVulkan::OcarinaDrawFacts> RasterizerVulkan::CaptureOca
         return *facts;
     };
     const auto& regs = maxwell3d->regs;
-    if (regs.rt[0].format == Tegra::RenderTargetFormat::B10G11R11_FLOAT && regs.zeta_enable != 0) {
-        if (auto camera = CaptureOcarinaCamera()) {
-            take().camera = std::move(*camera);
-        }
-    }
-    if (shader_hash == 0x28c6e527634f814aULL && is_indexed && !is_indirect) {
-        if (auto actor = CaptureOcarinaActor()) {
-            take().actor = std::move(*actor);
-        }
-    }
-    return facts;
-}
-
-std::optional<RasterizerVulkan::OcarinaCameraFacts> RasterizerVulkan::CaptureOcarinaCamera() {
-    // Tracking needs the guest binding: the shader-visible view omits unused slots and
-    // truncates ranges to shader usage.
+    // The scene camera of draws into a scene-format target, where the upscale reads it (the
+    // target itself is checked on GPURender). Tracking needs the guest binding: the
+    // shader-visible view omits unused slots and truncates ranges to shader usage.
     const auto& binding = maxwell3d->state.shader_stages[0].const_buffers[3];
-    constexpr size_t bytes = VideoCommon::OcarinaCameraBytes;
-    if (!binding.enabled || binding.address == 0 || binding.size < bytes ||
-        !gpu_memory->IsFullyMappedRange(binding.address, bytes) ||
-        !gpu_memory->IsContinuousRange(binding.address, bytes)) {
-        return std::nullopt;
+    if (regs.rt[0].format == Tegra::RenderTargetFormat::B10G11R11_FLOAT && regs.zeta_enable != 0 &&
+        binding.enabled && binding.address != 0 &&
+        binding.size >= VideoCommon::OcarinaCameraBytes &&
+        gpu_memory->IsFullyMappedRange(binding.address, VideoCommon::OcarinaCameraBytes) &&
+        gpu_memory->IsContinuousRange(binding.address, VideoCommon::OcarinaCameraBytes)) {
+        OcarinaDrawFacts& taken = take();
+        const auto device_address = gpu_memory->GpuToCpuAddress(binding.address);
+        if (!device_address ||
+            buffer_cache.IsRegionGpuModified(*device_address, VideoCommon::OcarinaCameraBytes)) {
+            taken.camera_gpu_written = true;
+        } else {
+            taken.camera.emplace();
+            device_memory.ReadBlockUnsafe(*device_address, taken.camera->data(),
+                                          VideoCommon::OcarinaCameraBytes);
+        }
     }
-    const auto device_address = gpu_memory->GpuToCpuAddress(binding.address);
-    if (!device_address || buffer_cache.IsRegionGpuModified(*device_address, bytes)) {
-        return OcarinaCameraFacts{.values = {}, .gpu_written = true};
+    // The skinning pose of the recognized Link draw, for frame-to-frame motion.
+    if (shader_hash != 0x28c6e527634f814aULL || !is_indexed || is_indirect) {
+        return facts;
     }
-    OcarinaCameraFacts camera;
-    camera.gpu_written = false;
-    device_memory.ReadBlockUnsafe(*device_address, camera.values.data(), bytes);
-    return camera;
-}
-
-/// Capture the skinning pose of the recognized Link draw, for frame-to-frame motion.
-std::optional<RasterizerVulkan::OcarinaActorPose> RasterizerVulkan::CaptureOcarinaActor() {
-    const auto& regs = maxwell3d->regs;
     const auto& draw = maxwell3d->draw_manager.draw_state;
     const auto& stream = regs.vertex_streams[0];
     if (draw.index_buffer.count != 9702 || draw.index_buffer.FormatSizeInBytes() != 2 ||
         !stream.IsEnabled() || stream.stride != 48 || regs.vertex_stream_instances.IsInstancingEnabled(0)) {
-        return std::nullopt;
+        return facts;
     }
     const auto attribute = [&](u32 location, VkFormat format, u32 offset) {
         const auto& attrib = regs.vertex_attrib_format[location];
@@ -5301,7 +5252,7 @@ std::optional<RasterizerVulkan::OcarinaActorPose> RasterizerVulkan::CaptureOcari
     if (!attribute(0, VK_FORMAT_R32G32B32_SFLOAT, 0) ||
         !attribute(4, VK_FORMAT_R8G8B8A8_UNORM, 40) || !attribute(5, VK_FORMAT_R8G8B8A8_UNORM, 44) ||
         !attribute(6, VK_FORMAT_R16G16B16A16_UINT, 12) || !attribute(7, VK_FORMAT_R16G16B16A16_UINT, 20)) {
-        return std::nullopt;
+        return facts;
     }
 
     OcarinaActorPose pose{
@@ -5326,10 +5277,10 @@ std::optional<RasterizerVulkan::OcarinaActorPose> RasterizerVulkan::CaptureOcari
             bones_found = true;
         }
     });
-    if (!origin_found || !bones_found) {
-        return std::nullopt;
+    if (origin_found && bones_found) {
+        take().actor = pose;
     }
-    return pose;
+    return facts;
 }
 
 /// Read the shared mesh only when both poses refer to the same vertex and index buffers.
@@ -5825,8 +5776,10 @@ void RasterizerVulkan::TraceInlineToMemory(GPUVAddr address, size_t copy_size,
     }
 }
 
-bool RasterizerVulkan::InlineBufferHalf(DAddr cpu_addr, size_t copy_size,
-                                        std::span<const u8> memory, bool defer) {
+bool RasterizerVulkan::InlineBufferHalf(DAddr cpu_addr_value, size_t copy_size,
+                                        std::span<const u8> memory) {
+    const std::optional<DAddr> cpu_addr{cpu_addr_value};
+    const bool defer = InlineDefers();
     bool uploaded = false;
     // One cache at a time: holding both while waiting for either (std::lock) waited longer, the
     // fencing thread and CPU write traps holding one of them most of the time.
@@ -5835,8 +5788,8 @@ bool RasterizerVulkan::InlineBufferHalf(DAddr cpu_addr, size_t copy_size,
     // as GPU-written marks its pages in Tegra::g_nx2_gpu_written_pages first, under its lock, on
     // this thread, and the bits never clear. So when no written page has either mark the locked
     // section changes nothing, and the write skips the lock (jpkto/Lichii 7a5e5357cb).
-    const DAddr page_begin = Common::AlignDown(cpu_addr, Core::DEVICE_PAGESIZE);
-    const DAddr page_end = Common::AlignUp(cpu_addr + copy_size, Core::DEVICE_PAGESIZE);
+    const DAddr page_begin = Common::AlignDown(*cpu_addr, Core::DEVICE_PAGESIZE);
+    const DAddr page_end = Common::AlignUp(*cpu_addr + copy_size, Core::DEVICE_PAGESIZE);
     const auto reaches_list_page = [&] {
         if (copy_size == 0 ||
             !Tegra::g_nx2_has_command_list_pages.load(std::memory_order_relaxed)) {
@@ -5857,19 +5810,19 @@ bool RasterizerVulkan::InlineBufferHalf(DAddr cpu_addr, size_t copy_size,
         if (VideoCommon::BackX::g_verify) {
             std::scoped_lock lock{buffer_cache.mutex};
             if (buffer_cache.IsRegionGpuModified(page_begin, page_end - page_begin)) {
-                VideoCommon::BackX::Mismatch("inline write into GPU-written buffer data", cpu_addr,
+                VideoCommon::BackX::Mismatch("inline write into GPU-written buffer data", *cpu_addr,
                                              copy_size);
-                buffer_cache.Nx2NoteListHostWrite(cpu_addr, copy_size);
-                uploaded = buffer_cache.InlineMemory(cpu_addr, copy_size, memory);
+                buffer_cache.Nx2NoteListHostWrite(*cpu_addr, copy_size);
+                uploaded = buffer_cache.InlineMemory(*cpu_addr, copy_size, memory);
             }
         }
     } else {
         std::scoped_lock lock{buffer_cache.mutex};
         // Guest memory has the words now: a command list copy of the page no longer does.
-        buffer_cache.Nx2NoteListHostWrite(cpu_addr, copy_size);
-        uploaded = buffer_cache.InlineMemory(cpu_addr, copy_size, memory);
+        buffer_cache.Nx2NoteListHostWrite(*cpu_addr, copy_size);
+        uploaded = buffer_cache.InlineMemory(*cpu_addr, copy_size, memory);
         if (!uploaded && !defer) {
-            buffer_cache.WriteMemory(cpu_addr, copy_size);
+            buffer_cache.WriteMemory(*cpu_addr, copy_size);
         }
     }
     return uploaded;
@@ -5892,7 +5845,7 @@ bool RasterizerVulkan::PostInlineToMemory(GPUVAddr address, size_t copy_size,
     {
         // Uploads into GPU-written buffer data go in the op, played where the lent call ran.
         const BufferArena::Collect collect{inline_commands};
-        uploaded = InlineBufferHalf(*cpu_addr, copy_size, memory, true);
+        uploaded = InlineBufferHalf(*cpu_addr, copy_size, memory);
     }
     const bool query = query_cache.page_filter.Any(*cpu_addr, copy_size);
     if (!uploaded) {
@@ -5905,17 +5858,17 @@ bool RasterizerVulkan::PostInlineToMemory(GPUVAddr address, size_t copy_size,
     commands.Swap(inline_commands);
     const u64 stamp = commands.Empty() ? 0 : buffer_cache_runtime.Arena().CloseCollected();
     PostRenderOp(GpuSplit::PostedOp::Inline, [this, commands = std::move(commands), stamp,
-                                              addr = *cpu_addr, copy_size, query, uploaded] {
+                                              device = *cpu_addr, copy_size, query, uploaded] {
         if (!commands.Empty()) {
             buffer_cache_runtime.Arena().PlayCollected(commands, stamp);
         }
         // Pending query results must not land over the new words later.
         if (query) {
-            query_cache.InvalidateRegion(addr, copy_size);
+            query_cache.InvalidateRegion(device, copy_size);
         }
         if (uploaded) {
             std::scoped_lock lock{texture_cache.mutex};
-            texture_cache.WriteMemory(addr, copy_size);
+            texture_cache.WriteMemory(device, copy_size);
         }
     });
     return true;
@@ -5923,7 +5876,7 @@ bool RasterizerVulkan::PostInlineToMemory(GPUVAddr address, size_t copy_size,
 
 void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                                 std::span<const u8> memory) {
-    if (scheduler.RenderRecordersEnabled() && PostInlineToMemory(address, copy_size, memory)) {
+    if (PostInlineToMemory(address, copy_size, memory)) {
         return;
     }
     RENDER_LEND(AccelerateInlineToMemory(address, copy_size, memory))
@@ -5935,7 +5888,7 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
     }
     gpu_memory->WriteBlockUnsafe(address, memory.data(), copy_size);
     const bool defer = InlineDefers();
-    const bool uploaded = InlineBufferHalf(*cpu_addr, copy_size, memory, defer);
+    const bool uploaded = InlineBufferHalf(*cpu_addr, copy_size, memory);
     // Pending query results must not land over the new words later: drop them now.
     query_cache.InvalidateRegion(*cpu_addr, copy_size);
     if (!uploaded && defer) {

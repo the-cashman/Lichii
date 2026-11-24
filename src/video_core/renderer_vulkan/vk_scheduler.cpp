@@ -112,8 +112,6 @@ void Scheduler::CommandChunk::ExecuteAll(vk::CommandBuffer cmdbuf,
 
 Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
     : device{device_}, state_tracker{state_tracker_},
-      render_recorders{VideoCommon::GpuSplit::RenderThreadOn()},
-      buffer_arena{render_recorders && VideoCommon::GpuSplit::RenderSwitch("EDEN_NX2_BUFFER_ARENA")},
       master_semaphore{std::make_unique<MasterSemaphore>(device)},
       command_pool{std::make_unique<CommandPool>(*master_semaphore, device)},
       upload_batch{std::make_unique<UploadBatch>()} {
@@ -178,11 +176,6 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
     AcquireNewChunk();
     AllocateWorkerCommandBuffer();
     worker_thread = std::jthread([this](std::stop_token token) { WorkerThread(token); });
-}
-
-void Scheduler::JoinActiveRecorders(std::source_location site) {
-    VideoCommon::GpuSplit::JoinRender(site);
-    BufferArena::PlayPending();
 }
 
 Scheduler::~Scheduler() {

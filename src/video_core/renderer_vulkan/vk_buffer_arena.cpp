@@ -37,37 +37,10 @@ constexpr VkMemoryBarrier POST_COPY_BARRIER{
 };
 using VertexArray = boost::container::static_vector<VkDeviceSize, VideoCommon::NUM_VERTEX_BUFFERS>;
 using HandleArray = boost::container::static_vector<VkBuffer, VideoCommon::NUM_VERTEX_BUFFERS>;
-
-void RecordVertices(Scheduler& scheduler, u32 first, bool extended, HandleArray&& buffers,
-                    VertexArray&& offsets, VertexArray&& sizes, VertexArray&& strides) {
-    if (extended) {
-        scheduler.Record([first, buffers = std::move(buffers), offsets = std::move(offsets),
-                          sizes = std::move(sizes), strides = std::move(strides)](
-                             vk::CommandBuffer cmdbuf) {
-            cmdbuf.BindVertexBuffers2EXT(first, static_cast<u32>(buffers.size()), buffers.data(),
-                                         offsets.data(), sizes.data(), strides.data());
-        });
-        return;
-    }
-    scheduler.Record([first, buffers = std::move(buffers), offsets = std::move(offsets)](
-                         vk::CommandBuffer cmdbuf) {
-        cmdbuf.BindVertexBuffers(first, static_cast<u32>(buffers.size()), buffers.data(),
-                                 offsets.data());
-    });
-}
-
-void RecordFeedback(Scheduler& scheduler, u32 first, HandleArray&& buffers, VertexArray&& offsets,
-                    VertexArray&& sizes) {
-    scheduler.Record([first, buffers = std::move(buffers), offsets = std::move(offsets),
-                      sizes = std::move(sizes)](vk::CommandBuffer cmdbuf) {
-        cmdbuf.BindTransformFeedbackBuffersEXT(first, static_cast<u32>(buffers.size()),
-                                               buffers.data(), offsets.data(), sizes.data());
-    });
-}
 } // Anonymous namespace
 
 BufferArena::BufferArena(const Device& device_, Scheduler& scheduler_)
-    : device{device_}, scheduler{scheduler_}, enabled{scheduler_.BufferArenaEnabled()} {
+    : device{device_}, scheduler{scheduler_}, enabled{Enabled()} {
     checks_records.store(enabled, std::memory_order_relaxed);
     if (enabled) {
         LOG_INFO(Render_Vulkan, "EDEN_NX2_BUFFER_ARENA: buffer commands queued by value");
@@ -94,21 +67,25 @@ BufferArena::~BufferArena() {
     }
 }
 
+bool BufferArena::Enabled() {
+    return VideoCommon::GpuSplit::RenderSwitch("EDEN_NX2_BUFFER_ARENA");
+}
+
 template <typename Body, typename E>
 void BufferArena::Submit(Op op, const Body& body, std::span<const E> array) {
+    if (collecting != nullptr) {
+        if (collecting->Empty()) {
+            collect_stamp = clock.Now();
+        }
+        collecting->Push(static_cast<u16>(op), body, array);
+        return;
+    }
+    if (enabled && VideoCommon::GpuSplit::OwnsScheduler()) {
+        queued.Push(static_cast<u16>(op), body, array);
+        pending = this;
+        return;
+    }
     if (enabled) {
-        if (collecting != nullptr) {
-            if (collecting->Empty()) {
-                collect_stamp = clock.Now();
-            }
-            collecting->Push(static_cast<u16>(op), body, array);
-            return;
-        }
-        if (VideoCommon::GpuSplit::OwnsScheduler()) {
-            queued.Push(static_cast<u16>(op), body, array);
-            pending = this;
-            return;
-        }
         ++direct_records;
     }
     Exec(body, array);
@@ -151,43 +128,13 @@ void BufferArena::BindVertex(u32 index, VkBuffer buffer, VkDeviceSize offset, Vk
     Submit(Op::BindVertex, BindVertexBody{buffer, offset, size, stride, index, extended});
 }
 
-void BufferArena::BindVertices(u32 first, std::span<const VkBuffer> buffers,
-                               std::span<const u64> offsets, std::span<const u64> sizes,
-                               std::span<const u64> strides, bool extended) {
-    if (!enabled) {
-        const size_t count = buffers.size();
-        offsets = offsets.first(count);
-        sizes = sizes.first(count);
-        strides = strides.first(count);
-        RecordVertices(scheduler, first, extended, HandleArray{buffers.begin(), buffers.end()},
-                       VertexArray{offsets.begin(), offsets.end()},
-                       extended ? VertexArray{sizes.begin(), sizes.end()} : VertexArray{},
-                       extended ? VertexArray{strides.begin(), strides.end()} : VertexArray{});
-        return;
-    }
-    boost::container::static_vector<VertexBinding, VideoCommon::NUM_VERTEX_BUFFERS> bindings;
-    for (size_t i = 0; i < buffers.size(); ++i) {
-        bindings.push_back({buffers[i], offsets[i], sizes[i], strides[i]});
-    }
-    Submit(Op::BindVertices, BindVerticesBody{first, extended},
-           std::span<const VertexBinding>{bindings});
+void BufferArena::BindVertices(u32 first, std::span<const VertexBinding> bindings,
+                               bool extended) {
+    Submit(Op::BindVertices, BindVerticesBody{first, extended}, bindings);
 }
 
-void BufferArena::BindTransformFeedback(u32 first, std::span<const VkBuffer> buffers,
-                                        std::span<const u64> offsets, std::span<const u64> sizes) {
-    if (!enabled) {
-        offsets = offsets.first(buffers.size());
-        sizes = sizes.first(buffers.size());
-        RecordFeedback(scheduler, first, HandleArray{buffers.begin(), buffers.end()},
-                       VertexArray{offsets.begin(), offsets.end()},
-                       VertexArray{sizes.begin(), sizes.end()});
-        return;
-    }
-    boost::container::static_vector<VertexBinding, VideoCommon::NUM_VERTEX_BUFFERS> bindings;
-    for (size_t i = 0; i < buffers.size(); ++i) {
-        bindings.push_back({buffers[i], offsets[i], sizes[i], 0});
-    }
-    Submit(Op::BindTransformFeedback, BindFeedbackBody{first}, std::span<const VertexBinding>{bindings});
+void BufferArena::BindTransformFeedback(u32 first, std::span<const VertexBinding> bindings) {
+    Submit(Op::BindTransformFeedback, BindFeedbackBody{first}, bindings);
 }
 
 u64 BufferArena::Now() const noexcept {
@@ -291,9 +238,9 @@ void BufferArena::CheckRecord(const char* where, std::source_location location) 
     }
 }
 
-BufferArena::ImmediateScope::ImmediateScope(BufferArena& arena) noexcept : enabled{arena.enabled} {
-    if (enabled) {
-        ++immediate_depth;
+BufferArena::ImmediateScope::ImmediateScope(BufferArena& arena) noexcept {
+    ++immediate_depth;
+    if (arena.enabled) {
         arena.immediates.fetch_add(1, std::memory_order_relaxed);
     }
 }
@@ -303,20 +250,22 @@ void BufferArena::Exec(const OutsideBody& body, std::span<const u8>) {
 }
 
 void BufferArena::Exec(const CopyBody& body, std::span<const VkBufferCopy> span) {
-    if (body.mode == CopyMode::Batched) {
-        scheduler.RecordUpload(body.src, body.dst, span);
-        return;
-    }
     boost::container::small_vector<VkBufferCopy, 8> copies(span.begin(), span.end());
-    if (body.mode == CopyMode::UploadBuffer) {
+    switch (body.mode) {
+    case CopyMode::UploadBuffer:
         scheduler.RecordWithUploadBuffer(
-            [src = body.src, dst = body.dst, copies = std::move(copies)](
-                vk::CommandBuffer, vk::CommandBuffer upload_cmdbuf) {
+            [src = body.src, dst = body.dst, copies](vk::CommandBuffer,
+                                                     vk::CommandBuffer upload_cmdbuf) {
                 upload_cmdbuf.CopyBuffer(src, dst, copies);
             });
         return;
+    case CopyMode::Batched:
+        scheduler.RecordUpload(body.src, body.dst, span);
+        return;
+    case CopyMode::Plain:
+        break;
     }
-    scheduler.Record([src = body.src, dst = body.dst, copies = std::move(copies),
+    scheduler.Record([src = body.src, dst = body.dst, copies,
                       barrier = body.barrier](vk::CommandBuffer cmdbuf) {
         if (barrier) {
             cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
@@ -464,8 +413,18 @@ void BufferArena::Exec(const BindVerticesBody& body, std::span<const VertexBindi
         sizes.push_back(binding.size);
         strides.push_back(binding.stride);
     }
-    RecordVertices(scheduler, body.first, body.extended, std::move(buffers), std::move(offsets),
-                   std::move(sizes), std::move(strides));
+    if (body.extended) {
+        scheduler.Record([first = body.first, buffers, offsets, sizes,
+                          strides](vk::CommandBuffer cmdbuf) {
+            cmdbuf.BindVertexBuffers2EXT(first, static_cast<u32>(buffers.size()), buffers.data(),
+                                         offsets.data(), sizes.data(), strides.data());
+        });
+        return;
+    }
+    scheduler.Record([first = body.first, buffers, offsets](vk::CommandBuffer cmdbuf) {
+        cmdbuf.BindVertexBuffers(first, static_cast<u32>(buffers.size()), buffers.data(),
+                                 offsets.data());
+    });
 }
 
 void BufferArena::Exec(const BindFeedbackBody& body, std::span<const VertexBinding> bindings) {
@@ -476,7 +435,10 @@ void BufferArena::Exec(const BindFeedbackBody& body, std::span<const VertexBindi
         offsets.push_back(binding.offset);
         sizes.push_back(binding.size);
     }
-    RecordFeedback(scheduler, body.first, std::move(buffers), std::move(offsets), std::move(sizes));
+    scheduler.Record([first = body.first, buffers, offsets, sizes](vk::CommandBuffer cmdbuf) {
+        cmdbuf.BindTransformFeedbackBuffersEXT(first, static_cast<u32>(buffers.size()),
+                                               buffers.data(), offsets.data(), sizes.data());
+    });
 }
 
 } // namespace Vulkan

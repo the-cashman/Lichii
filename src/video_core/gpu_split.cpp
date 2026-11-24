@@ -166,6 +166,9 @@ bool GpuSplit::RenderThreadOn() {
 }
 
 bool GpuSplit::RenderSwitch(const char* name) {
+    if (!RenderThreadOn()) {
+        return false;
+    }
     const char* const value = std::getenv(name);
     return value == nullptr || value[0] != '0';
 }
@@ -208,7 +211,7 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     // EDEN_NX2_RENDER_FOLLOWER: record warm direct draws on GPURender. Off by default; the
     // render_thread setting or EDEN_NX2_RENDER_FOLLOWER=1 turns it on with every switch of the port
     // below, <switch>=0 turns one off. EDEN_NX2_RENDER_FOLLOWER overrides the setting either way.
-    const bool render_requested = render_follower_requested;
+    const bool render_requested = RenderSwitch("EDEN_NX2_RENDER_FOLLOWER");
     const char* const follower_env = std::getenv("EDEN_NX2_RENDER_FOLLOWER");
     LOG_INFO(HW_GPU, "GPU render thread: {} ({})", render_requested ? "on" : "off",
              follower_env != nullptr ? fmt::format("EDEN_NX2_RENDER_FOLLOWER={}", follower_env)
@@ -238,7 +241,8 @@ void GpuSplit::MaybeStart(Core::System& system_) {
         render_owns = RenderSwitch("EDEN_NX2_RENDER_OWNS");
         // EDEN_NX2_RENDER_UNLEND=1: warm direct draws go to GPURender unlent.
         const bool unlend_wanted = RenderSwitch("EDEN_NX2_RENDER_UNLEND");
-        render_unlend = render_owns && render_follower_arena && unlend_wanted;
+        const bool arena = RenderSwitch("EDEN_NX2_BUFFER_ARENA");
+        render_unlend = render_owns && arena && unlend_wanted;
         // EDEN_NX2_RENDER_WAITS_E=1: the front's game memory and list waits read the back's
         // position (Fritchii 347d15c12).
         const bool waits_wanted = RenderSwitch("EDEN_NX2_RENDER_WAITS_E");
@@ -257,11 +261,11 @@ void GpuSplit::MaybeStart(Core::System& system_) {
                           "EDEN_NX2_RENDER_POST_WFI",         "EDEN_NX2_RENDER_POST_FENCE_REPORT",
                           "EDEN_NX2_RENDER_LIST_WORDS_E"};
         for (size_t op = 0; op < posts.size(); ++op) {
-            const bool post_wanted = RenderSwitch(post_switches[op]);
-            posts[op] = post_wanted && render_unlend;
+            const bool wanted = RenderSwitch(post_switches[op]);
+            posts[op] = wanted && render_unlend;
             posted[op] = 0;
             fences_lent = {};
-            if (post_wanted && !render_unlend) {
+            if (wanted && !render_unlend) {
                 LOG_WARNING(HW_GPU, "{} needs EDEN_NX2_RENDER_UNLEND=1: ignored",
                             post_switches[op]);
             }
@@ -552,12 +556,8 @@ void GpuSplit::Publish() {
 void GpuSplit::Drain(DrainSite site) {
     FlushState();
     const bool on_engine = UsesEngine(site);
-    const auto reached = [&] {
-        return on_engine ? ReachedOnEngine(write_position, std::memory_order_acquire)
-                         : consumed_cache >= write_position;
-    };
     consumed_cache = FrontPosition(std::memory_order_acquire);
-    if (reached() && BackQuiet()) {
+    if (Reached(write_position, on_engine, std::memory_order_acquire) && BackQuiet()) {
         return;
     }
     Publish();
@@ -570,9 +570,9 @@ void GpuSplit::Drain(DrainSite site) {
     bool hook_asked = false;
     for (u32 spins = 0;; ++spins) {
         consumed_cache = FrontPosition(std::memory_order_acquire);
-        if (reached()) {
+        if (Reached(write_position, on_engine, std::memory_order_acquire)) {
             if (BackQuiet()) {
-                if (on_engine && consumed_cache < write_position) {
+                if (consumed_cache != write_position) {
                     engine_early.fetch_add(1, std::memory_order_relaxed);
                 }
                 publish_every = 8;
@@ -925,12 +925,8 @@ bool GpuSplit::WaitForSyncedWriters() {
 bool GpuSplit::WaitFor(u64 target, DrainSite site) {
     FlushState();
     const bool on_engine = UsesEngine(site);
-    const auto reached = [&](u64 position) {
-        return on_engine ? ReachedOnEngine(position, std::memory_order_acquire)
-                         : consumed_cache >= position;
-    };
     consumed_cache = FrontPosition(std::memory_order_acquire);
-    if (reached(target)) {
+    if (Reached(target, on_engine, std::memory_order_acquire)) {
         return false;
     }
     Nx2Profile::Scope scope{Nx2Profile::Zone::WriterWait};
@@ -953,7 +949,7 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
     for (u32 spins = 0;; ++spins) {
         consumed_cache = FrontPosition(std::memory_order_acquire);
         if (past_release && !release_ran) {
-            if (!reached(release)) {
+            if (!Reached(release, on_engine, std::memory_order_acquire)) {
                 Backoff(spins, release, on_engine);
                 continue;
             }
@@ -961,8 +957,8 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
             wait_target.store(target, std::memory_order_seq_cst);
             spins = 0;
         }
-        if (reached(target)) {
-            if (on_engine && consumed_cache < target) {
+        if (Reached(target, on_engine, std::memory_order_acquire)) {
+            if (consumed_cache < target) {
                 engine_early.fetch_add(1, std::memory_order_relaxed);
             }
             wait_target.store(~u64{0}, std::memory_order_relaxed);
@@ -1000,7 +996,10 @@ bool GpuSplit::SiteOnEngine(DrainSite site) noexcept {
     }
 }
 
-bool GpuSplit::ReachedOnEngine(u64 target, std::memory_order order) const {
+bool GpuSplit::Reached(u64 target, bool on_engine, std::memory_order order) const {
+    if (!on_engine) {
+        return FrontPosition(order) >= target;
+    }
     // The back ran `target`, and GPURender played the newest guest write op from before it. The
     // mark is read after "consumed": an op in an entry the back ran is in it. A newer mark (at
     // `target` or later) may hide an older one: then GPURender's position.

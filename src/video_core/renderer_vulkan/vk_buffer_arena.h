@@ -35,6 +35,8 @@ public:
     BufferArena(const BufferArena&) = delete;
     BufferArena& operator=(const BufferArena&) = delete;
 
+    [[nodiscard]] static bool Enabled();
+
     void OutsideRenderPass(std::source_location location = std::source_location::current());
     void Copy(VkBuffer src, VkBuffer dst, std::span<const VkBufferCopy> copies, CopyMode mode,
               bool barrier);
@@ -48,10 +50,14 @@ public:
     void BindIndex(VkBuffer buffer, VkDeviceSize offset, VkIndexType type, bool tracked);
     void BindVertex(u32 index, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size,
                     VkDeviceSize stride, bool extended);
-    void BindVertices(u32 first, std::span<const VkBuffer> buffers, std::span<const u64> offsets,
-                      std::span<const u64> sizes, std::span<const u64> strides, bool extended);
-    void BindTransformFeedback(u32 first, std::span<const VkBuffer> buffers,
-                               std::span<const u64> offsets, std::span<const u64> sizes);
+    struct VertexBinding {
+        VkBuffer buffer;
+        VkDeviceSize offset;
+        VkDeviceSize size;
+        VkDeviceSize stride;
+    };
+    void BindVertices(u32 first, std::span<const VertexBinding> bindings, bool extended);
+    void BindTransformFeedback(u32 first, std::span<const VertexBinding> bindings);
 
     /// The stamp of what is recorded now (buffer usage, the buffer staging pool).
     [[nodiscard]] u64 Now() const noexcept;
@@ -106,21 +112,12 @@ public:
 
     /// Marks code whose scheduler use belongs to the buffer side.
     struct SideScope {
-        SideScope() noexcept
-            : tracking{checks_records.load(std::memory_order_relaxed) &&
-                       VideoCommon::GpuSplit::check_owner} {
-            if (tracking) {
-                ++side_depth;
-            }
+        SideScope() noexcept {
+            ++side_depth;
         }
         ~SideScope() {
-            if (tracking) {
-                --side_depth;
-            }
+            --side_depth;
         }
-
-    private:
-        const bool tracking;
     };
     /// A buffer side path that records or syncs on the scheduler directly (compute passes, host
     /// read syncs, list word patches): counted, and lent or posted when GPURender owns the
@@ -128,13 +125,8 @@ public:
     struct ImmediateScope {
         explicit ImmediateScope(BufferArena& arena_) noexcept;
         ~ImmediateScope() {
-            if (enabled) {
-                --immediate_depth;
-            }
+            --immediate_depth;
         }
-
-    private:
-        const bool enabled;
     };
 
 private:
@@ -193,12 +185,6 @@ private:
         VkDeviceSize stride;
         u32 index;
         bool extended;
-    };
-    struct VertexBinding {
-        VkBuffer buffer;
-        VkDeviceSize offset;
-        VkDeviceSize size;
-        VkDeviceSize stride;
     };
     struct BindVerticesBody {
         u32 first;
