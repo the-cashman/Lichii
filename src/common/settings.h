@@ -983,6 +983,15 @@ struct Values {
     // Ryuhdr 0.2.6's recommended mode. Read by the SDL driver on every vibration, so a change in
     // the HD Rumble dialog applies to connected controllers right away.
     Setting<bool> hd_rumble_enabled{linkage, true, "hd_rumble_enabled", Category::Controls};
+    // Switch 2 rumble Mode last sent by the guest (commands 213 / 214): 2 = Mode 2, anything else
+    // is played as Switch 1. Written by the HID service, read by the RenHDrum pad driver. Not a
+    // user setting and not saved.
+    std::atomic<int> nx2_active_mode{0};
+    // Set by the input layer when the RenHDrum library is actually loaded; never saved. HD Rumble
+    // can be enabled in the config with no library next to the emulator, in which case the standard
+    // rumble runs and the 15 ms packet filter has to stay in place.
+    Setting<bool> renhdrum_available{linkage, false, "renhdrum_available", Category::Controls,
+                                     Specialization::Default, false};
     // Amplitude gain in percent for everything RenHDrum plays. Switchable: some Switch 2 games
     // (Ocarina of Time) send amplitudes below 0.1 that the Joy-Con 2 still plays strongly.
     SwitchableSetting<int> hd_rumble_gain{linkage, 100, "hd_rumble_gain", Category::Controls};
@@ -1002,6 +1011,22 @@ struct Values {
     Setting<bool> hd_rumble_bt_fast{linkage, true, "hd_rumble_bt_fast", Category::Controls};
     Setting<bool> hd_rumble_bt_crisp_notes{linkage, true, "hd_rumble_bt_crisp_notes",
                                            Category::Controls};
+    // RenHDrum 0.5.0 options-table rows that had no Eglantine setting yet.
+    // Bluetooth basic mode: 0 = Detailed (5 ms envelope), 1 = Compatible (plain, every adapter).
+    Setting<int> hd_rumble_bt_mode{linkage, 0, "hd_rumble_bt_mode", Category::Controls};
+    // Transport switches. usb_no_queue and auto_slow only bite with the patched SDL transport;
+    // with stock SDL the driver clears them, as it already does for the transport modes.
+    Setting<bool> hd_rumble_usb_no_queue{linkage, true, "hd_rumble_usb_no_queue",
+                                         Category::Controls};
+    Setting<bool> hd_rumble_frequency_both_bands{linkage, true, "hd_rumble_frequency_both_bands",
+                                                 Category::Controls};
+    Setting<bool> hd_rumble_usb_auto_slow{linkage, true, "hd_rumble_usb_auto_slow",
+                                          Category::Controls};
+    // RenHDrum 0.5.0 HD Haptics: the controller speaker and the L2/R2 trigger kick react to the
+    // rumble. Host-side only: the speaker and trigger blocks are sent by the pad driver.
+    Setting<bool> dualsense_hd_haptics{linkage, true, "dualsense_hd_haptics", Category::Controls};
+    Setting<int> dualsense_speaker_volume{linkage, 60, "dualsense_speaker_volume",
+                                          Category::Controls};
     Setting<bool> dualsense_haptics_enabled{linkage, true, "dualsense_haptics_enabled",
                                             Category::Controls};
     Setting<int> dualsense_haptics_volume{linkage, 100, "dualsense_haptics_volume", Category::Controls};
@@ -1201,10 +1226,6 @@ struct Values {
 };
 
 extern Values values;
-
-// Switch 2 rumble Mode the guest sent last (HID 213 / 214): 2 = Mode 2, else 0. Written by the HID
-// service, read by the RenHDrum pad driver (renhdrum_set_nx2_mode). Not a user setting.
-inline std::atomic<int> nx2_active_mode{0};
 
 struct NvidiaDlssRuntimeSettings {
     NvidiaDlssQuality quality;

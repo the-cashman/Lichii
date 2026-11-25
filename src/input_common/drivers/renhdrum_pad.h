@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <vector>
 
 #include <SDL3/SDL.h>
 
@@ -30,6 +32,28 @@ int GetRenHDrumXboxTriggers();
 /// True when an official Xbox controller is connected but its trigger motors are out of reach:
 /// on Windows SDL drives them only through raw input ("Enable XInput 8 player support").
 bool GetRenHDrumXboxNeedsRawInput();
+
+/// One row of RenHDrum's settings table, as the loaded library publishes it. The dialog builds
+/// its rows from this so every option appears exactly as the engine knows it.
+struct RenHDrumOption {
+    std::string key;
+    std::string label;
+    std::string help;
+    std::vector<std::string> choices;
+    int kind{};         // 0 bool, 1 int, 2 choice (value = index)
+    int min{};
+    int max{};
+    int step{};
+    int def{};
+    unsigned devices{}; // bit 1 Switch, 2 DualSense, 4 Xbox, 8 Steam
+    int tier{};         // 0 basic, 1 advanced
+    int link{};         // 0 any, 1 wired only, 2 Bluetooth only
+    int requires_row{}; // row index that must be non-zero for this row to matter, -1 none
+};
+
+/// The library's settings table. When the library predates it (pre-0.5.0), a copy of the 0.5.0
+/// table stands in so the dialog keeps working; the values still bind to Eglantine's settings.
+std::vector<RenHDrumOption> GetRenHDrumOptions();
 
 /**
  * Vibration for one SDL controller through RenHDrum (https://github.com/trzz1214/RenHDrum):
