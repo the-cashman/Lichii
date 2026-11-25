@@ -3947,6 +3947,12 @@ private:
             // movie: Ocarina of Time's title movie went in at ~330 packets a second (2,600
             // queued), and until the last was in, its pictures came at 20-28 fps, so the video
             // started ~11 s behind its audio. End of stream is never refused.
+            // The next AV1 stream can start before an old EOS finishes writing its image.
+            // Even a busy submit must be able to see the next transition back to ready.
+            if (m_parallel_decode && !end) {
+                m_stream_ended = false;
+                m_end_queued = false;
+            }
             if (!m_inputs.Submit(std::move(input))) {
                 m_ready->room.store(false, std::memory_order_relaxed);
                 if (Nx2VideoTraceEnabled()) {
@@ -4208,9 +4214,11 @@ private:
                 m_outputs.push_back({image, width, height, frame.pts, frame.end});
                 const bool current_generation = generation == m_decoded.Generation();
                 if (frame.end && current_generation) {
-                    m_stream_ended = true;
-                    m_end_queued = false;
-                    m_ready->room.store(false, std::memory_order_relaxed);
+                    if (!parallel || frame.submission == m_inputs.LastSubmission()) {
+                        m_stream_ended = true;
+                        m_end_queued = false;
+                        m_ready->room.store(false, std::memory_order_relaxed);
+                    }
                 }
                 if (parallel || !current_generation) {
                     // Stop can have completed this handout even before the worker took its image.
@@ -4355,16 +4363,12 @@ private:
             }
             m_last_decoded_pts = pts;
             // Set EOS before publishing the last frame: the output worker may take it immediately.
-            m_decoded.Push({std::move(picture), pts, input.end && i + 1 == pictures.size()},
-                           generation, capacity);
+            const bool end = input.end && i + 1 == pictures.size();
+            m_decoded.Push({std::move(picture), pts, end, input.submission}, generation, capacity);
             m_cv.notify_all();
         }
         if (input.end && pictures.empty()) {
-            if (m_decoded.Empty()) {
-                m_decoded.Push({std::nullopt, input.pts, true}, generation, capacity);
-            } else {
-                m_decoded.Back().end = true;
-            }
+            m_decoded.MarkEnd(input.pts, input.submission);
         }
         pictures.clear();
         m_cv.notify_all();

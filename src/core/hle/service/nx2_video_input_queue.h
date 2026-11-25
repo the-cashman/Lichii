@@ -18,12 +18,14 @@ public:
         std::vector<u8> data;
         u64 pts;
         bool end;
+        u64 submission{};
     };
 
     /// The decoder refuses packets (nn::codec 3603, busy) from this many on.
     static constexpr size_t RefuseAt = 24;
 
     void Push(Input input) {
+        input.submission = ++last_submission;
         inputs.push_back(std::move(input));
     }
 
@@ -33,6 +35,8 @@ public:
     /// in 4 ms when it loops), so the held packet goes in ahead of the next one. A lost packet
     /// leaves VP9 decoding against missing references until the next keyframe.
     bool Submit(Input input) {
+        // A busy submit also establishes that the client is waiting to feed the next stream.
+        input.submission = ++last_submission;
         if (held) {
             if (held->pts != input.pts || held->data != input.data) {
                 inputs.push_back(std::move(*held));
@@ -62,6 +66,10 @@ public:
         return inputs.empty();
     }
 
+    u64 LastSubmission() const {
+        return last_submission;
+    }
+
     size_t Size() const {
         return inputs.size();
     }
@@ -79,6 +87,7 @@ public:
 private:
     std::deque<Input> inputs;
     std::optional<Input> held; ///< The last refused packet, until the client's next one
+    u64 last_submission{};
 };
 
 } // namespace Service

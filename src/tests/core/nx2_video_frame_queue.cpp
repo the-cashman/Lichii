@@ -3,6 +3,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "core/hle/service/nx2_video_frame_queue.h"
+#include "core/hle/service/nx2_video_input_queue.h"
 
 namespace {
 using Service::Nx2VideoFrameQueue;
@@ -76,6 +77,33 @@ TEST_CASE("NX2 video bounds decoded lookahead and rejects work from a discarded 
     REQUIRE(queue.Push(Picture(0), queue.Generation()));
     REQUIRE_FALSE(queue.Front().end);
     REQUIRE(queue.Size() == 1);
+}
+
+TEST_CASE("A drained EOS retains the submission it ends when a later stream fills the queue",
+          "[nx2_video_frames]") {
+    Service::Nx2VideoInputQueue inputs;
+    Nx2VideoFrameQueue frames;
+    REQUIRE(inputs.Submit({{}, 0, true}));
+    const auto end = inputs.Pop();
+    SECTION("Drain attaches to the last decoded picture") {
+        REQUIRE(frames.Push(Picture(0), frames.Generation()));
+    }
+    SECTION("Drain produces an empty end marker") {
+        REQUIRE(frames.Empty());
+    }
+    frames.MarkEnd(end.pts, end.submission);
+    const auto writing = frames.Pop();
+    REQUIRE(writing.end);
+    REQUIRE(writing.submission == inputs.LastSubmission());
+    for (u64 i = 0; i < inputs.RefuseAt; ++i) {
+        REQUIRE(inputs.Submit({{0x31}, i, false}));
+    }
+    REQUIRE_FALSE(inputs.Submit({{0x32}, 90, false}));
+    REQUIRE(writing.submission != inputs.LastSubmission());
+    REQUIRE_FALSE(inputs.HasRoom());
+    const auto next = inputs.Pop();
+    REQUIRE(next.submission > writing.submission);
+    REQUIRE(inputs.HasRoom());
 }
 
 TEST_CASE("NX2 video bounded catch-up leaves a real picture and its final EOS",

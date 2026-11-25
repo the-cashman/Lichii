@@ -20,6 +20,7 @@ public:
         std::optional<Tegra::Host1x::Nx2Picture> picture;
         u64 pts;
         bool end;
+        u64 submission{};
     };
 
     static constexpr size_t Capacity = 8;
@@ -35,9 +36,6 @@ public:
     }
     const Frame& Front() const {
         return frames.front();
-    }
-    Frame& Back() {
-        return frames.back();
     }
     bool HasRoom(size_t capacity = Capacity) const {
         return frames.size() < capacity;
@@ -60,6 +58,17 @@ public:
         auto frame = std::move(frames.front());
         frames.pop_front();
         return frame;
+    }
+
+    // A drain without a new picture associates its EOS with the last queued picture.
+    // It still belongs to the input that ended the stream, even if another input follows.
+    void MarkEnd(u64 pts, u64 submission) {
+        if (frames.empty()) {
+            frames.push_back({std::nullopt, pts, true, submission});
+        } else {
+            frames.back().end = true;
+            frames.back().submission = submission;
+        }
     }
 
     // The parallel output path requires a real decoded successor; an empty EOS cannot replace
