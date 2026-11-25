@@ -3691,6 +3691,10 @@ private:
         u32 syncpoint;
         u32 value;
     };
+    struct FreeImage {
+        u32 image;
+        u32 completion;
+    };
 
     static constexpr u32 NoSyncpoint = ~0U;
     static constexpr size_t MaxDecodedAhead = 2; // decoded frames held while no image is free
@@ -3783,9 +3787,6 @@ private:
                 (codec == "video/av1" || codec == "video/av01");
             if (m_worker.joinable() && (m_parallel_decode || parallel)) {
                 DiscardPendingFrames();
-                m_stream_ended = false;
-                m_end_queued = false;
-                m_ready->room.store(true, std::memory_order_relaxed);
             }
             m_codec = std::move(codec);
             m_parallel_decode = parallel;
@@ -3844,7 +3845,6 @@ private:
         u32 value;
         {
             std::scoped_lock lk{m_mutex};
-            m_free.push_back(image);
             m_registered.insert(image);
             if (release_fence) {
                 m_release_fences[image] = *release_fence;
@@ -3859,15 +3859,21 @@ private:
                 system.GetApplicationProcessProgramID() == Settings::MarioKartWorldProgramId;
             if ((drain_eos || release_now) && release_fence && m_stream_ended && m_inputs.Empty() &&
                 m_decoded.Empty()) {
-                const u32 reached =
-                    drain_eos ? DrainFreeAsEndOfStream()
-                              : static_cast<u32>(system.Host1x().GetSyncpointManager()
-                                                     .GetGuestSyncpointValue(m_syncpoint));
-                m_sync_base = reached;
-                m_handed = 0;
-                value = reached;
+                value = static_cast<u32>(
+                    system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(m_syncpoint));
+                m_free.push_back({image, value});
+                if (drain_eos) {
+                    value = DrainFreeAsEndOfStream();
+                }
+                // An already-satisfied debug release leaves earlier AV1 promises in place.
+                if (!m_parallel_decode) {
+                    m_sync_base = value;
+                    m_handed = 0;
+                }
             } else {
-                value = m_sync_base + ++m_handed;
+                value = m_sync_base + m_handed + 1;
+                m_free.push_back({image, value});
+                ++m_handed;
             }
             if (Nx2VideoTraceEnabled()) {
                 LOG_INFO(Service,
@@ -3896,7 +3902,7 @@ private:
             const auto acquired = m_acquired_image;
             const auto is_acquired = [&](const Output& output) { return output.image == acquired; };
             if (acquired && *acquired != w[2] && m_registered.contains(*acquired) &&
-                std::ranges::find(m_free, *acquired) == m_free.end() &&
+                std::ranges::find(m_free, *acquired, &FreeImage::image) == m_free.end() &&
                 std::ranges::none_of(m_outputs, is_acquired)) {
                 const auto timing = m_parallel_decode ? Nx2MovieClock::ReleaseTiming::AlignAtStart
                                                       : Nx2MovieClock::ReleaseTiming::FollowClient;
@@ -3913,7 +3919,7 @@ private:
         const u32 image = ctx.CommandBuffer()[2];
         {
             std::scoped_lock lk{m_mutex};
-            std::erase(m_free, image);
+            std::erase_if(m_free, [image](const FreeImage& entry) { return entry.image == image; });
             m_registered.erase(image);
             m_release_fences.erase(image);
         }
@@ -3991,12 +3997,12 @@ private:
                 // Preserve the serial worker's existing deferred flush and output ordering.
                 m_inputs.Clear();
                 m_flush = true;
+                m_stream_ended = false;
+                m_end_queued = false;
+                m_ready->room.store(true, std::memory_order_relaxed);
             }
-            m_stream_ended = false;
-            m_end_queued = false;
             m_clock.Reset();
             m_stream_start.reset();
-            m_ready->room.store(true, std::memory_order_relaxed);
             // Only Stop: Bananza flushes (8) after its movies end and treats every completed
             // fence as a frame to acquire.
             if (ctx.GetCommand() == 207) {
@@ -4034,6 +4040,9 @@ private:
     void DiscardPendingFrames() {
         m_inputs.Clear();
         m_decoded.Reset();
+        m_stream_ended = false;
+        m_end_queued = false;
+        m_ready->room.store(true, std::memory_order_relaxed);
         m_flush = true;
         m_last_decoded_pts = 0;
         m_dropped_in_a_row = 0;
@@ -4086,13 +4095,18 @@ private:
         if (m_syncpoint == NoSyncpoint) {
             return;
         }
-        auto& syncpoints = system.Host1x().GetSyncpointManager();
         const u32 target = m_sync_base + m_handed;
-        u32 current = static_cast<u32>(syncpoints.GetGuestSyncpointValue(m_syncpoint));
         if (Nx2VideoTraceEnabled()) {
+            const auto current = system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(m_syncpoint);
             LOG_INFO(Service, "nx2:vdec trace complete fences syncpoint={} current={} target={}",
                      m_syncpoint, current, target);
         }
+        CompleteThrough(target);
+    }
+
+    void CompleteThrough(u32 target) {
+        auto& syncpoints = system.Host1x().GetSyncpointManager();
+        u32 current = static_cast<u32>(syncpoints.GetGuestSyncpointValue(m_syncpoint));
         while (static_cast<s32>(target - current) > 0) {
             syncpoints.IncrementGuest(m_syncpoint);
             ++current;
@@ -4176,11 +4190,7 @@ private:
                 const u64 decoded_frames = m_decoded_frames;
                 const std::string codec = m_codec;
                 const std::pair<u32, u32> configured_size{m_width, m_height};
-                const u32 completion_value =
-                    static_cast<u32>(
-                        system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(m_syncpoint)) +
-                    1;
-                const u32 image = m_free.front();
+                const auto [image, completion_value] = m_free.front();
                 m_free.pop_front();
                 std::optional<Fence> fence;
                 if (const auto it = m_release_fences.find(image); it != m_release_fences.end()) {
@@ -4202,13 +4212,11 @@ private:
                     m_end_queued = false;
                     m_ready->room.store(false, std::memory_order_relaxed);
                 }
-                auto& syncpoints = system.Host1x().GetSyncpointManager();
-                // Stop/finalize may already have completed this value while WriteImage ran.
-                if ((!parallel && current_generation) ||
-                    static_cast<s32>(
-                        completion_value -
-                        static_cast<u32>(syncpoints.GetGuestSyncpointValue(m_syncpoint))) > 0) {
-                    syncpoints.IncrementGuest(m_syncpoint);
+                if (parallel || !current_generation) {
+                    // Stop can have completed this handout even before the worker took its image.
+                    CompleteThrough(completion_value);
+                } else {
+                    system.Host1x().GetSyncpointManager().IncrementGuest(m_syncpoint);
                 }
                 m_last_output = m_outputs.back();
                 if (frame.end && current_generation && m_inputs.Empty() && m_decoded.Empty() &&
@@ -4369,7 +4377,7 @@ private:
                      m_syncpoint, m_free.size());
         }
         while (!m_free.empty()) {
-            const u32 image = m_free.front();
+            const u32 image = m_free.front().image;
             m_free.pop_front();
             m_release_fences.erase(image);
             m_outputs.push_back({image, m_last_output.width, m_last_output.height, m_last_output.pts, true});
@@ -4565,7 +4573,7 @@ private:
     std::optional<std::pair<s64, u64>> m_stream_start; ///< Host time (us) and pts of its first frame
     Nx2VideoInputQueue m_inputs;
     Nx2VideoFrameQueue m_decoded;      ///< Waiting for a free output image
-    std::deque<u32> m_free;            ///< Output images, in the order the client acquires them
+    std::deque<FreeImage> m_free;      ///< Each registered/released image and its promised value
     std::map<u32, Fence> m_release_fences;
     std::deque<Output> m_outputs;      ///< Finished, for 213
     std::optional<u32> m_acquired_image; ///< The output image the client acquired last
