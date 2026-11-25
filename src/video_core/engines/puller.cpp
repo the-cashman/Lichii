@@ -215,7 +215,7 @@ void VerifyWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcquire& acq
     }
 }
 
-// [bazzite acq] EDEN_NX2_ACQ_UNMET_DEFER=1: an acquire whose word, read without a drain once the
+// [bazzite acq] EDEN_NX2_ACQ_UNMET_DEFER=1: an equal or mask acquire whose word, read without a drain once the
 // recorded writes over it ran (EDEN_NX2_ACQUIRE_POLL), doesn't meet it, and with no release to it
 // the front knows of (EDEN_NX2_SEM_PREDICT), suspends without the narrowed read (it waits for
 // every dispatch sent) and the full drain, and its fence release is queued to the back instead of
@@ -269,10 +269,14 @@ struct AcqWaitScope {
 
 // Whether an acquire not met by `polled` (read without a drain) skips the narrowed read and the
 // drain: the switch, and no release to the word the front knows of.
-bool SkipUnmetDrain(DmaPusher& dma_pusher, GPUVAddr address, bool polled, bool defer) {
-    if (!defer || !polled || VideoCommon::GpuSplit::NarrowVerify()) {
+bool SkipUnmetDrain(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire, bool polled,
+                    bool defer) {
+    // Not greater-or-equal ones: the narrowed read meets those where a dispatch's release is
+    // still queued (Bananza: ~35 per 10 s on one word, which a skip left to the next poll).
+    if (!defer || !polled || acquire.WaitsToReach() || VideoCommon::GpuSplit::NarrowVerify()) {
         return false;
     }
+    const GPUVAddr address = acquire.address;
     auto& split = VideoCommon::GpuSplit::Get();
     return split.Active() && split.NarrowDrains() &&
            !(split.SemaphorePredict() &&
@@ -407,7 +411,7 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     }
     const bool defer = AcqUnmetDefer();
     const AcqWaitScope wait_scope{defer};
-    const bool skip = !overdue && SkipUnmetDrain(dma_pusher, pending_acquire->address,
+    const bool skip = !overdue && SkipUnmetDrain(dma_pusher, *pending_acquire,
                                                   polled.has_value(), defer);
     // Not met in guest memory: the release may still be queued for the back (one the front
     // doesn't record, such as a QMD release or a report). Check it as below rather than wait for
@@ -695,7 +699,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         }
         const bool defer = AcqUnmetDefer();
         const AcqWaitScope wait_scope{defer};
-        const bool skip = SkipUnmetDrain(dma_pusher, acquire.address, polled.has_value(), defer);
+        const bool skip = SkipUnmetDrain(dma_pusher, acquire, polled.has_value(), defer);
         // Not met in guest memory: the release may still be queued for the back, so check it
         // with the drained read below before suspending (see CanResumeAcquire). Suspending at
         // once left the channel to the pending-channel polling, whose latency halved the FPS.
