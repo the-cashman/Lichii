@@ -408,6 +408,8 @@ private:
     u32 oot_jitter_phases{8}; ///< Halton sequence length for the last FSR frame's scale
     std::optional<u64> oot_4k_scene_frame;
     VkImage oot_4k_guest_present{};
+    /// Marks Ocarina's effects scene for FSR when its view is still the one the fog draw saw.
+    void MarkOcarinaEffectsIfAlive();
     std::optional<u64> oot_effects_frame;
     GPUVAddr oot_effects_address{};
     VideoCommon::ImageViewId oot_effects_view{};

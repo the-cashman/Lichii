@@ -586,9 +586,9 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
             gpu.ForEachPendingCpuWrite(callback);
         });
     buffer_cache.SetReadRunPageFilter([this](DAddr addr, u64 size) {
+        // (No owed list slots in this tree: only texture and query pages hold reads back.)
         return !texture_cache.page_filter.Any(addr, size) &&
-               !query_cache.page_filter.Any(addr, size) &&
-               !buffer_cache_runtime.Nx2Slots().HasOwed();
+               !query_cache.page_filter.Any(addr, size);
     });
     VideoCommon::GpuSplit::Get().SetIdleHook(
         [](void* argument) { static_cast<Scheduler*>(argument)->FlushDeferred(); },

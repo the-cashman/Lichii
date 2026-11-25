@@ -1212,7 +1212,6 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     if (scheduler.CurrentTick() != geometry_tick) {
         // A wait since the geometry binds (in the render target lookup, say) submitted them with
         // the previous command buffer, and the draw would run with no vertex or index buffer.
-        const BufferArena::SideScope side;
         buffer_cache.BindHostGeometryBuffers(is_indexed);
         if (buffer_cache.any_buffer_uploaded) {
             buffer_cache.runtime.PostCopyBarrier();
@@ -1434,7 +1433,6 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
     if (scheduler.CurrentTick() != geometry_tick) {
         // A wait since the geometry binds (in the render target lookup, say) submitted them with
         // the previous command buffer, and the draw would run with no vertex or index buffer.
-        const BufferArena::SideScope side;
         buffer_cache.BindHostGeometryBuffers(is_indexed);
         if (buffer_cache.any_buffer_uploaded) {
             buffer_cache.runtime.PostCopyBarrier();

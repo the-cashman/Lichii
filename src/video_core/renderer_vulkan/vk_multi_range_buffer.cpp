@@ -165,9 +165,8 @@ void MultiRangeBufferCache::RetireEntry(Scheduler& scheduler, Entry& entry) {
     retired.push_back(Retired{
         .handle = std::move(entry.sparse_handle),
         .gathered = std::move(entry.gathered),
-        .tick = sparse || scheduler.RenderRecordersEnabled()
-                    ? std::nullopt
-                    : std::optional{scheduler.CurrentTick()},
+        // (No render recorders in this tree: a gathered entry's tick is the current one.)
+        .tick = sparse ? std::nullopt : std::optional{scheduler.CurrentTick()},
         .sparse_sources = sparse ? std::move(entry.sources) : std::vector<MultiRangeSource>{},
     });
 }
