@@ -4480,11 +4480,25 @@ bool TextureCache<P>::UploadsByLayer(const ImageBase& image) const noexcept {
         if (True(image.flags & ImageFlagBits::CompactLayers)) {
             return False(image.flags & ImageFlagBits::NonContiguous);
         }
-        return True(image.flags & ImageFlagBits::AcceleratedUpload) &&
-               image.info.type == ImageType::e2D && image.info.resources.layers > 1 &&
-               image.guest_size_bytes >= LayerUploadMinSize &&
-               False(image.flags & (ImageFlagBits::Unbacked | ImageFlagBits::Sparse |
-                                    ImageFlagBits::Remapped));
+        if (image.info.type != ImageType::e2D || image.info.resources.layers <= 1 ||
+            True(image.flags & (ImageFlagBits::Unbacked | ImageFlagBits::Sparse |
+                                ImageFlagBits::Remapped))) {
+            return false;
+        }
+        if (True(image.flags & ImageFlagBits::AcceleratedUpload)) {
+            return image.guest_size_bytes >= LayerUploadMinSize;
+        }
+        // [bazzite hitch] EDEN_NX2_LAYER_UPLOAD_MIB=<n>: plain-format arrays of at least n MiB
+        // too (UploadLayers' unswizzle-per-layer path). Star Fox streams layers into two BC7
+        // arrays (512x512x128 with 10 levels, 43 MiB; 1024x1024x64 with 6 levels, 85 MiB); each
+        // write re-uploaded both whole on the GPU thread (~25 ms: a ~40 ms frame every few s).
+        static const u64 plain_min_bytes = [] {
+            const char* const value = std::getenv("EDEN_NX2_LAYER_UPLOAD_MIB");
+            return value != nullptr ? std::strtoull(value, nullptr, 10) << 20 : u64{0};
+        }();
+        return plain_min_bytes != 0 && image.guest_size_bytes >= plain_min_bytes &&
+               False(image.flags & (ImageFlagBits::Converted | ImageFlagBits::TrimmedLevels |
+                                    ImageFlagBits::AsynchronousDecode));
     } else {
         return false;
     }
@@ -4598,7 +4612,23 @@ bool TextureCache<P>::UploadWrittenLayers(Image& image) {
         if (layers.empty() || layers.size() == num_layers) {
             return false;
         }
+        const bool tc_trace = TextureCacheTrace();
+        const auto trace_begin =
+            tc_trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         UploadLayers(image, layers);
+        if (tc_trace) {
+            LOG_WARNING(HW_GPU,
+                        "TCTRACE layer-upload gpu={:#x} fmt={} {}x{} lv={} ly={}/{} "
+                        "guest={}KiB accelerated={} ms={:.2f} frame={}",
+                        image.gpu_addr, static_cast<u32>(image.info.format), image.info.size.width,
+                        image.info.size.height, image.info.resources.levels, layers.size(),
+                        num_layers, image.guest_size_bytes / 1024,
+                        True(image.flags & ImageFlagBits::AcceleratedUpload),
+                        std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - trace_begin)
+                            .count(),
+                        frame_tick);
+        }
         return true;
     } else {
         return false;
