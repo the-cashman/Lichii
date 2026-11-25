@@ -143,6 +143,7 @@ add_library(video_core STATIC
     nx2_back_idle_trace.h
     nx2_list_macro_trace.cpp
     nx2_list_macro_trace.h
+    nx2_list_indexed_draw.h
     nx2_cmdpage_diag.h
     nx2_debug_control.cpp
     nx2_debug_control.h

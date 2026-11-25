@@ -11,6 +11,7 @@
 #include "common/settings.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/nx2_list_indexed_draw.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/render_trace.h"
@@ -261,7 +262,8 @@ void Maxwell3D::DrawManager::DrawEnd(Maxwell3D& maxwell3d, u32 instance_count, b
         fold_first_instance = false;
         // Not a list draw (#1336 port): its address is for this draw only.
         if (draw_state.draw_mode == DrawMode::General && !force_draw &&
-            draw_state.instance_count == 0 && draw_state.list_draw_address == 0) {
+            draw_state.instance_count == 0 && draw_state.list_draw_address == 0 &&
+            draw_state.list_indexed_draw_address == 0) {
             // FoldFirstInstance: DrawDeferred draws this instance with the loop's others.
             draw_state.draw_mode = DrawMode::Instance;
             first_folded = true;
@@ -271,6 +273,13 @@ void Maxwell3D::DrawManager::DrawEnd(Maxwell3D& maxwell3d, u32 instance_count, b
     // List draws (nx2_list_draw.h): set between this draw.end and its draw.begin, for this draw only.
     const GPUVAddr list_draw_address = std::exchange(draw_state.list_draw_address, 0);
     const u64 list_keep_id = std::exchange(draw_state.list_keep_id, 0);
+    // List indexed draws (nx2_list_indexed_draw.h, #1559 port): set right before this draw.end,
+    // for this draw only.
+    const GPUVAddr list_indexed_address = std::exchange(draw_state.list_indexed_draw_address, 0);
+    if (list_indexed_address != 0 &&
+        (!draw_state.draw_indexed || draw_state.draw_mode != DrawMode::General)) {
+        Nx2ListIndexedDraw::Count(Nx2ListIndexedDraw::g_stats.dropped);
+    }
     switch (draw_state.draw_mode) {
     case DrawMode::Instance:
         if (!force_draw) {
@@ -301,6 +310,30 @@ void Maxwell3D::DrawManager::DrawEnd(Maxwell3D& maxwell3d, u32 instance_count, b
             ProcessDrawIndirect(maxwell3d);
             indirect_state.list_words = false;
             indirect_state.list_keep_id = 0;
+            break;
+        }
+        if (list_indexed_address != 0 && draw_state.draw_indexed &&
+            draw_state.draw_mode == DrawMode::General) {
+            // The index count, the instances, the first index, the base vertex and the base
+            // instance are the five words at the address, an indexed indirect draw command as
+            // the host takes it. The index buffer is bound as far as it can be read.
+            draw_state.index_buffer = maxwell3d.regs.index_buffer;
+            draw_state.index_buffer.first = 0;
+            draw_state.index_buffer.count = static_cast<u32>(maxwell3d.EstimateIndexBufferSize());
+            indirect_state.is_byte_count = false;
+            indirect_state.is_indexed = true;
+            indirect_state.include_count = false;
+            indirect_state.count_start_address = 0;
+            indirect_state.indirect_start_address = list_indexed_address;
+            indirect_state.buffer_size = 5 * sizeof(u32);
+            indirect_state.max_draw_counts = 1;
+            indirect_state.stride = 0;
+            maxwell3d.dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+            ProcessDrawIndirect(maxwell3d);
+            // The next draw binds the index buffer for its own count again.
+            maxwell3d.dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+            draw_state.draw_indexed = false;
+            Nx2ListIndexedDraw::Count(Nx2ListIndexedDraw::g_stats.drawn);
             break;
         }
         if (draw_state.draw_indexed) {

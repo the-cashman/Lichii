@@ -38,6 +38,7 @@
 #include "video_core/nx2_cmdpage_diag.h"
 #include "video_core/nx2_list_dispatch.h"
 #include "video_core/nx2_list_draw.h"
+#include "video_core/nx2_list_indexed_draw.h"
 #include "video_core/nx2_list_macro_trace.h"
 #include "video_core/rasterizer_interface.h"
 
@@ -669,7 +670,8 @@ bool DmaPusher::Step() {
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         } else if (gpu_written &&
                    (TakeListDraw(dma_state.dma_get, static_cast<u32>(header.size)) ||
-                    TakeListDispatch(dma_state.dma_get, static_cast<u32>(header.size)))) {
+                    TakeListDispatch(dma_state.dma_get, static_cast<u32>(header.size)) ||
+                    TakeListIndexedDraw(dma_state.dma_get, static_cast<u32>(header.size)))) {
             // Nothing to parse: the words stay on the host GPU, the call is complete.
         } else if (bool pending = false;
                    !caches_flushed &&
@@ -1383,6 +1385,68 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count, bool* pendin
         }
         chunk = chunk_end;
     }
+    return true;
+}
+
+bool DmaPusher::TakeListIndexedDraw(GPUVAddr address, u32 count) {
+    namespace ListDraw = Tegra::Nx2ListIndexedDraw;
+    const int mode = ListDraw::Mode();
+    if (mode == 0) {
+        return false;
+    }
+    ListDraw::MaybeLog();
+    auto& split = VideoCommon::GpuSplit::Get();
+    // The five words are the remaining parameters of a 3D macro call begun in the entry before,
+    // on one mapped page that draws write.
+    constexpr size_t bytes = 5 * sizeof(u32);
+    if (count != 5 || dma_state.method_count != 5 || command_resume_offset != 0 ||
+        !split.Active() || !split.FrontMacros() || dma_state.method < MacroRegistersStart ||
+        (address & 0xfff) > 0x1000 - bytes || subchannels[dma_state.subchannel] == nullptr ||
+        subchannel_type[dma_state.subchannel] != Engines::EngineTypes::Maxwell3D ||
+        rasterizer == nullptr) {
+        return false;
+    }
+    const auto device = memory_manager.GpuToCpuAddress(address);
+    if (!device || !rasterizer->IsDrawWrittenCommandListPage(*device)) {
+        return false;
+    }
+    // What guest memory holds of the record: the registers and constant buffer words the macro
+    // writes from it get these. Only the reset record's shape is taken.
+    const auto is_reset_shape = [](const std::array<u32, 5>& record) {
+        return record[1] == 1 && record[2] == 0 && record[3] == 0 && record[4] == 0;
+    };
+    std::array<u32, 5> words{};
+    memory_manager.ReadBlockUnsafe(address, words.data(), bytes);
+    if (!is_reset_shape(words)) {
+        ListDraw::Count(ListDraw::g_stats.refused_record);
+        return false;
+    }
+    if (mode == 2) {
+        // The old way, then the record as the GPU left it.
+        if (FlushGpuWrittenCommands(address, bytes)) {
+            std::array<u32, 5> fresh{};
+            memory_manager.ReadBlockUnsafe(address, fresh.data(), bytes);
+            ListDraw::Count(ListDraw::g_stats.checked);
+            if (!is_reset_shape(fresh)) {
+                ListDraw::Count(ListDraw::g_stats.mismatched);
+                static u32 logged{};
+                if (logged < 16) {
+                    ++logged;
+                    LOG_WARNING(HW_GPU, "List indexed draw check at {:#x}: record {:#x}", address,
+                                fmt::join(fresh, " "));
+                }
+            }
+        }
+        return false;
+    }
+    auto* const maxwell3d = static_cast<Engines::Maxwell3D*>(subchannels[dma_state.subchannel]);
+    if (!maxwell3d->FrontTakeListIndexedDraw(system, split, dma_state.method, address, words)) {
+        ListDraw::Count(ListDraw::g_stats.refused);
+        return false;
+    }
+    ListDraw::Count(ListDraw::g_stats.taken);
+    dma_state.method_count = 0;
+    dma_state.is_last_call = true;
     return true;
 }
 

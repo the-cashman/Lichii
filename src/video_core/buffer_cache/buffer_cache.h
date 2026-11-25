@@ -2132,6 +2132,7 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
     // with command lists, which then counted as GPU-written and were read back at every use).
     if (const Binding& binding = channel_state->storage_buffers[stage][ssbo_index];
         is_written && write_extent.bounded && indirect_offset == ~0U && binding.size != 0 &&
+        binding.buffer_id != NULL_BUFFER_ID && Nx2DrawWriteExtents() &&
         maxwell3d->GetNativeMacroEngine().native_turing) {
         // The extent counts from the pointer, the binding from the pointer aligned down.
         const GPUVAddr pointer = gpu_memory->Read<u64>(ssbo_addr);
@@ -4124,6 +4125,18 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool 
         }
         std::memcpy(out.data(), it->second.copy->mapped_span.data() + offset, out.size());
         return Nx2ListRead::Copied;
+    }
+}
+
+template <class P>
+bool BufferCache<P>::Nx2IsDrawWrittenListPage(DAddr device_addr) {
+    if constexpr (IS_OPENGL) {
+        return false;
+    } else {
+        constexpr DAddr page_size = DAddr{1} << Tegra::Nx2WrittenPageBits;
+        std::scoped_lock lock{nx2_list_mutex};
+        const auto it = nx2_list_pages.find(device_addr & ~(page_size - 1));
+        return it != nx2_list_pages.end() && it->second.draw_written;
     }
 }
 

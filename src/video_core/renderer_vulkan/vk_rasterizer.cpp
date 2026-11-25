@@ -2976,6 +2976,11 @@ bool RasterizerVulkan::IsGpuTickDone(u64 tick) {
     return scheduler.IsFree(tick);
 }
 
+bool RasterizerVulkan::IsDrawWrittenCommandListPage(DAddr addr) {
+    // No cache lock: the list pages have their own.
+    return buffer_cache.Nx2IsDrawWrittenListPage(addr);
+}
+
 void RasterizerVulkan::NoteGpuWrittenCommandListSynced(DAddr page) {
     buffer_cache.Nx2NoteListSynced(page);
 }

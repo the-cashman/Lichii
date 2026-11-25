@@ -178,6 +178,12 @@ public:
         return true;
     }
 
+    /// Switch 2: whether draws write this command list page (their writes are only known to the
+    /// host GPU until the page is flushed). Front thread.
+    virtual bool IsDrawWrittenCommandListPage([[maybe_unused]] DAddr addr) {
+        return false;
+    }
+
     /// Switch 2: the front flushed this command list page with the split drained.
     virtual void NoteGpuWrittenCommandListSynced([[maybe_unused]] DAddr page) {}
 

@@ -311,6 +311,10 @@ public:
     /// the compute macro that stores a dispatch's grid; returns whether the compute engine took
     /// them without reading them.
     bool TakeListDispatch(GPUVAddr address, u32 count);
+    /// List indexed draws (nx2_list_indexed_draw.h, #1559 port): the entry at `address` is the
+    /// five GPU-written parameters of an indexed indirect draw macro call; returns whether the 3D
+    /// engine took them without waiting for them.
+    bool TakeListIndexedDraw(GPUVAddr address, u32 count);
     /// List guard (nx2_list_dispatch.h): the words at `address`, which a list left on the host GPU, read
     /// back after everything sent so far (a wait for the back and a flush of their pages).
     bool ReadListWords(GPUVAddr address, u64 keep_id, std::span<u32> words);

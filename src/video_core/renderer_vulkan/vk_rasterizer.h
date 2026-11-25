@@ -122,6 +122,7 @@ public:
     GpuWrittenList ReadGpuWrittenCommandList(DAddr addr, std::span<u8> out, bool past_sync,
                                              u64* pending_tick = nullptr) override;
     bool IsGpuTickDone(u64 tick) override;
+    bool IsDrawWrittenCommandListPage(DAddr addr) override;
     void NoteGpuWrittenCommandListSynced(DAddr page) override;
     void FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) override;
     bool MustFlushRegion(DAddr addr, u64 size,

@@ -31,6 +31,7 @@
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_list_dispatch.h"
 #include "video_core/nx2_list_draw.h"
+#include "video_core/nx2_list_indexed_draw.h"
 #include "video_core/nx2_list_macro_trace.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
@@ -1592,6 +1593,12 @@ struct Maxwell3D::FrontState {
     u32 upload_offset{};
     /// The back's draw manager is in an instance loop (DrawMode::Instance): draw.end does nothing.
     bool instance_loop{};
+    /// List indexed draws (nx2_list_indexed_draw.h, #1559 port): by start in the macro code of
+    /// list_indexed_generation, whether the macro is the indexed draw FrontTakeListIndexedDraw
+    /// sends as an address; and that address while the macro runs, until its draw.end.
+    std::unordered_map<u32, bool> list_indexed_macros;
+    u64 list_indexed_generation{~u64{0}};
+    GPUVAddr list_indexed_draw{};
     /// EDEN_NX2_SKIP_SAME_DRAWREG: a draw that binds an index buffer other than the registers'
     /// (inline or small indexes) was sent since index_buffer.first or .count last went to the
     /// back. Until one of them goes again, a same-value index_buffer.first is sent anyway.
@@ -2308,6 +2315,13 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                     fs.oot_writes.push_back(value);
                 }
                 ListTrace::NoteWrite(trace, address, value);
+                if (address == MAXWELL3D_REG_INDEX(draw.end) && fs.list_indexed_draw != 0)
+                    [[unlikely]] {
+                    // The draw this draw.end issues takes its arguments from the list.
+                    split.Defer([this, list = std::exchange(fs.list_indexed_draw, GPUVAddr{0})] {
+                        draw_manager.draw_state.list_indexed_draw_address = list;
+                    });
+                }
                 FrontWrite(split, fs, address, value, true, true);
                 // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED (into the load FIFO).
                 if (address == 0x157 || address == 0x158) {
@@ -3250,6 +3264,78 @@ bool Maxwell3D::FrontBatchRepeats(VideoCommon::GpuSplit& split, FrontState& fs,
     return true;
 }
 
+
+// List indexed draws (nx2_list_indexed_draw.h, port of Lichii #1559).
+bool Maxwell3D::FrontIsListIndexedDrawMacro(FrontState& fs, const MacroEngine& engine,
+                                            u32 start) {
+    namespace ListDraw = Tegra::Nx2ListIndexedDraw;
+    if (fs.list_indexed_generation != engine.native_code_generation) {
+        fs.list_indexed_macros.clear();
+        fs.list_indexed_generation = engine.native_code_generation;
+    }
+    const auto [it, inserted] = fs.list_indexed_macros.try_emplace(start, false);
+    if (!inserted) {
+        return it->second;
+    }
+    static_assert(ListDraw::DrawBegin == MAXWELL3D_REG_INDEX(draw.begin) &&
+                  ListDraw::DrawEnd == MAXWELL3D_REG_INDEX(draw.end) &&
+                  ListDraw::IndexFirst == MAXWELL3D_REG_INDEX(index_buffer.first) &&
+                  ListDraw::IndexCount == MAXWELL3D_REG_INDEX(index_buffer.count) &&
+                  ListDraw::BaseVertex == MAXWELL3D_REG_INDEX(global_base_vertex_index) &&
+                  ListDraw::BaseInstance == MAXWELL3D_REG_INDEX(global_base_instance_index) &&
+                  ListDraw::ConstBufferOffset == MAXWELL3D_REG_INDEX(const_buffer.offset) &&
+                  ListDraw::ConstBufferData == MAXWELL3D_REG_INDEX(const_buffer.buffer));
+    it->second = ListDraw::IsIndexedDrawMacro(std::span<const u32>{engine.native_code}, start);
+    LOG_INFO(HW_GPU, "Macro at {:#x} {} the indexed indirect draw (list indexed draws)", start,
+             it->second ? "is" : "is not");
+    return it->second;
+}
+
+bool Maxwell3D::FrontTakeListIndexedDraw(Core::System& system, VideoCommon::GpuSplit& split,
+                                         u32 method, GPUVAddr address,
+                                         std::span<const u32, 5> words) {
+    auto& fs = Front(system, split);
+    // The call began in the entry before with its first parameter, the topology; the registers
+    // must take the macro's words themselves (no shadow RAM replay).
+    if (fs.executing_macro == 0 || (fs.executing_macro | 1) != (method | 1) ||
+        fs.parameters.size() != 1 || fs.control == Regs::ShadowRamControl::Replay ||
+        rasterizer == nullptr) {
+        return false;
+    }
+    switch (static_cast<Regs::PrimitiveTopology>(fs.parameters[0])) {
+    case Regs::PrimitiveTopology::Points:
+    case Regs::PrimitiveTopology::Lines:
+    case Regs::PrimitiveTopology::LineStrip:
+    case Regs::PrimitiveTopology::Triangles:
+    case Regs::PrimitiveTopology::TriangleStrip:
+    case Regs::PrimitiveTopology::Patches:
+        break;
+    default:
+        // Topologies the host draws with other indices or counts.
+        return false;
+    }
+    const auto& engine = GetNativeMacroEngine();
+    const auto positions = GetNativeMacroPositions();
+    if (!engine.native_turing || positions.empty()) {
+        return false;
+    }
+    const u32 start = positions[((fs.executing_macro - MacroRegistersStart) >> 1) & 0x7f];
+    if (!FrontIsListIndexedDrawMacro(fs, engine, start)) {
+        return false;
+    }
+    // The macro runs on the words guest memory holds (one instance: one draw.end), and the
+    // draw of that draw.end takes the list's own words on the host GPU.
+    fs.parameters.insert(fs.parameters.end(), words.begin(), words.end());
+    fs.list_indexed_draw = address;
+    FrontRunMacro(system, split, fs);
+    if (std::exchange(fs.list_indexed_draw, GPUVAddr{0}) != 0) {
+        static bool logged{};
+        if (!std::exchange(logged, true)) {
+            LOG_ERROR(HW_GPU, "List indexed draw at {:#x}: the macro sent no draw.end", address);
+        }
+    }
+    return true;
+}
 
 // List draws (nx2_list_draw.h, port of Lichii #1336 onto the #717 front): whether the macro at
 // `start` does nothing but begin a draw, write its first parameter to vertex_buffer.count and its

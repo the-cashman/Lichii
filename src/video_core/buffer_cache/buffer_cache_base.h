@@ -515,6 +515,18 @@ public:
         binds = resolved = bound_bytes = marked_bytes = 0;
         window = now;
     }
+    /// EDEN_NX2_DRAW_WRITE_EXTENT=0: a draw marks its written native storage bindings
+    /// GPU-written whole, as before their programs' store extents were used (#1559).
+    [[nodiscard]] static bool Nx2DrawWriteExtents() {
+        static const bool enabled = [] {
+            const char* const value = std::getenv("EDEN_NX2_DRAW_WRITE_EXTENT");
+            return value == nullptr || value[0] != '0';
+        }();
+        return enabled;
+    }
+    /// Front thread: whether draws write the command list page of `device_addr`
+    /// (list indexed draws, nx2_list_indexed_draw.h).
+    bool Nx2IsDrawWrittenListPage(DAddr device_addr);
     /// Front thread, the split drained: the command list page was flushed to guest memory.
     void Nx2NoteListSynced(DAddr page);
 

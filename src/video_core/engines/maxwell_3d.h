@@ -3091,6 +3091,10 @@ public:
             GPUVAddr list_draw_address{};
             /// Its keep id: the rasterizer keeps a copy of the words for the front.
             u64 list_keep_id{};
+            /// List indexed draws (nx2_list_indexed_draw.h, #1559 port): the next draw.end draws
+            /// the indexed draw whose five arguments are the words at this address
+            /// (Maxwell3D::FrontTakeListIndexedDraw).
+            GPUVAddr list_indexed_draw_address{};
             std::vector<u8> inline_index_draw_indexes;
         };
         struct DrawTextureState {
@@ -3249,6 +3253,12 @@ public:
                          u32 argument, bool is_last_call);
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                               const u32* base_start, u32 amount, u32 methods_pending);
+    /// List indexed draws (nx2_list_indexed_draw.h, #1559 port): the macro call the front began
+    /// with its topology gets `words`, guest memory's copy of the five GPU-written parameters at
+    /// `address`, and its draw is sent as that address. False when the call is of another shape:
+    /// nothing was done.
+    bool FrontTakeListIndexedDraw(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
+                                  GPUVAddr address, std::span<const u32, 5> words);
     /// List draws (nx2_list_draw.h, #1336 port): the call of macro `method` whose two parameters
     /// are the GPU-written words at `address`. Returns whether the call was sent to the back
     /// without reading them.
@@ -3549,6 +3559,7 @@ private:
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
     // List draws and their guard (#1336 port).
     bool FrontIsListDrawMacro(FrontState& state, const MacroEngine& engine, u32 start);
+    bool FrontIsListIndexedDrawMacro(FrontState& state, const MacroEngine& engine, u32 start);
     bool FrontMacroUsesDataRam(FrontState& state, const MacroEngine& engine, u32 start);
     void FrontNoteListDrawWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method);
     void FrontResolveListDraw(VideoCommon::GpuSplit& split, FrontState& state);
