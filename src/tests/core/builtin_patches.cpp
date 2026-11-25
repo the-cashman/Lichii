@@ -1606,7 +1606,7 @@ TEST_CASE("OoT compaction interval is opt-in and skips changed code or state",
     }
     const auto patched = manager.PatchNSO(nso, module);
     REQUIRE(WordAt(patched, Site) == (installs ? 0x14401ED3 : WordAt(nso, Site)));
-    REQUIRE(WordAt(patched, Entry) == (installs ? 0x360FDD88 : 0));
+    REQUIRE(WordAt(patched, Entry) == (installs ? 0x360FDD88U : 0U));
     if (mod) {
         REQUIRE(WordAt(patched, mod_offset) == *mod);
     }

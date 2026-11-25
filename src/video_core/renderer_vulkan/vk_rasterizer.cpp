@@ -585,6 +585,11 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
         [this](const std::function<void(DAddr, size_t)>& callback) {
             gpu.ForEachPendingCpuWrite(callback);
         });
+    buffer_cache.SetReadRunPageFilter([this](DAddr addr, u64 size) {
+        return !texture_cache.page_filter.Any(addr, size) &&
+               !query_cache.page_filter.Any(addr, size) &&
+               !buffer_cache_runtime.Nx2Slots().HasOwed();
+    });
     VideoCommon::GpuSplit::Get().SetIdleHook(
         [](void* argument) { static_cast<Scheduler*>(argument)->FlushDeferred(); },
         &scheduler);
@@ -624,6 +629,7 @@ RasterizerVulkan::~RasterizerVulkan() {
     state_tracker.ClearChannel();
     scheduler.WaitWorker();
     scheduler.Finish();
+    buffer_cache_runtime.ClearMultiRangeBuffers();
 }
 
 GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_indirect) {
@@ -1528,11 +1534,12 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                 scene.size.width == oot_motion.extent.width &&
                 scene.size.height == oot_motion.extent.height && !scene.IsRescaled() &&
                 scene.range == VideoCommon::SubresourceRange{}) {
-                oot_effects_scene = scene.Handle(Shader::TextureType::Color2D);
+                oot_effects_view = scene_id;
+                oot_effects_generation = texture_cache.ImageViewGeneration(scene_id);
                 oot_effects_address = scene.gpu_addr;
                 oot_effects_frame = render_trace_frame;
-                oot_live_dlss->SaveEffectsBase(oot_effects_scene, oot_motion.extent,
-                                               render_trace_frame);
+                oot_live_dlss->SaveEffectsBase(scene.Handle(Shader::TextureType::Color2D),
+                                               oot_motion.extent, render_trace_frame);
             }
         }
     }
@@ -1587,6 +1594,18 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     }
 }
 
+void RasterizerVulkan::MarkOcarinaEffectsIfAlive() {
+    if (const auto* scene =
+            texture_cache.GetImageViewIfCurrent(oot_effects_view, oot_effects_generation)) {
+        oot_live_dlss->MarkEffects(scene->Handle(Shader::TextureType::Color2D), render_trace_frame);
+    } else if (oot_effects_stale_warnings < 8) {
+        ++oot_effects_stale_warnings;
+        LOG_WARNING(Render_Vulkan,
+                    "OoT effects mark skipped: scene view at {:#x} was retired since the fog "
+                    "draw ({} so far)",
+                    oot_effects_address, oot_effects_stale_warnings);
+    }
+}
 
 namespace {
 // EDEN_NX2_WINDOW_TRACE: describe clears and draws into screen-sized colour targets (debug aid).
@@ -2817,7 +2836,7 @@ void RasterizerVulkan::DispatchCompute() {
         if (std::ranges::any_of(written, [this](VideoCommon::ImageViewId id) {
                 return id && texture_cache.GetImageView(id).gpu_addr == oot_effects_address;
             })) {
-            oot_live_dlss->MarkEffects(oot_effects_scene, render_trace_frame);
+            MarkOcarinaEffectsIfAlive();
             oot_effects_frame.reset();
         }
     }

@@ -77,10 +77,36 @@ struct GameFiles {
     std::vector<FileSys::VirtualDir> romfs;
 };
 
+struct ReadingSteps {
+    void Advance(std::string_view next, std::optional<size_t> files = std::nullopt) {
+        const auto now = std::chrono::steady_clock::now();
+        if (!current.empty()) {
+            LOG_INFO(Render_Vulkan, "Shader precache {:016x}: {} finished in {} ms", title_id,
+                     current,
+                     std::chrono::duration_cast<std::chrono::milliseconds>(now - started).count());
+        }
+        current = next;
+        if (current.empty()) {
+            return;
+        }
+        if (files) {
+            LOG_INFO(Render_Vulkan, "Shader precache {:016x}: {} started ({} files)", title_id,
+                     current, *files);
+        } else {
+            LOG_INFO(Render_Vulkan, "Shader precache {:016x}: {} started", title_id, current);
+        }
+        started = std::chrono::steady_clock::now();
+    }
+
+    u64 title_id;
+    std::string_view current{};
+    std::chrono::steady_clock::time_point started{};
+};
+
 /// Opens the game file and collects its RomFS trees into `game`. Returns the error text when the
 /// file cannot be opened or has no RomFS.
 std::optional<std::string> OpenGame(Core::System& system, const fs::path& game_path,
-                                    GameFiles& game) {
+                                    GameFiles& game, ReadingSteps& steps) {
     FileSys::VirtualFilesystem filesystem = system.GetFilesystem();
     if (filesystem == nullptr) {
         filesystem = std::make_shared<FileSys::RealVfsFilesystem>();
@@ -91,6 +117,7 @@ std::optional<std::string> OpenGame(Core::System& system, const fs::path& game_p
         return "Cannot open the game file";
     }
     if (FileSys::NupContainer::IsNupFile(file)) {
+        steps.Advance("NUP opening and RomFS directory lookup");
         // Small memory cache: every member is read once.
         game.nup = std::make_unique<FileSys::NupContainer>(file, 128 * 1024 * 1024);
         if (game.nup->GetStatus() != Loader::ResultStatus::Success) {
@@ -114,10 +141,12 @@ std::optional<std::string> OpenGame(Core::System& system, const fs::path& game_p
         if (game.loader == nullptr) {
             return "Unsupported game file format";
         }
+        steps.Advance("RomFS loader read");
         FileSys::VirtualFile romfs;
         if (game.loader->ReadRomFS(romfs) != Loader::ResultStatus::Success || romfs == nullptr) {
             return "Cannot read the game's RomFS (are the keys installed?)";
         }
+        steps.Advance("RomFS directory extraction");
         if (auto dir = FileSys::ExtractRomFS(romfs)) {
             game.romfs.push_back(std::move(dir));
         }
@@ -549,6 +578,8 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
         }
     };
     const auto begin = std::chrono::steady_clock::now();
+    ReadingSteps steps{title_id};
+    steps.Advance("output preparation");
     report(StageReading, 0, 0);
 
     const fs::path output_dir = options.output_dir.empty() ? TitleDir(title_id) : options.output_dir;
@@ -570,7 +601,8 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     };
 
     GameFiles game;
-    if (const auto error = OpenGame(system, game_path, game)) {
+    steps.Advance("game opening and loader identification");
+    if (const auto error = OpenGame(system, game_path, game, steps)) {
         return fail(*error);
     }
 
@@ -582,10 +614,12 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     ZstdDictionaries dictionaries;
     FileSys::VirtualFile dictionary_pack;
     for (const auto& romfs : game.romfs) {
+        steps.Advance("RomFS file enumeration and sorting");
         std::vector<ArchiveFile> files;
         ListFiles(romfs, "", files);
         std::sort(files.begin(), files.end(),
                   [](const ArchiveFile& a, const ArchiveFile& b) { return a.path < b.path; });
+        steps.Advance("RomFS file classification and header probing", files.size());
         std::vector<ArchiveFile> package_effects;
         for (auto& file : files) {
             switch (ClassifyGameFile(file.path)) {
@@ -609,12 +643,14 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     }
     archives.insert(archives.end(), effects.begin(), effects.end());
     if (dictionary_pack) {
+        steps.Advance("zstd dictionary loading");
         try {
             dictionaries.Load(dictionary_pack->ReadAllBytes());
         } catch (const ArchiveError& e) {
             LOG_WARNING(Render_Vulkan, "Shader precache: zstd dictionary pack: {}", e.what());
         }
     }
+    steps.Advance({});
     // Without archives the file is written empty: the precache then has only the pipeline cache
     // of earlier sessions to build.
     result.archives = archives.size();

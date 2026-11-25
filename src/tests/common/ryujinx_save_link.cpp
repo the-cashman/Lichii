@@ -242,7 +242,7 @@ TEST_CASE("Ryujinx link and unlink preserve saves and backups", "[ryujinx]") {
     const auto result = UpdateRyujinxSave(f.lichii, f.ryujinx, operation);
     INFO(result.error);
     REQUIRE(result.error.empty());
-    REQUIRE(result.backups.size() == (operation == RyujinxSaveOperation::FromLichii ? 2 : 1));
+    REQUIRE(result.backups.size() == (operation == RyujinxSaveOperation::FromLichii ? 2U : 1U));
     CHECK(ReadSave(result.backups[0]) == "Lichii save");
     if (operation == RyujinxSaveOperation::FromLichii) {
         CHECK(ReadSave(result.backups[1]) == "Ryujinx save");

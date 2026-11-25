@@ -52,6 +52,7 @@
 #include "video_core/texture_cache/image_base.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view_base.h"
+#include "video_core/texture_cache/image_view_slots.h"
 #include "video_core/texture_cache/render_targets.h"
 #include "video_core/texture_cache/sampled_views.h"
 #include "video_core/texture_cache/stale_pages.h"
@@ -358,6 +359,14 @@ public:
 
     /// Return a reference to the given image view id
     [[nodiscard]] ImageView& GetImageView(ImageViewId id) noexcept;
+
+    [[nodiscard]] u32 ImageViewGeneration(ImageViewId id) const noexcept {
+        return slot_image_views.Generation(id);
+    }
+
+    [[nodiscard]] ImageView* GetImageViewIfCurrent(ImageViewId id, u32 generation) noexcept {
+        return slot_image_views.GetIfCurrent(id, generation);
+    }
 
     /// Get the imageview from the graphics descriptor table in the specified index
     [[nodiscard]] ImageView& GetImageView(u32 index) noexcept;
@@ -1105,7 +1114,7 @@ private:
 
     Common::SlotVector<Image> slot_images;
     Common::SlotVector<ImageMapView> slot_map_views;
-    Common::SlotVector<ImageView> slot_image_views;
+    ImageViewSlots<ImageView> slot_image_views;
     Common::SlotVector<ImageAlloc> slot_image_allocs;
     Common::SlotVector<Sampler> slot_samplers;
     Common::SlotVector<Framebuffer> slot_framebuffers;

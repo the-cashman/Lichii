@@ -410,7 +410,9 @@ private:
     VkImage oot_4k_guest_present{};
     std::optional<u64> oot_effects_frame;
     GPUVAddr oot_effects_address{};
-    VkImageView oot_effects_scene{};
+    VideoCommon::ImageViewId oot_effects_view{};
+    u32 oot_effects_generation{};
+    u32 oot_effects_stale_warnings{};
     struct OcarinaActorPose {
         u64 frame{};
         const Tegra::MemoryManager* channel{};

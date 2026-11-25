@@ -300,8 +300,8 @@ bool Scheduler::IdleGpuAwaitsWork() {
     // 100 and 200 us.
     static constexpr auto age = std::chrono::microseconds{100};
     // Not inside a render pass: ending passes early tripled the submissions and cost the back
-    // about as much as the wait saved.
-    if (state.renderpass || !RecordedSinceSubmit()) {
+    // about as much as the wait saved. A deferred clear belongs to the next pass (upstream #2466).
+    if (state.renderpass || deferred_clear.framebuffer || !RecordedSinceSubmit()) {
         return false;
     }
     const auto now = std::chrono::steady_clock::now();

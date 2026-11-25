@@ -62,6 +62,7 @@ constexpr u16 TlvIcon = 0x0003;
 constexpr u16 TlvDisplayVersion = 0x0004;
 constexpr u16 TlvTitleName = 0x0005;
 constexpr u16 TlvPublisher = 0x0006;
+constexpr u16 TlvBuildId = 0x0007;
 constexpr u16 TlvSourceDump = 0x0008;
 constexpr u16 TlvLocalizedTitles = 0x0009;
 
@@ -2270,6 +2271,7 @@ EditResult EditNupMetadata(const fs::path& archive, const MetadataEdit& edit,
     std::string cur_publisher;
     std::vector<u8> cur_icon;
     std::vector<std::pair<std::string, std::string>> cur_localized;
+    bool publisher_matches_module_id = false;
     {
         RealVfsFilesystem vfs;
         const auto file =
@@ -2292,6 +2294,19 @@ EditResult EditNupMetadata(const fs::path& archive, const MetadataEdit& edit,
         cur_title = current.title_name;
         cur_version = current.display_version;
         cur_publisher = current.publisher;
+        constexpr size_t ModuleIdOffset = 0x40;
+        constexpr size_t ModuleIdSize = 0x20;
+        if (edit.publisher && *edit.publisher != cur_publisher &&
+            cur_publisher.size() == ModuleIdSize) {
+            const auto exefs = nup.GetExeFSDir(target);
+            const auto main = exefs ? exefs->GetFile("main") : nullptr;
+            std::array<u8, ModuleIdOffset + ModuleIdSize> header{};
+            publisher_matches_module_id =
+                main && main->ReadObject(&header) == header.size() &&
+                (std::memcmp(header.data(), "NSO0", 4) == 0 ||
+                 std::memcmp(header.data() + 0x10, "NRO0", 4) == 0) &&
+                std::memcmp(header.data() + ModuleIdOffset, cur_publisher.data(), ModuleIdSize) == 0;
+        }
         cur_icon = current.icon;
         cur_localized = current.localized_titles;
         cur_update_version =
@@ -2397,6 +2412,17 @@ EditResult EditNupMetadata(const fs::path& archive, const MetadataEdit& edit,
                     SetOrRemoveTlv(tlvs, TlvTitleName, StringBytes(*edit.title_name));
                 }
                 if (edit.publisher) {
+                    if (publisher_matches_module_id &&
+                        std::ranges::none_of(tlvs, [&](const auto& tlv) {
+                            return tlv.first == TlvBuildId &&
+                                   tlv.second.size() == cur_publisher.size() &&
+                                   std::memcmp(tlv.second.data(), cur_publisher.data(),
+                                               tlv.second.size()) == 0;
+                        })) {
+                        return fail(EditResult::InvalidSource,
+                                    "cannot edit Publisher: this NUP stores its Build ID in the "
+                                    "Publisher record");
+                    }
                     SetOrRemoveTlv(tlvs, TlvPublisher, StringBytes(*edit.publisher));
                 }
                 if (edit.icon) {

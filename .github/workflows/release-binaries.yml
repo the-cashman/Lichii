@@ -115,7 +115,7 @@ jobs:
         include:
           - platform: linux-x86_64
             runner: ubuntu-24.04
-          # The Linux -pgo builds are the same programs compiled by clang against the repo's
+          # Linux x86-64 PGO builds the same programs with clang against the repo's
           # eglantine.profdata. Eden's profile (Eden-CI/PGO) comes from Switch 1 games: with it Mario
           # Kart World ran at about half the speed of the normal build, with eglantine.profdata at
           # about the same speed. Both Windows builds are clang-cl with ThinLTO; windows-x86_64-pgo
@@ -132,9 +132,6 @@ jobs:
             profile: lichii-windows.profdata
           - platform: linux-aarch64
             runner: ubuntu-24.04-arm
-          - platform: linux-aarch64-pgo
-            runner: ubuntu-24.04-arm
-            pgo: true
           - platform: macos-arm64
             runner: macos-15
 
@@ -389,7 +386,7 @@ jobs:
           )
           if [ '${{ matrix.pgo }}' = 'true' ]; then
             # Same flags Eden's CI passes for its clang PGO build.
-            profile="-fprofile-use=$PWD/eglantine.profdata -Wno-backend-plugin \
+            profile="-fprofile-use=$PWD/eglantine.profdata -Wbackend-plugin -Wno-error=backend-plugin \
               -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date"
             flags+=(
               "-DCMAKE_C_COMPILER=clang-$PGO_LLVM_VERSION"
@@ -493,7 +490,28 @@ jobs:
           start=$(date +%s)
           targets="lichii lichii-cmd"
           if [[ "${{ matrix.platform }}" == windows* ]]; then targets="$targets lichii-updater"; fi
-          cmake --build build/release --target $targets --parallel
+          if [[ '${{ matrix.pgo }}' == 'true' ]]; then
+            if cmake --build build/release --target $targets --parallel 2>&1 |
+                tee --output-error=warn "$RUNNER_TEMP/pgo-build.log"; then
+              awk -v platform='${{ matrix.platform }}' '
+                /function control flow change detected \(hash mismatch\).* up to [0-9]+ count discarded/ {
+                  total++
+                  if ($0 ~ / up to [1-9][0-9]* count discarded/) nonzero++
+                }
+                END {
+                  printf "### PGO profile mismatches: %s\n\n", platform
+                  printf "- Discarded profile warnings: %d\n- With nonzero counts: %d\n", total, nonzero
+                }
+              ' "$RUNNER_TEMP/pgo-build.log" >> "$GITHUB_STEP_SUMMARY" ||
+                echo "::warning::Could not write PGO mismatch summary"
+            else
+              build_status=${PIPESTATUS[0]}
+              if (( build_status != 0 )); then exit "$build_status"; fi
+              echo "::warning::Could not capture PGO build output for the job summary"
+            fi
+          else
+            cmake --build build/release --target $targets --parallel
+          fi
           ccache --show-stats
           ccache --evict-older-than "$(( $(date +%s) - start + 60 ))s"
           du -sh .ccache .lto-cache 2> /dev/null || true
@@ -857,9 +875,11 @@ jobs:
 
           Linux packages come as an AppImage and a tar.gz. Both are self-contained and need glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, Debian 13, Arch). The tar.gz holds the same files unpacked, for systems without FUSE: extract it and run \`lichii/lichii\`.
 
+          Linux ARM64 now ships only the standard build. If you use ARM64 PGO, the in-app updater in build 116 or newer offers the standard package of the same type. If no update appears on an older build, download the standard ARM64 package below.
+
           $({
             row amd64 "$(appimage_tar lichii-linux-x86_64)" "$(appimage_tar lichii-linux-x86_64-pgo)" "Make the AppImage executable (\`chmod +x\`) and run it"
-            row "ARM (aarch64)" "$(appimage_tar lichii-linux-aarch64)" "$(appimage_tar lichii-linux-aarch64-pgo)" ""
+            row "ARM (aarch64)" "$(appimage_tar lichii-linux-aarch64)" "" ""
           } | table)
 
           ## Windows

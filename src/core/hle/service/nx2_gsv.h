@@ -86,6 +86,7 @@
 #include "core/hle/service/nx2_stub_interface.h"
 #include "core/hle/service/nx2_fence_action.h"
 #include "core/hle/service/nx2_frame_interval.h"
+#include "core/hle/service/nx2_hdr_notifications.h"
 #include "core/hle/service/nx2_image_layout.h"
 #include "core/hle/service/nx2_movie_clock.h"
 #include "core/hle/service/nx2_video_input_queue.h"
@@ -3115,7 +3116,7 @@ private:
             .crop_rect = {0, 0, static_cast<int>(crop_width), static_cast<int>(crop_height)},
             .blending = Tegra::BlendMode::Opaque,
             .native_tiling = true,
-            .color_space = Nx2NativeImageColorSpace(image_format, m_told_hdr.load()),
+            .color_space = Nx2NativeImageColorSpace(image_format, m_hdr_notifications.ToldHdr()),
             .linear_unit_luminance = image_format == Nx2NativeImageFormat::Rgba16Float
                                          ? static_cast<u16>((image_word7 >> 8) & 0xFFFF)
                                          : u16{},
@@ -3248,8 +3249,7 @@ private:
                output.reference_white;
     }
 
-    // What the game is told; m_logged_hdr_output keeps the last answer.
-    Common::HdrOutput HostHdrOutput() {
+    Common::HdrOutput QueryHostHdrOutput() {
         std::optional<Common::DisplayHdrInfo> display;
         const auto output = ResolveHostHdrOutput(display);
         const u64 logged = HdrOutputKey(output);
@@ -3268,25 +3268,25 @@ private:
         return output;
     }
 
-    // Fires the slots bound to the HDR status and paper white events once the monitor's state
-    // changed what the game was last told (Windows HDR toggled, the window moved to another
-    // monitor, a new HDR calibration or SDR content brightness), so it queries again and switches
-    // between SDR and HDR images. Runs at every present; costs an atomic load while nothing
-    // changes.
+    // A monitor or swapchain change wakes the slots for the replies that are now stale.
     void NotifyHdrChange() {
         const u64 generation = Common::DisplayHdrMonitor::Instance().Generation();
         if (generation == m_hdr_generation) {
             return;
         }
         m_hdr_generation = generation;
+        if ((m_hdr_status_slots | m_hdr_paper_white_slots) == 0) {
+            return;
+        }
         std::optional<Common::DisplayHdrInfo> display;
-        if (m_hdr_change_slots == 0 || m_logged_hdr_output == ~u64{} ||
-            HdrOutputKey(ResolveHostHdrOutput(display)) == m_logged_hdr_output) {
+        const u32 slots = m_hdr_notifications.ChangedSlots(
+            ResolveHostHdrOutput(display), m_hdr_status_slots, m_hdr_paper_white_slots);
+        if (slots == 0) {
             return;
         }
         LOG_INFO(Service, "nx2:vi2 display HDR state changed, signalling the game");
         for (u32 index = 0; index < m_native_events.size(); ++index) {
-            if ((m_hdr_change_slots >> index) & 1 && m_native_events[index]) {
+            if ((slots >> index) & 1 && m_native_events[index]) {
                 m_native_events[index]->Signal(system.Kernel());
             }
         }
@@ -3294,15 +3294,14 @@ private:
 
     // nn::vi2::QueryDisplayHdrPaperWhite(display name): u16 reference white in nits.
     void QueryDisplayHdrPaperWhite(HLERequestContext& ctx) {
-        TipcReplyWords(ctx, {HostHdrOutput().reference_white});
+        TipcReplyWords(ctx, {m_hdr_notifications.RecordPaperWhite(QueryHostHdrOutput())});
     }
 
     // Wire reply: u64 output format (1 = SDR, 2 = HDR), u16 peak luminance in nits.
     // MKW's SDK converts these to public formats 0/1 before DefaultDisplay tests for HDR.
     void QueryDisplayHdrStatus(HLERequestContext& ctx) {
-        const auto output = HostHdrOutput();
-        m_told_hdr = output.enabled;
-        TipcReplyWords(ctx, {output.enabled ? 2U : 1U, 0, output.peak_luminance});
+        const auto status = m_hdr_notifications.RecordStatus(QueryHostHdrOutput());
+        TipcReplyWords(ctx, {status.enabled ? 2U : 1U, 0, status.peak_luminance});
     }
 
     // 212(u64 layer): u64 bits of the layer's buffer slots that are ready. The client polls it once
@@ -3428,7 +3427,8 @@ private:
         LOG_INFO(Service, "nx2:vi2 261 native event {} -> vsync", index);
         if (index < m_native_events.size() && m_native_events[index]) {
             SetVsyncSlot(index, true);
-            m_hdr_change_slots &= ~(1U << index);
+            m_hdr_status_slots &= ~(1U << index);
+            m_hdr_paper_white_slots &= ~(1U << index);
         }
         TipcReplyWords(ctx, {});
     }
@@ -3445,11 +3445,9 @@ private:
         if (index < m_native_events.size() && m_native_events[index]) {
             SetVsyncSlot(index, false);
             const u32 command = ctx.GetCommand();
-            if (command == 265 || command == 267) {
-                m_hdr_change_slots |= 1U << index;
-            } else {
-                m_hdr_change_slots &= ~(1U << index);
-            }
+            const u32 bit = 1U << index;
+            m_hdr_status_slots = (m_hdr_status_slots & ~bit) | (command == 265 ? bit : 0);
+            m_hdr_paper_white_slots = (m_hdr_paper_white_slots & ~bit) | (command == 267 ? bit : 0);
             m_native_events[index]->Signal(system.Kernel());
         }
         TipcReplyWords(ctx, {});
@@ -3461,7 +3459,8 @@ private:
         LOG_INFO(Service, "nx2:vi2 {} native event {} unbound", ctx.GetCommand(), index);
         if (index < m_native_events.size() && m_native_events[index]) {
             SetVsyncSlot(index, false);
-            m_hdr_change_slots &= ~(1U << index);
+            m_hdr_status_slots &= ~(1U << index);
+            m_hdr_paper_white_slots &= ~(1U << index);
         }
         TipcReplyWords(ctx, {});
     }
@@ -3580,9 +3579,10 @@ private:
     std::array<std::optional<u64>, 15> m_recorded_ticks{}; ///< 53's recorders, by present word 18
     u64 m_shown_layout{}; // image and crop size last logged
     u64 m_logged_hdr_output{~u64{}}; // HDR status last logged
-    u64 m_hdr_generation{};           // DisplayHdrMonitor generation NotifyHdrChange last saw
-    u32 m_hdr_change_slots{};         // native event slots bound to HDR status / paper white
-    std::atomic<bool> m_told_hdr{};   // the last HDR status answer was HDR
+    u64 m_hdr_generation{}; // DisplayHdrMonitor generation NotifyHdrChange last saw
+    u32 m_hdr_status_slots{};
+    u32 m_hdr_paper_white_slots{};
+    Nx2HdrNotifications m_hdr_notifications;
     std::shared_ptr<std::atomic<bool>> m_capture_pending = std::make_shared<std::atomic<bool>>(false);
 };
 

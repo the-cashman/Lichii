@@ -28,6 +28,8 @@ Visit the [Lichii game compatibility website](https://lichii.zortos.me) to find 
 
 Download Lichii only from this repository's [releases page](https://github.com/zortos293/Lichii/releases). Lichii has no other download site: archives offered elsewhere, such as lichii.org, are not built by this project, and one has been reported to install malware ([#545](https://github.com/zortos293/Lichii/issues/545)).
 
+Linux ARM64 now ships only the standard AppImage and tarball. If no update appears on an older ARM64 PGO build, download the standard ARM64 package from the releases page.
+
 On Windows, extract the entire build archive and run **lichii.exe**. Use homebrew you have permission to run, or your own games and system files dumped from a console you own, where permitted by applicable law. Games, keys and firmware are not included. The project does not provide download sources for them. Owning a console or game does not by itself establish permission to bypass access controls or redistribute its files.
 
 ### Existing saves and settings

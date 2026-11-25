@@ -59,6 +59,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Test release retests against a local API fixture
+        run: python3 -B tools/ci/test_release_retest.py
+
       - name: Install Linux dependencies
         run: |
           sudo apt-get update

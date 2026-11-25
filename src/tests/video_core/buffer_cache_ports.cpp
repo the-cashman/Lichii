@@ -400,6 +400,21 @@ struct BufferCacheTestAccess {
     static size_t ReadDownloads(Cache& cache) {
         return cache.read_downloads.size();
     }
+    static bool HasSpeculativeRead(Cache& cache, DAddr addr) {
+        return std::ranges::any_of(cache.read_downloads, [addr](const auto& download) {
+            return download.speculative_clean_ranges &&
+                   download.speculative_clean_ranges->Intersects(addr, 1);
+        });
+    }
+    static u32 MaxUnreadWrites() {
+        return Cache::MaxUnreadWrites;
+    }
+    static u32 MaxPendingEarlyDownloads() {
+        return Cache::MaxPendingEarlyDownloads;
+    }
+    static u64 EarlyBytesPerFrame() {
+        return Cache::EarlyBytesPerFrame;
+    }
     /// Every read download compared with a synchronous flush (EDEN_NX2_READ_CHECK=1).
     static void CheckEveryRead(Cache& cache) {
         cache.read_check.every = 1;
@@ -1675,6 +1690,70 @@ VideoCore::RasterizerDownloadArea ReadWord(Fixture& f, DAddr address) {
 }
 } // namespace
 
+TEST_CASE("Adjacent read downloads supply the same bytes with fewer host waits",
+          "[buffer_ports][read_runs]") {
+    Fixture f;
+    const Nx2TitleScope nx2_title;
+    const bool read_runs = GENERATE(false, true);
+    if (read_runs) {
+        f.cache->SetReadRunPageFilter([](DAddr, u64) { return true; });
+    }
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    for (u32 i = 0; i < 4; ++i) {
+        WriteByDispatch(f, id, 0x20000 + i * 0x1000, 0x80, static_cast<u8>(i + 1));
+    }
+    const auto first = f.cache->GetFlushArea(0x21010, 4);
+    REQUIRE_FALSE(first->preemtive);
+    f.cache->DownloadMemoryForRead(first->start_address, first->end_address - first->start_address);
+    REQUIRE(Access::HasSpeculativeRead(*f.cache, 0x22010) == read_runs);
+    f.cache->FinishReadDownloads(first->start_address, first->end_address - first->start_address);
+    for (u32 i = 0; i < 4; ++i) {
+        const DAddr page = 0x20000 + i * 0x1000;
+        const auto area = ReadWord(f, page + 0x10);
+        REQUIRE(area.preemtive == (read_runs || i == 1));
+        const auto* guest = f.bytes + (page - 0x10000);
+        REQUIRE(std::all_of(guest, guest + 0x80, [i](u8 value) { return value == i + 1; }));
+        REQUIRE(std::all_of(guest + 0x80, guest + 0x1000, [](u8 value) { return value == 0; }));
+    }
+    CAPTURE(read_runs, f.runtime.host_read_waits);
+    REQUIRE(f.runtime.host_read_barriers == (read_runs ? 1U : 4U));
+    REQUIRE(f.runtime.host_read_waits == (read_runs ? 1U : 4U));
+}
+
+TEST_CASE("Adjacent read downloads stop before a page they cannot take",
+          "[buffer_ports][read_runs]") {
+    Fixture f;
+    f.cache->SetReadRunPageFilter([](DAddr, u64) { return true; });
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    auto& buffer = Access::Get(*f.cache, id);
+    std::ranges::fill(buffer.bytes, 0x12);
+    Access::Dirty(*f.cache, 0x21000, 0x2080);
+    SECTION("a clean page with no GPU writes") {
+        f.cache->WriteMemory(0x22000, 0x1000);
+        Access::Upload(*f.cache, id, 0x22000, 0x1000);
+    }
+    SECTION("a CPU-dirty page that still has GPU-modified bytes") {
+        f.cache->WriteMemory(0x22080, 4);
+        REQUIRE(f.cache->IsRegionGpuModified(0x22000, 0x80));
+    }
+    SECTION("a page with a pending CPU write") {
+        f.cache->SetPendingCpuWrites(
+            [](const std::function<void(DAddr, size_t)>& callback) { callback(0x22080, 4); });
+    }
+    SECTION("a page marked Preflushable") {
+        REQUIRE_FALSE(f.cache->GetFlushArea(0x22010, 4)->preemtive);
+    }
+    SECTION("a page excluded by the renderer") {
+        f.cache->SetReadRunPageFilter([](DAddr addr, u64) { return addr != 0x22000; });
+    }
+    f.cache->DownloadMemoryForRead(0x21000, 0x1000);
+    f.cache->FinishReadDownloads(0x21000, 0x1000);
+    REQUIRE(f.bytes[0x11000] == 0x12);
+    REQUIRE(f.bytes[0x12000] == 0);
+    REQUIRE(f.bytes[0x13000] == 0);
+    REQUIRE(f.cache->IsRegionGpuModified(0x23000, 0x80));
+}
+
 TEST_CASE("Pages read after each GPU write get their downloads right behind the writes",
           "[buffer_ports]") {
     Fixture f;
@@ -2221,6 +2300,100 @@ TEST_CASE("A guest write stored while a read download lands keeps its bytes", "[
     REQUIRE(VideoCore::DownloadLanding::Waits() > waits);
     REQUIRE(Access::ReadChecks(*f.cache).checked == 1);
     REQUIRE(Access::ReadChecks(*f.cache).mismatched == 0);
+}
+
+TEST_CASE("A write racing an adjacent download keeps its bytes",
+          "[buffer_ports][read_runs]") {
+    Fixture f;
+    f.cache->SetReadRunPageFilter([](DAddr, u64) { return true; });
+    const auto id = GuestWrittenPage(f);
+    auto& buffer = Access::Get(*f.cache, id);
+    std::ranges::copy(OldGuestValue, buffer.bytes.begin() + 0x1a20);
+    std::ranges::copy(OldGuestValue, f.bytes + 0x11a20);
+    Access::MarkWritten(*f.cache, id, 0x21000, 0x1000);
+    GuestCpuWrites writes{*f.cache};
+    f.cache->DownloadMemoryForRead(0x20000, 0x1000);
+    REQUIRE(Access::HasSpeculativeRead(*f.cache, 0x21010));
+    SECTION("the write is pending when the landing starts") {
+        writes.Write(f.bytes + 0x11a20, 0x21a20, NewGuestValue);
+        f.cache->FinishReadDownloads(0x20000, 0x1000);
+    }
+    SECTION("the write was already applied") {
+        writes.Write(f.bytes + 0x11a20, 0x21a20, NewGuestValue);
+        writes.Apply();
+        f.cache->FinishReadDownloads(0x20000, 0x1000);
+    }
+    SECTION("the write is collected after the landing checked pending writes") {
+        const u64 waits = VideoCore::DownloadLanding::Waits();
+        RacingGuestWrite race{f, writes, 0x21a20, 1};
+        f.cache->FinishReadDownloads(0x20000, 0x1000);
+        REQUIRE(race.Stored());
+        REQUIRE(VideoCore::DownloadLanding::Waits() > waits);
+    }
+    REQUIRE(GuestHolds(f, 0x21a20, NewGuestValue));
+    REQUIRE(f.bytes[0x11000] == 0x12);
+    REQUIRE(f.bytes[0x11a40] == 0x12);
+    REQUIRE(f.runtime.host_read_waits == 1);
+}
+
+TEST_CASE("An adjacent staged page that becomes CPU-dirty is not downloaded",
+          "[buffer_ports][read_runs]") {
+    Fixture f;
+    f.cache->SetReadRunPageFilter([](DAddr, u64) { return true; });
+    const auto id = GuestWrittenPage(f);
+    Access::MarkWritten(*f.cache, id, 0x21000, 0x80);
+    f.cache->DownloadMemoryForRead(0x20000, 0x1000);
+    REQUIRE(Access::HasSpeculativeRead(*f.cache, 0x21010));
+    f.runtime.before_completion = [&] { f.cache->WriteMemory(0x21080, 4); };
+    f.cache->FinishReadDownloads(0x20000, 0x1000);
+    REQUIRE(f.bytes[0x10000] == 0x12);
+    REQUIRE(f.bytes[0x11000] == 0);
+    REQUIRE(f.cache->IsRegionGpuModified(0x21000, 0x80));
+    REQUIRE_FALSE(f.cache->GetFlushArea(0x21010, 4)->in_flight);
+}
+
+TEST_CASE("A second reader queues its own copy over a speculative download",
+          "[buffer_ports][read_runs]") {
+    Fixture f;
+    const bool cpu_write = GENERATE(false, true);
+    f.cache->SetReadRunPageFilter([](DAddr, u64) { return true; });
+    const auto id = GuestWrittenPage(f);
+    Access::MarkWritten(*f.cache, id, 0x21000, 0x80);
+    f.cache->DownloadMemoryForRead(0x20000, 0x1000);
+    REQUIRE(Access::HasSpeculativeRead(*f.cache, 0x21010));
+    if (cpu_write) {
+        f.runtime.before_completion = [&] {
+            f.cache->WriteMemory(0x21080, 4);
+            f.bytes[0x11080] = 0x93;
+        };
+    }
+    const auto area = ReadWord(f, 0x21010);
+    REQUIRE_FALSE(area.preemtive);
+    REQUIRE_FALSE(area.in_flight);
+    REQUIRE(f.runtime.host_read_barriers == 2);
+    REQUIRE(f.runtime.host_read_waits == 1);
+    REQUIRE(f.bytes[0x10010] == 0x12);
+    REQUIRE(f.bytes[0x11010] == 0x12);
+    REQUIRE(f.bytes[0x11080] == (cpu_write ? 0x93 : 0));
+}
+
+TEST_CASE("A new GPU write supersedes an adjacent staged copy",
+          "[buffer_ports][read_runs]") {
+    Fixture f;
+    const Nx2TitleScope nx2_title;
+    f.cache->SetReadRunPageFilter([](DAddr, u64) { return true; });
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    WriteByDispatch(f, id, 0x20000, 0x80, 1);
+    WriteByDispatch(f, id, 0x21000, 0x80, 2);
+    f.cache->DownloadMemoryForRead(0x20000, 0x1000);
+    REQUIRE(Access::HasSpeculativeRead(*f.cache, 0x21010));
+    WriteByDispatch(f, id, 0x21000, 0x80, 3);
+    f.cache->FinishReadDownloads(0x20000, 0x1000);
+    REQUIRE(f.bytes[0x10010] == 1);
+    REQUIRE(f.cache->IsRegionGpuModified(0x21000, 0x80));
+    REQUIRE_FALSE(ReadWord(f, 0x21010).preemtive);
+    REQUIRE(f.bytes[0x11010] == 3);
+    REQUIRE(f.runtime.host_read_waits == 2);
 }
 
 TEST_CASE("Read download check leaves out a guest write stored while it compares",

@@ -17,9 +17,16 @@ find_package(Qt6 REQUIRED COMPONENTS Widgets)
 option(LICHII_USE_PENDING_RELEASE_NOTES "Show the staged What's new notes for this build" OFF)
 
 if(LICHII_TESTS)
-    add_subdirectory(../tests/qt_compatibility ${CMAKE_BINARY_DIR}/qt_compatibility_tests)
-    add_subdirectory(../tests/qt_iidb ${CMAKE_BINARY_DIR}/qt_iidb_tests)
-    add_subdirectory(../tests/qt_whats_new ${CMAKE_BINARY_DIR}/qt_whats_new_tests)
+    # The bundled Qt has no Test module
+    find_package(Qt6 QUIET OPTIONAL_COMPONENTS Test)
+    if(TARGET Qt6::Test)
+        add_subdirectory(../tests/qt_compatibility ${CMAKE_BINARY_DIR}/qt_compatibility_tests)
+        add_subdirectory(../tests/qt_iidb ${CMAKE_BINARY_DIR}/qt_iidb_tests)
+        add_subdirectory(../tests/qt_nup ${CMAKE_BINARY_DIR}/qt_nup_tests)
+        add_subdirectory(../tests/qt_whats_new ${CMAKE_BINARY_DIR}/qt_whats_new_tests)
+    else()
+        message(STATUS "Qt6Test not found: skipping the Qt frontend tests")
+    endif()
 endif()
 
 add_executable(lichii

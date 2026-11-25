@@ -1744,6 +1744,7 @@ void MainWindow::RestoreUIState() {
     ToggleWindowMode();
 
     ui->action_Fullscreen->setChecked(UISettings::values.fullscreen.GetValue());
+    ui->action_Preserve_Window_Size->setChecked(UISettings::values.preserve_window_size.GetValue());
 
     ui->action_Enable_Overlay_Applet->setChecked(Settings::values.enable_overlay.GetValue());
 
@@ -1910,6 +1911,11 @@ void MainWindow::ConnectMenuEvents() {
 #else
     ui->action_Post_Processing_Shaders->setVisible(false);
 #endif
+
+    connect(ui->action_Preserve_Window_Size, &QAction::triggered, this, [this](bool enabled) {
+        UISettings::values.preserve_window_size = enabled;
+        OnSaveConfig();
+    });
 
     connect_menu(ui->action_Reset_Window_Size_720, &MainWindow::ResetWindowSize720);
     connect_menu(ui->action_Reset_Window_Size_900, &MainWindow::ResetWindowSize900);
@@ -2779,7 +2785,8 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     emulation_running = true;
     if (ui->action_Fullscreen->isChecked()) {
         ShowFullscreen();
-    } else if (!(ui->action_Single_Window_Mode->isChecked() ? isMaximized()
+    } else if (!UISettings::values.preserve_window_size &&
+               !(ui->action_Single_Window_Mode->isChecked() ? isMaximized()
                                                             : render_window->isMaximized())) {
         if (Settings::IsDockedMode()) {
             ResetWindowSize1080();
