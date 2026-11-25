@@ -1569,6 +1569,24 @@ void GpuSplit::ReportAcquire() {
              passed, by_queued, by_poll, by_narrow, latched, drained, valve_drains, polls,
              acquire_polls, list_polls, back_waits, back_sleeps, spin_ms, early_publishes,
              settles);
+    {
+        const u64 needs = take(stats.drain_needs_drain), unmet = take(stats.drain_unmet);
+        const u64 overdue = take(stats.drain_overdue), other = take(stats.drain_other);
+        const u64 eq = take(stats.drain_by_op[0]), ge = take(stats.drain_by_op[1]);
+        const u64 mask = take(stats.drain_by_op[2]), met_after = take(stats.drain_met_after);
+        const u64 predicted = take(stats.drain_predicted);
+        const u64 first = take(stats.drain_first);
+        const double drain_ms = static_cast<double>(take(stats.drain_ns)) / 1e6;
+        if (drained != 0) {
+            LOG_INFO(HW_GPU,
+                     "Acquire drains in 10 s: {} ({:.1f} ms, {} at the first check): {} on a page needing a drained "
+                     "read, {} word not met without a drain, {} overdue, {} other; equal {} "
+                     "greater-or-equal {} mask {}; met right after the drain {}; with a known "
+                     "queued release that didn't meet it {}",
+                     drained, drain_ms, first, needs, unmet, overdue, other, eq, ge, mask, met_after,
+                     predicted);
+        }
+    }
     LOG_INFO(HW_GPU,
              "GPU thread waits for suspended channels in 10 s: {} in hardware, {} in the OS, {} "
              "ended by a wake, {} by a store to a semaphore word; channels that moved without "

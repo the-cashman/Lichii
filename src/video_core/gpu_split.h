@@ -66,6 +66,19 @@ struct AcquireStats {
     std::atomic<u64> latched{};   ///< Polls resumed by a release the back ran (no drain)
     std::atomic<u64> drained{};   ///< Acquires and polls that drained the split
     std::atomic<u64> valve_drains{}; ///< Of drained: polls of an unmet acquire, once per 1 ms
+    /// [bazzite acq] Of drained: why (the word's page needs a drained read: GPU-written or
+    /// buffer-cache newer; the word read without a drain didn't meet it; the 2 s report; other),
+    /// by operation (equal, greater-or-equal, mask), whether the word met it right after the
+    /// drain, and whether a queued release to the word was known (value didn't meet it) or none.
+    std::atomic<u64> drain_needs_drain{};
+    std::atomic<u64> drain_unmet{};
+    std::atomic<u64> drain_overdue{};
+    std::atomic<u64> drain_other{};
+    std::array<std::atomic<u64>, 3> drain_by_op{};
+    std::atomic<u64> drain_met_after{};
+    std::atomic<u64> drain_predicted{};
+    std::atomic<u64> drain_ns{};
+    std::atomic<u64> drain_first{}; ///< Of drained: the acquire's first check (not a poll)
     std::atomic<u64> polls{};     ///< Polls that keep waiting without a drain
     std::atomic<u64> acquire_polls{}; ///< Polls of suspended channels waiting on an acquire
     std::atomic<u64> list_polls{};    ///< ...and on a command list copy the GPU writes

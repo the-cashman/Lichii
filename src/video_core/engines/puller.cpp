@@ -215,6 +215,50 @@ void VerifyWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcquire& acq
     }
 }
 
+// [bazzite acq] With the acquire counters on: why an acquire drains the split (see AcquireStats),
+// and when; CountAcquireDrainEnd adds the drain's time and whether the word met it after.
+std::chrono::steady_clock::time_point CountAcquireDrain(DmaPusher& dma_pusher,
+                                                        const Puller::PendingAcquire& acquire,
+                                                        bool overdue) {
+    if (!VideoCommon::g_acquire_counting) {
+        return {};
+    }
+    auto& stats = VideoCommon::g_acquire_stats;
+    if (overdue) {
+        VideoCommon::Count(stats.drain_overdue);
+    } else if (dma_pusher.memory_manager.Nx2ReadNeedsDrain(acquire.address, sizeof(u32))) {
+        VideoCommon::Count(stats.drain_needs_drain);
+    } else if (VideoCommon::GpuSplit::Get().Active() &&
+               VideoCommon::GpuSplit::Get().NarrowDrains()) {
+        // Read without a drain (narrowed or polled) and not met.
+        VideoCommon::Count(stats.drain_unmet);
+    } else {
+        VideoCommon::Count(stats.drain_other);
+    }
+    // Puller::GpuSemaphoreOperation (private): 1 equal, 4 greater-or-equal, 8 mask.
+    VideoCommon::Count(stats.drain_by_op[acquire.operation == 1 ? 0 : acquire.operation == 4 ? 1 : 2]);
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (split.Active() && split.SemaphorePredict() &&
+        split.PredictedRelease(&dma_pusher.memory_manager, acquire.address)) {
+        VideoCommon::Count(stats.drain_predicted);
+    }
+    return std::chrono::steady_clock::now();
+}
+
+void CountAcquireDrainEnd(std::chrono::steady_clock::time_point begin, bool met) {
+    if (!VideoCommon::g_acquire_counting) {
+        return;
+    }
+    auto& stats = VideoCommon::g_acquire_stats;
+    VideoCommon::Count(stats.drain_ns,
+                       static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now() - begin)
+                                            .count()));
+    if (met) {
+        VideoCommon::Count(stats.drain_met_after);
+    }
+}
+
 } // Anonymous namespace
 
 Puller::~Puller() {
@@ -314,10 +358,12 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
         VideoCommon::Count(stats.valve_drains);
     }
     VideoCommon::Count(stats.drained);
+    const auto drain_begin = CountAcquireDrain(dma_pusher, *pending_acquire, overdue);
     // The release may still be queued for the split GPU thread's back half (and the caches
     // ReadSemaphoreWord asks are its state).
     DrainBack();
     const u32 current = ReadSemaphoreWord(dma_pusher, pending_acquire->address);
+    CountAcquireDrainEnd(drain_begin, pending_acquire->Matches(current));
     if (narrowed) {
         VideoCommon::GpuSplit::ReportNarrowCheck(VideoCommon::DrainSite::NarrowAcquire,
                                                  *narrowed != current ? 1U : 0U, 0,
@@ -574,8 +620,11 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         // The first check still drains and releases the fences when not met (#949 too; skipping
         // that crashed the field load, gpuback-sync.md): only the polls use the 1 ms valve.
         VideoCommon::Count(stats.drained);
+        VideoCommon::Count(stats.drain_first);
+        const auto drain_begin = CountAcquireDrain(dma_pusher, acquire, false);
         DrainBack();
         const u32 current = ReadSemaphoreWord(dma_pusher, acquire.address);
+        CountAcquireDrainEnd(drain_begin, acquire.Matches(current));
         if (narrowed) {
             VideoCommon::GpuSplit::ReportNarrowCheck(VideoCommon::DrainSite::NarrowAcquire,
                                                      *narrowed != current ? 1U : 0U, 0,
