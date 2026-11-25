@@ -79,6 +79,15 @@ struct AcquireStats {
     std::atomic<u64> drain_predicted{};
     std::atomic<u64> drain_ns{};
     std::atomic<u64> drain_first{}; ///< Of drained: the acquire's first check (not a poll)
+    /// [bazzite acq] EDEN_NX2_ACQ_UNMET_DEFER: acquires (first checks, polls) that skipped the
+    /// narrowed read and full drain; with EDEN_NX2_ACQUIRE_VERIFY those a drain would have met;
+    /// the front's time in the acquire path's waits by switch phase (0 off, 1 on).
+    std::atomic<u64> skip_first{};
+    std::atomic<u64> skip_polls{};
+    std::atomic<u64> skip_verified{};
+    std::atomic<u64> skip_would_meet{};
+    std::array<std::atomic<u64>, 2> acq_wait_ns{};
+    std::array<std::atomic<u64>, 2> acq_checks{};
     std::atomic<u64> polls{};     ///< Polls that keep waiting without a drain
     std::atomic<u64> acquire_polls{}; ///< Polls of suspended channels waiting on an acquire
     std::atomic<u64> list_polls{};    ///< ...and on a command list copy the GPU writes

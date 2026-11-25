@@ -215,6 +215,91 @@ void VerifyWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcquire& acq
     }
 }
 
+// [bazzite acq] EDEN_NX2_ACQ_UNMET_DEFER=1: an acquire whose word, read without a drain once the
+// recorded writes over it ran (EDEN_NX2_ACQUIRE_POLL), doesn't meet it, and with no release to it
+// the front knows of (EDEN_NX2_SEM_PREDICT), suspends without the narrowed read (it waits for
+// every dispatch sent) and the full drain, and its fence release is queued to the back instead of
+// waited for. Bananza: ~2,000 such acquires per 10 s, all equal, none met right after the drain.
+// The suspended channel's polls see the word (and drain once per 1 ms) as before. In-session
+// A/B: EDEN_NX2_ACQ_AB_MS=<ms> turns it on in odd periods of the steady clock
+// ((steady_ns / 1e6 / ms) % 2 == 1), off in even ones (EDEN_NX2_PRESENT_LOG times are that clock).
+bool AcqUnmetDefer() {
+    static const bool on = [] {
+        const char* value = std::getenv("EDEN_NX2_ACQ_UNMET_DEFER");
+        return value != nullptr && value[0] == '1';
+    }();
+    static const s64 ab_ms = [] {
+        const char* value = std::getenv("EDEN_NX2_ACQ_AB_MS");
+        const s64 ms = value != nullptr ? std::strtoll(value, nullptr, 10) : 0;
+        if (ms > 0) {
+            LOG_INFO(HW_GPU, "EDEN_NX2_ACQ_AB_MS={}: unmet defer on in odd periods of the steady "
+                             "clock, off in even ones", ms);
+        }
+        return ms;
+    }();
+    if (ab_ms > 0) {
+        const s64 now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+        return (now_ms / ab_ms) % 2 == 1;
+    }
+    return on;
+}
+
+// The front's time in an acquire's waits (narrowed read, drain, fence release), by phase.
+struct AcqWaitScope {
+    explicit AcqWaitScope(bool defer_) : defer{defer_} {
+        if (VideoCommon::g_acquire_counting) {
+            begin = std::chrono::steady_clock::now();
+            VideoCommon::Count(VideoCommon::g_acquire_stats.acq_checks[defer ? 1 : 0]);
+        }
+    }
+    ~AcqWaitScope() {
+        if (VideoCommon::g_acquire_counting) {
+            VideoCommon::Count(
+                VideoCommon::g_acquire_stats.acq_wait_ns[defer ? 1 : 0],
+                static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - begin)
+                                     .count()));
+        }
+    }
+    bool defer;
+    std::chrono::steady_clock::time_point begin{};
+};
+
+// Whether an acquire not met by `polled` (read without a drain) skips the narrowed read and the
+// drain: the switch, and no release to the word the front knows of.
+bool SkipUnmetDrain(DmaPusher& dma_pusher, GPUVAddr address, bool polled, bool defer) {
+    if (!defer || !polled || VideoCommon::GpuSplit::NarrowVerify()) {
+        return false;
+    }
+    auto& split = VideoCommon::GpuSplit::Get();
+    return split.Active() && split.NarrowDrains() &&
+           !(split.SemaphorePredict() &&
+             split.PredictedRelease(&dma_pusher.memory_manager, address));
+}
+
+// EDEN_NX2_ACQUIRE_VERIFY with a skipped drain: drains anyway and counts where the word met it.
+void VerifySkip(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire) {
+    if (!VideoCommon::g_acquire_verify) {
+        return;
+    }
+    DrainBack();
+    const u32 word = ReadSemaphoreWord(dma_pusher, acquire.address);
+    auto& stats = VideoCommon::g_acquire_stats;
+    VideoCommon::Count(stats.skip_verified);
+    if (acquire.Matches(word)) {
+        VideoCommon::Count(stats.skip_would_meet);
+        if (static std::atomic<u32> logged{}; logged.fetch_add(1) < 16) {
+            LOG_WARNING(HW_GPU,
+                        "Acquire unmet defer verify: channel {} skipped the drain for semaphore "
+                        "{:#x} (op {}, {:#x}); the word is {:#x} after one",
+                        dma_pusher.channel_state.bind_id, acquire.address, acquire.operation,
+                        acquire.value, word);
+        }
+    }
+}
+
 // [bazzite acq] With the acquire counters on: why an acquire drains the split (see AcquireStats),
 // and when; CountAcquireDrainEnd adds the drain's time and whether the word met it after.
 std::chrono::steady_clock::time_point CountAcquireDrain(DmaPusher& dma_pusher,
@@ -320,6 +405,10 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
             return true;
         }
     }
+    const bool defer = AcqUnmetDefer();
+    const AcqWaitScope wait_scope{defer};
+    const bool skip = !overdue && SkipUnmetDrain(dma_pusher, pending_acquire->address,
+                                                  polled.has_value(), defer);
     // Not met in guest memory: the release may still be queued for the back (one the front
     // doesn't record, such as a QMD release or a report). Check it as below rather than wait for
     // the next poll: suspended channels are polled with yields and 1 ms sleeps, and that latency
@@ -327,8 +416,12 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     // drain returns at once, so an acquire the CPU releases costs no wait on the back.
     // Met without waiting for all queued work: the work after it is queued behind the work
     // before it, and command list reads wait for that work (NoteSync).
-    std::optional<u32> narrowed = NarrowSemaphoreRead(dma_pusher, pending_acquire->address);
-    const bool read_without_drain = polled.has_value() && narrowed.has_value();
+    std::optional<u32> narrowed =
+        skip ? std::nullopt : NarrowSemaphoreRead(dma_pusher, pending_acquire->address);
+    const bool read_without_drain = polled.has_value() && (skip || narrowed.has_value());
+    if (skip) {
+        VideoCommon::Count(stats.skip_polls);
+    }
     if (narrowed && pending_acquire->Matches(*narrowed)) {
         if (!VideoCommon::GpuSplit::NarrowVerify()) {
             VideoCommon::GpuSplit::Get().NoteSyncDone(VideoCommon::UnboundedCause::AcquireSync);
@@ -590,8 +683,8 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             VerifyWithoutDrain(dma_pusher, acquire, AcquireCheck::MetByQueued);
             return;
         }
-        if (const std::optional<u32> polled = PollSemaphoreRead(dma_pusher, acquire.address);
-            polled && acquire.Matches(*polled)) {
+        const std::optional<u32> polled = PollSemaphoreRead(dma_pusher, acquire.address);
+        if (polled && acquire.Matches(*polled)) {
             NoteAcquireSync(acquire.address);
             VideoCommon::Count(stats.passed);
             VideoCommon::Count(stats.by_poll);
@@ -600,10 +693,14 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             VideoCommon::Nx2FastDraw::NoteSync();
             return;
         }
+        const bool defer = AcqUnmetDefer();
+        const AcqWaitScope wait_scope{defer};
+        const bool skip = SkipUnmetDrain(dma_pusher, acquire.address, polled.has_value(), defer);
         // Not met in guest memory: the release may still be queued for the back, so check it
         // with the drained read below before suspending (see CanResumeAcquire). Suspending at
         // once left the channel to the pending-channel polling, whose latency halved the FPS.
-        std::optional<u32> narrowed = NarrowSemaphoreRead(dma_pusher, acquire.address);
+        std::optional<u32> narrowed =
+            skip ? std::nullopt : NarrowSemaphoreRead(dma_pusher, acquire.address);
         if (narrowed && acquire.Matches(*narrowed)) {
             if (!VideoCommon::GpuSplit::NarrowVerify()) {
                 VideoCommon::GpuSplit::Get().NoteSyncDone(
@@ -619,12 +716,19 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         }
         // The first check still drains and releases the fences when not met (#949 too; skipping
         // that crashed the field load, gpuback-sync.md): only the polls use the 1 ms valve.
-        VideoCommon::Count(stats.drained);
-        VideoCommon::Count(stats.drain_first);
-        const auto drain_begin = CountAcquireDrain(dma_pusher, acquire, false);
-        DrainBack();
-        const u32 current = ReadSemaphoreWord(dma_pusher, acquire.address);
-        CountAcquireDrainEnd(drain_begin, acquire.Matches(current));
+        u32 current;
+        if (skip) {
+            VideoCommon::Count(stats.skip_first);
+            VerifySkip(dma_pusher, acquire);
+            current = *polled;
+        } else {
+            VideoCommon::Count(stats.drained);
+            VideoCommon::Count(stats.drain_first);
+            const auto drain_begin = CountAcquireDrain(dma_pusher, acquire, false);
+            DrainBack();
+            current = ReadSemaphoreWord(dma_pusher, acquire.address);
+            CountAcquireDrainEnd(drain_begin, acquire.Matches(current));
+        }
         if (narrowed) {
             VideoCommon::GpuSplit::ReportNarrowCheck(VideoCommon::DrainSite::NarrowAcquire,
                                                      *narrowed != current ? 1U : 0U, 0,
@@ -650,8 +754,15 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                           Nx2SemaphoreWaiters::MaxWaiters);
             }
         }
-        ReleaseFences(dma_pusher);
-        if (!waiters.Latched(this) && !acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
+        if (skip) {
+            // Queued, not waited for: the back runs it after the work sent so far.
+            OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
+        } else {
+            ReleaseFences(dma_pusher);
+        }
+        if (!waiters.Latched(this) &&
+            !acquire.Matches(skip ? ReadAcquireWord(dma_pusher, acquire.address)
+                                  : ReadSemaphoreWord(dma_pusher, acquire.address))) {
             pending_acquire = acquire;
             dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
             VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);

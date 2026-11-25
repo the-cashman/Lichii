@@ -1576,6 +1576,22 @@ void GpuSplit::ReportAcquire() {
         const u64 mask = take(stats.drain_by_op[2]), met_after = take(stats.drain_met_after);
         const u64 predicted = take(stats.drain_predicted);
         const u64 first = take(stats.drain_first);
+        const u64 skip_first = take(stats.skip_first), skip_polls = take(stats.skip_polls);
+        const u64 skip_verified = take(stats.skip_verified);
+        const u64 skip_would_meet = take(stats.skip_would_meet);
+        const double wait0 = static_cast<double>(take(stats.acq_wait_ns[0])) / 1e6;
+        const double wait1 = static_cast<double>(take(stats.acq_wait_ns[1])) / 1e6;
+        const u64 checks0 = take(stats.acq_checks[0]), checks1 = take(stats.acq_checks[1]);
+        LOG_INFO(HW_GPU,
+                 "Acquire unmet defer in 10 s: {} first checks and {} polls skipped the drain "
+                 "({} verified, {} a drain would have met); front acquire-path waits: off "
+                 "{:.1f} ms over {} checks, on {:.1f} ms over {} checks",
+                 skip_first, skip_polls, skip_verified, skip_would_meet, wait0, checks0, wait1,
+                 checks1);
+        if (skip_would_meet != 0) {
+            LOG_WARNING(HW_GPU, "Acquire unmet defer verify: {} skipped drains would have met",
+                        skip_would_meet);
+        }
         const double drain_ms = static_cast<double>(take(stats.drain_ns)) / 1e6;
         if (drained != 0) {
             LOG_INFO(HW_GPU,
