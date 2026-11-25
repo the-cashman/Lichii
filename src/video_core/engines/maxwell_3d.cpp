@@ -2287,7 +2287,10 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                 fs.oot_writes.clear();
             }
         }
-        if (replacement == OotMacros::Id::None ||
+        // A list indexed draw (FrontTakeListIndexedDraw) runs the native code: its draw.end is
+        // seen in emit below. Bananza's indexed indirect draw macro has the code of OoT's 0xea0,
+        // whose replacement writes the registers without it.
+        if (replacement == OotMacros::Id::None || fs.list_indexed_draw != 0 ||
             !FrontRunOotMacro(split, fs, method, replacement)) {
             const auto parameter_count = fs.parameters.size();
             const auto read = [&](u32 address) {
