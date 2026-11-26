@@ -33,15 +33,43 @@
 // leaves them; mode 2 checks that the GPU-written record still says the same.
 namespace Tegra::Nx2ListIndexedDraw {
 
-/// EDEN_NX2_LIST_INDEXED_DRAW, read once: 1 (the default) = indirect draw, 0 = off (the front
-/// reads the words back), 2 = off, and every list that would be taken is checked after its
-/// words are read back.
+/// EDEN_NX2_LIST_INDEXED_DRAW_AB_MS=<ms>, read once: in-session A/B, lists are taken (mode 1) only
+/// in odd periods of the steady clock (as EDEN_NX2_ACQ_AB_MS); 0 or unset = no A/B.
+[[nodiscard]] inline s64 AbPeriodMs() {
+    static const s64 period = [] {
+        const char* const value = std::getenv("EDEN_NX2_LIST_INDEXED_DRAW_AB_MS");
+        const s64 ms = value != nullptr ? std::atoll(value) : 0;
+        if (ms > 0) {
+            LOG_INFO(HW_GPU, "EDEN_NX2_LIST_INDEXED_DRAW_AB_MS={}: list indexed draws in odd "
+                             "periods of the steady clock",
+                     ms);
+        }
+        return ms;
+    }();
+    return period;
+}
+
+/// EDEN_NX2_LIST_INDEXED_DRAW, read once: 1 = indirect draw, 0 (the default here; upstream's
+/// default is 1) = off (the front reads the words back), 2 = off, and every list that would be
+/// taken is checked after its words are read back. EDEN_NX2_LIST_INDEXED_DRAW_AB_MS implies 1.
 [[nodiscard]] inline int Mode() {
     static const int mode = [] {
         const char* const value = std::getenv("EDEN_NX2_LIST_INDEXED_DRAW");
-        return value != nullptr ? std::atoi(value) : 1;
+        return value != nullptr ? std::atoi(value) : (AbPeriodMs() > 0 ? 1 : 0);
     }();
     return mode;
+}
+
+/// Mode 1 under the A/B: whether this period takes lists.
+[[nodiscard]] inline bool AbOn() {
+    const s64 period = AbPeriodMs();
+    if (period <= 0) {
+        return true;
+    }
+    const s64 ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch())
+                       .count();
+    return ((ms / period) & 1) != 0;
 }
 
 /// EDEN_NX2_LIST_INDEXED_DRAW_DIAG: the counters below are logged every 2 s.

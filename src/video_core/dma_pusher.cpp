@@ -1395,6 +1395,9 @@ bool DmaPusher::TakeListIndexedDraw(GPUVAddr address, u32 count) {
         return false;
     }
     ListDraw::MaybeLog();
+    if (mode == 1 && !ListDraw::AbOn()) {
+        return false;
+    }
     auto& split = VideoCommon::GpuSplit::Get();
     // The five words are the remaining parameters of a 3D macro call begun in the entry before,
     // on one mapped page that draws write.
