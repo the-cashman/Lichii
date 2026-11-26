@@ -5,6 +5,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -71,6 +72,46 @@ inline const bool g_i2m_coalesce = EnvOn("EDEN_NX2_I2M_COALESCE");
 /// EDEN_NX2_UBO_REBIND=0: every graphics uniform buffer bind translates its GPU address again and
 /// makes the next draw look its buffer up again, even when it binds the slot's current range.
 inline const bool g_ubo_rebind = EnvOn("EDEN_NX2_UBO_REBIND");
+
+/// EDEN_NX2_UBO_STAGE_REPLAY=1 (off by default): a stage whose uniform buffers all streamed through
+/// the reuse copies (uniform_stream_reuse.h) binds those copies again when its slots hold the same
+/// ranges and buffers, the copies are from the current command buffer and the guest bytes still
+/// equal them (compared as the slot hit does), skipping the per-binding lookups.
+/// EDEN_NX2_UBO_STAGE_REPLAY_AB_MS=<ms>: replays only in odd periods of the steady clock (records
+/// always). EDEN_NX2_UBO_STAGE_REPLAY_VERIFY=1: binds every replayable stage the normal way and
+/// counts where that bound other copies than the replay would have.
+[[nodiscard]] inline s64 UboStageReplayAbMs() {
+    static const s64 period = [] {
+        const char* const value = std::getenv("EDEN_NX2_UBO_STAGE_REPLAY_AB_MS");
+        return value != nullptr ? static_cast<s64>(std::atoll(value)) : s64{0};
+    }();
+    return period;
+}
+inline const bool g_ubo_stage_replay_verify = [] {
+    const char* const value = std::getenv("EDEN_NX2_UBO_STAGE_REPLAY_VERIFY");
+    return value != nullptr && value[0] == '1';
+}();
+inline const bool g_ubo_stage_replay = [] {
+    const char* const value = std::getenv("EDEN_NX2_UBO_STAGE_REPLAY");
+    return (value != nullptr && value[0] == '1') || UboStageReplayAbMs() > 0 ||
+           g_ubo_stage_replay_verify;
+}();
+/// Whether this period replays (EDEN_NX2_UBO_STAGE_REPLAY_AB_MS), read every 256 calls.
+[[nodiscard]] inline bool UboStageReplayNow() {
+    const s64 period = UboStageReplayAbMs();
+    if (period <= 0) {
+        return true;
+    }
+    thread_local u32 calls = 0;
+    thread_local bool on = false;
+    if ((calls++ & 255) == 0) {
+        const s64 ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+        on = ((ms / period) & 1) != 0;
+    }
+    return on;
+}
 
 /// EDEN_NX2_SYNC_SKIP=0: every sync walks the tracker over its range, even one left clean by
 /// an earlier sync with no CPU write marked in the buffer since.

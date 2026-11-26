@@ -12,6 +12,7 @@
 #include <atomic>
 #include <bit>
 #include <functional>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -1530,6 +1531,38 @@ private:
     };
     std::array<std::array<UniformBindMemo, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES>
         uniform_bind_memo{};
+
+    /// EDEN_NX2_UBO_STAGE_REPLAY: a stage's uniform binds as the last normal pass made them, when
+    /// every enabled slot streamed through a reuse copy (nx2_bufcache.h).
+    struct UniformStageSlot {
+        DAddr device_addr{};
+        BufferId buffer_id{};
+        u32 index{};
+        u32 size{};
+        u32 copy{};
+        u32 serial{};
+        bool alignment_stream{}; ///< streamed for its offset: no GPU-modified check, as the bind
+    };
+    struct UniformStageReplay {
+        bool valid{};
+        u32 mask{};
+        const void* sizes{};
+        const void* channel{};
+        u64 epoch{}; ///< binding_epoch when recorded
+        u32 count{};
+        std::array<UniformStageSlot, NUM_GRAPHICS_UNIFORM_BUFFERS> slots{};
+    };
+    std::array<UniformStageReplay, NUM_STAGES> uniform_stage_replay{};
+    /// Set by BindHostGraphicsUniformBuffer for the replay's record: how its bind streamed.
+    u8 last_uniform_reuse{};       ///< VideoCommon::UniformReuseResult
+    bool last_uniform_alignment_stream{};
+    /// Counts for the 10 s log: replayed, missed, recorded, verified, mismatched.
+    std::array<u64, 5> ubo_stage_stats{};
+    std::chrono::steady_clock::time_point ubo_stage_window{};
+    /// Whether the stage's record still holds: every check a slot hit makes, nothing bound.
+    bool CheckUniformStageReplay(size_t stage);
+    void RecordUniformStage(size_t stage, bool any_unsuitable);
+    void ReportUniformStageReplay();
 
     [[nodiscard]] bool ReuseGeometry(const GeometryMemo& memo, GPUVAddr begin, GPUVAddr end,
                                      u64 extra) const;

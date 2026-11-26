@@ -2839,6 +2839,61 @@ void BufferCache<P>::BindHostDrawIndirectBuffers() {
 
 template <class P>
 void BufferCache<P>::BindHostGraphicsUniformBuffers(size_t stage) {
+    if constexpr (!IS_OPENGL && !HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS &&
+                  VideoCommon::StreamUniformReusable<Runtime>) {
+        if (Nx2BufCache::g_ubo_stage_replay) {
+            ReportUniformStageReplay();
+            const bool verify = Nx2BufCache::g_ubo_stage_replay_verify;
+            const bool replay = (verify || Nx2BufCache::UboStageReplayNow()) &&
+                                CheckUniformStageReplay(stage);
+            if (replay && !verify) {
+                using Reuse = VideoCommon::UniformStreamReuse<typename Runtime::StreamUniformRef>;
+                Reuse& reuse = VideoCommon::UniformStreamReuseState<typename Runtime::StreamUniformRef>();
+                const UniformStageReplay& record = uniform_stage_replay[stage];
+                for (u32 i = 0; i < record.count; ++i) {
+                    runtime.RebindStreamUniform(reuse.copies[record.slots[i].copy].ref,
+                                                record.slots[i].size);
+                }
+                ++ubo_stage_stats[0];
+                return;
+            }
+            if (!replay) {
+                ++ubo_stage_stats[1];
+            }
+            // The normal binds, recorded for the next draw of this stage.
+            const UniformStageReplay expected = uniform_stage_replay[stage];
+            bool unsuitable = false;
+            u32 binding_index = 0;
+            ForEachEnabledBit(channel_state->enabled_uniform_buffer_masks[stage], [&](u32 index) {
+                last_uniform_reuse = 0;
+                BindHostGraphicsUniformBuffer(stage, index, binding_index, true);
+                unsuitable |= index == 17 || last_uniform_reuse == 0 ||
+                              (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000;
+                if constexpr (NEEDS_BIND_UNIFORM_INDEX) {
+                    ++binding_index;
+                }
+            });
+            RecordUniformStage(stage, unsuitable);
+            if (replay && verify) {
+                // The replay would have bound the copies `expected` names: the normal binds
+                // must have used the same ones.
+                ++ubo_stage_stats[3];
+                const UniformStageReplay& now = uniform_stage_replay[stage];
+                bool same = now.valid && now.count == expected.count;
+                for (u32 i = 0; same && i < now.count; ++i) {
+                    same = now.slots[i].copy == expected.slots[i].copy &&
+                           now.slots[i].serial == expected.slots[i].serial &&
+                           now.slots[i].size == expected.slots[i].size;
+                }
+                if (!same && ubo_stage_stats[4]++ < 16) {
+                    LOG_ERROR(HW_GPU, "UBO stage replay verify: stage {} bound other copies than "
+                                      "the replay would have",
+                              stage);
+                }
+            }
+            return;
+        }
+    }
     u32 dirty = ~0U;
     if constexpr (HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS) {
         dirty = std::exchange(channel_state->dirty_uniform_buffers[stage], 0);
@@ -2851,6 +2906,116 @@ void BufferCache<P>::BindHostGraphicsUniformBuffers(size_t stage) {
             ++binding_index;
         }
     });
+}
+
+template <class P>
+bool BufferCache<P>::CheckUniformStageReplay(size_t stage) {
+    if constexpr (!IS_OPENGL && VideoCommon::StreamUniformReusable<Runtime>) {
+        const UniformStageReplay& record = uniform_stage_replay[stage];
+        if (!record.valid || record.mask != channel_state->enabled_uniform_buffer_masks[stage] ||
+            record.sizes != static_cast<const void*>(channel_state->uniform_buffer_sizes) ||
+            record.channel != static_cast<const void*>(channel_state) ||
+            record.epoch != binding_epoch || !VideoCommon::UniformStreamReuseEnabled() ||
+            !VideoCommon::UniformStreamInPlaceEnabled()) {
+            return false;
+        }
+        using Reuse = VideoCommon::UniformStreamReuse<typename Runtime::StreamUniformRef>;
+        Reuse& reuse = VideoCommon::UniformStreamReuseState<typename Runtime::StreamUniformRef>();
+        const u64 tick = runtime.CurrentTick();
+        for (u32 i = 0; i < record.count; ++i) {
+            const UniformStageSlot& slot = record.slots[i];
+            const Binding& binding = channel_state->uniform_buffers[stage][slot.index];
+            const u32 size =
+                (std::min)(binding.size, (*channel_state->uniform_buffer_sizes)[stage][slot.index]);
+            if (binding.device_addr != slot.device_addr || binding.buffer_id != slot.buffer_id ||
+                size != slot.size || binding.buffer_id == NULL_BUFFER_ID) {
+                return false;
+            }
+            // As the bind: a range the GPU wrote is bound from its buffer, unless the offset
+            // alone made it stream.
+            if (!slot.alignment_stream &&
+                (size > channel_state->uniform_buffer_skip_cache_size ||
+                 memory_tracker.IsRegionGpuModified(slot.device_addr, size))) {
+                return false;
+            }
+            // As the slot hit: the slot's copy, of this command buffer, holding these bytes.
+            const auto& slot_state = reuse.slots[stage][slot.index];
+            const auto& copy = reuse.copies[slot.copy];
+            if (slot_state.copy != slot.copy || slot_state.serial != slot.serial ||
+                copy.serial != slot.serial || copy.tick != tick || copy.size != size) {
+                return false;
+            }
+            const u8* const guest = device_memory.GetSpan(slot.device_addr, size);
+            if (guest == nullptr || std::memcmp(reuse.Bytes(slot.copy), guest, size) != 0) {
+                return false;
+            }
+        }
+        return true;
+    } else {
+        return false;
+    }
+}
+
+template <class P>
+void BufferCache<P>::RecordUniformStage(size_t stage, bool any_unsuitable) {
+    UniformStageReplay& record = uniform_stage_replay[stage];
+    record.valid = false;
+    if constexpr (!IS_OPENGL && VideoCommon::StreamUniformReusable<Runtime>) {
+        if (any_unsuitable) {
+            return;
+        }
+        using Reuse = VideoCommon::UniformStreamReuse<typename Runtime::StreamUniformRef>;
+        Reuse& reuse = VideoCommon::UniformStreamReuseState<typename Runtime::StreamUniformRef>();
+        record.count = 0;
+        bool ok = true;
+        ForEachEnabledBit(channel_state->enabled_uniform_buffer_masks[stage], [&](u32 index) {
+            const Binding& binding = channel_state->uniform_buffers[stage][index];
+            const auto& slot_state = reuse.slots[stage][index];
+            ok &= slot_state.serial != 0 && binding.buffer_id != NULL_BUFFER_ID;
+            record.slots[record.count++] = UniformStageSlot{
+                .device_addr = binding.device_addr,
+                .buffer_id = binding.buffer_id,
+                .index = index,
+                .size = (std::min)(binding.size,
+                                   (*channel_state->uniform_buffer_sizes)[stage][index]),
+                .copy = slot_state.copy,
+                .serial = slot_state.serial,
+                .alignment_stream = false,
+            };
+        });
+        if (!ok) {
+            return;
+        }
+        // The alignment flag of each slot, as its bind decided it.
+        for (u32 i = 0; i < record.count; ++i) {
+            UniformStageSlot& slot = record.slots[i];
+            const u32 alignment = runtime.GetUniformBufferAlignment();
+            const u32 offset = slot_buffers[slot.buffer_id].Offset(slot.device_addr);
+            slot.alignment_stream = alignment > 1 && (offset % alignment) != 0;
+        }
+        ++ubo_stage_stats[2];
+        record.mask = channel_state->enabled_uniform_buffer_masks[stage];
+        record.sizes = channel_state->uniform_buffer_sizes;
+        record.channel = channel_state;
+        record.epoch = binding_epoch;
+        record.valid = true;
+    }
+}
+
+template <class P>
+void BufferCache<P>::ReportUniformStageReplay() {
+    const auto now = std::chrono::steady_clock::now();
+    if ((ubo_stage_stats[0] + ubo_stage_stats[1]) % 4096 != 0 ||
+        now - ubo_stage_window < std::chrono::seconds{10}) {
+        return;
+    }
+    ubo_stage_window = now;
+    LOG_INFO(HW_GPU,
+             "UBO stage replay (EDEN_NX2_UBO_STAGE_REPLAY) since the last report: {} replayed, {} "
+             "bound normally, {} records; verify {} checked, {} mismatched (total)",
+             ubo_stage_stats[0], ubo_stage_stats[1], ubo_stage_stats[2], ubo_stage_stats[3],
+             ubo_stage_stats[4]);
+    ubo_stage_stats[0] = ubo_stage_stats[1] = ubo_stage_stats[2] = 0;
 }
 
 template <class P>
@@ -2992,6 +3157,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                                                                 index, binding_index, device_addr,
                                                                 size, &reuse_result);
                 NoteUniformReuse(reuse_result, size);
+                last_uniform_reuse = static_cast<u8>(reuse_result);
             }
         }
         if (!streamed) {
