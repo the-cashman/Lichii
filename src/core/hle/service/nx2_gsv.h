@@ -2151,6 +2151,10 @@ private:
             frames_ahead = 1;
         }
         const auto entered = std::chrono::steady_clock::now();
+        // ft: the vsync timer tick this frame started on (read before the fence wait, which can
+        // span the next tick).
+        const u64 entry_ticks = m_vsync->signals.load(std::memory_order_relaxed);
+        const s64 entry_tick_ns = m_vsync->last_signal_ns.load(std::memory_order_relaxed);
         static const bool fence_trace = [] {
             const char* value = std::getenv("EDEN_NX2_PRESENT_FENCE_TRACE");
             return value != nullptr && value[0] == '1';
@@ -2198,6 +2202,9 @@ private:
             release_fences && system.IsMulticore() && frames_ahead == 0 && (w[18] & 0xf) == 0 &&
             (~w[22] >= 192 ||
              system.Host1x().GetSyncpointManager().IsReadyGuest(~w[22], w[24]));
+        if (~w[22] >= 192 || system.Host1x().GetSyncpointManager().IsReadyGuest(~w[22], w[24])) {
+            HoldToTick(entry_ticks, entry_tick_ns, waited);
+        }
         std::optional<Nx2PresentReleases::Release> release;
         std::chrono::steady_clock::time_point hold_until{};
         if (queueable) {
@@ -2222,6 +2229,8 @@ private:
         if (const auto* const process = system.ApplicationProcess(); process != nullptr) {
             UpdateFrameInterval(*process, entered);
         }
+        LogGuestPresent(entry_ticks, entry_tick_ns, entered, waited, composited, paced,
+                        release.has_value());
         if (traced) {
             FinishPresentFence(*traced, frames_ahead == -1 && !auto_reached, paced);
         }
@@ -2272,6 +2281,7 @@ private:
             if (m_stats.last_present != std::chrono::steady_clock::time_point{}) {
                 const long long frame = to_us(entered - m_stats.last_present);
                 m_stats.frame_us += frame;
+                ++m_stats.frames;
                 m_stats.max_frame_us = (std::max)(m_stats.max_frame_us, frame);
                 m_stats.hitches += frame > 100'000 ? 1 : 0;
                 // Vblanks the game asked for (its steps where it times by them, as Mario Kart
@@ -2285,7 +2295,11 @@ private:
                          "blocked on the GPU fence {} us (max {}), composite {} us, vblank "
                          "pacing {} us, {} ran a frame ahead, {} vblanks asked ({}% of real "
                          "time at 60 Hz)",
-                         m_stats.frame_us / 599, m_stats.max_frame_us, m_stats.hitches,
+                         // Intervals counted, not 599: every window after the first has 600
+                         // (its first present counts from the previous window's last), so /599
+                         // read 120 Hz as 8347 us.
+                         m_stats.frame_us / (std::max)(m_stats.frames, 1LL), m_stats.max_frame_us,
+                         m_stats.hitches,
                          m_stats.fence_us / 600, m_stats.max_fence_us, m_stats.composite_us / 600,
                          m_stats.pace_us / 600, m_stats.ran_ahead, m_stats.vblanks,
                          m_stats.frame_us > 0 ? m_stats.vblanks * 1'000'000 / 60 * 100 /
@@ -2298,6 +2312,156 @@ private:
         TipcReplyWords(ctx, {static_cast<u32>(AvailableSlots),
                              static_cast<u32>(AvailableSlots >> 32),
                              release ? ~release->id : 0U, 0, release ? release->value : 0U, 0});
+    }
+
+    /**
+     * ft: EDEN_NX2_TICK_HOLD=1: hands each finished frame to the renderer a fixed time after the
+     * vsync timer tick that started it, instead of whenever its fence happened to be reached. A
+     * game that starts its frames on the timer (Star Fox at 120) then shows them on an even
+     * grid: the tick is regular, the time from tick to finished frame is not (+-1-2 ms, the
+     * frame-time wobble on a VRR display). The offset follows a high percentile of recent
+     * tick-to-ready times (EDEN_NX2_TICK_HOLD_PCT, default 95) plus EDEN_NX2_TICK_HOLD_MARGIN_US
+     * (default 150), capped at EDEN_NX2_TICK_HOLD_MAX_US (default 7000); it rises at most 100 us
+     * and falls at most 10 us a frame, so its own changes stay invisible. A frame later than the
+     * offset, or one that didn't start on the next tick (a missed tick), goes at once. Costs the
+     * hold as latency (mean offset minus mean ready time). EDEN_NX2_TICK_HOLD_AB_MS=<ms>: in-session
+     * A/B, held in odd periods of the steady clock ((steady_ns / 1e6 / ms) % 2 == 1), the offset
+     * tracked in both.
+     */
+    void HoldToTick(u64 entry_ticks, s64 entry_tick_ns, std::chrono::steady_clock::time_point ready) {
+        struct Config {
+            bool enabled{};
+            s64 ab_ms{};
+            double pct{95.0};
+            s64 margin_ns{150'000};
+            s64 max_ns{7'000'000};
+        };
+        static const Config config = [] {
+            Config c;
+            const auto env_num = [](const char* name, double fallback) {
+                const char* text = std::getenv(name);
+                return text != nullptr && *text != '\0' ? std::strtod(text, nullptr) : fallback;
+            };
+            const char* on = std::getenv("EDEN_NX2_TICK_HOLD");
+            c.ab_ms = static_cast<s64>(env_num("EDEN_NX2_TICK_HOLD_AB_MS", 0));
+            c.enabled = (on != nullptr && on[0] == '1') || c.ab_ms > 0;
+            c.pct = std::clamp(env_num("EDEN_NX2_TICK_HOLD_PCT", 95.0), 50.0, 100.0);
+            c.margin_ns = static_cast<s64>(env_num("EDEN_NX2_TICK_HOLD_MARGIN_US", 150.0) * 1000.0);
+            c.max_ns = static_cast<s64>(env_num("EDEN_NX2_TICK_HOLD_MAX_US", 7000.0) * 1000.0);
+            if (c.enabled) {
+                LOG_INFO(Service,
+                         "EDEN_NX2_TICK_HOLD: frames handed over at p{:.0f} of tick-to-ready + {} us "
+                         "(max {} us){}",
+                         c.pct, c.margin_ns / 1000, c.max_ns / 1000,
+                         c.ab_ms > 0 ? fmt::format(", A/B every {} ms (odd periods held)", c.ab_ms)
+                                     : std::string{});
+            }
+            return c;
+        }();
+        m_tick_hold.held_ns = 0;
+        if (!config.enabled) {
+            return;
+        }
+        auto& h = m_tick_hold;
+        const u64 step = entry_ticks - h.last_ticks;
+        h.last_ticks = entry_ticks;
+        const s64 ready_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(ready.time_since_epoch()).count();
+        const s64 latency = ready_ns - entry_tick_ns;
+        const s64 interval = 1'000'000'000LL / Nx2VsyncRateHz();
+        // Only frames that started on the tick after the previous frame's: the others' tick is
+        // not the one they started on.
+        if (step != 1 || entry_tick_ns == 0 || latency < 0 || latency >= interval) {
+            ++h.skipped;
+            return;
+        }
+        h.ring[h.pos++ % h.ring.size()] = latency;
+        h.filled = (std::min)(h.filled + 1, h.ring.size());
+        if (h.filled >= 60 && (h.pos % 15) == 0) {
+            std::array<s64, 240> sorted{};
+            std::copy_n(h.ring.begin(), h.filled, sorted.begin());
+            const size_t k = (std::min)(h.filled - 1, static_cast<size_t>(config.pct / 100.0 *
+                                                                           static_cast<double>(h.filled)));
+            std::nth_element(sorted.begin(), sorted.begin() + k, sorted.begin() + h.filled);
+            h.target_ns = (std::min)(sorted[k] + config.margin_ns, config.max_ns);
+        }
+        if (h.offset_ns == 0) {
+            h.offset_ns = h.target_ns;
+        } else {
+            h.offset_ns += std::clamp<s64>(h.target_ns - h.offset_ns, -10'000, 100'000);
+        }
+        bool on = true;
+        if (config.ab_ms > 0) {
+            const s64 now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count();
+            on = (now_ms / config.ab_ms) % 2 == 1;
+        }
+        if (!on || h.offset_ns == 0) {
+            return;
+        }
+        const s64 wait = entry_tick_ns + h.offset_ns - ready_ns;
+        if (wait <= 0) {
+            ++h.late;
+            return;
+        }
+        h.held_ns = wait;
+        SleepFor(std::chrono::nanoseconds{wait});
+    }
+
+    struct TickHoldState {
+        u64 last_ticks{};
+        std::array<s64, 240> ring{};
+        size_t pos{}, filled{};
+        s64 target_ns{}, offset_ns{}, held_ns{};
+        u64 skipped{}, late{};
+    } m_tick_hold;
+
+    /**
+     * ft: EDEN_NX2_GUEST_LOG=<file>: one CSV line per present with the guest side of the frame
+     * (steady clock ns, the clock of EDEN_NX2_PRESENT_LOG): the vsync timer's last signal before
+     * the present (count, time, CoreTiming lateness), the present call, its fence wait's end, the
+     * composite hand-off and the return after pacing. Off (no file) by default.
+     */
+    void LogGuestPresent(u64 entry_ticks, s64 entry_tick_ns,
+                         std::chrono::steady_clock::time_point entered,
+                         std::chrono::steady_clock::time_point waited,
+                         std::chrono::steady_clock::time_point composited,
+                         std::chrono::steady_clock::time_point paced, bool released) {
+        static std::FILE* const file = [] {
+            const char* path = std::getenv("EDEN_NX2_GUEST_LOG");
+            if (path == nullptr || *path == '\0') {
+                return static_cast<std::FILE*>(nullptr);
+            }
+            std::FILE* f = std::fopen(path, "w");
+            if (f == nullptr) {
+                LOG_ERROR(Service, "EDEN_NX2_GUEST_LOG: can't open {}", path);
+                return f;
+            }
+            std::setvbuf(f, nullptr, _IOFBF, 1 << 20);
+            std::fprintf(f, "present,ticks,tick_ns,tick_late_ns,entered_ns,waited_ns,composited_ns,"
+                            "paced_ns,released,hold_ns,hold_offset_ns\n");
+            LOG_INFO(Service, "EDEN_NX2_GUEST_LOG {}", path);
+            return f;
+        }();
+        if (file == nullptr) {
+            return;
+        }
+        const auto ns = [](std::chrono::steady_clock::time_point t) {
+            return static_cast<long long>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count());
+        };
+        std::fprintf(file, "%llu,%llu,%lld,%lld,%lld,%lld,%lld,%lld,%d,%lld,%lld\n",
+                     static_cast<unsigned long long>(m_presents),
+                     static_cast<unsigned long long>(entry_ticks),
+                     static_cast<long long>(entry_tick_ns),
+                     static_cast<long long>(m_vsync->last_late_ns.load(std::memory_order_relaxed)),
+                     ns(entered), ns(waited), ns(composited), ns(paced), released ? 1 : 0,
+                     static_cast<long long>(m_tick_hold.held_ns),
+                     static_cast<long long>(m_tick_hold.offset_ns));
+        if ((m_presents % 600) == 0) {
+            std::fflush(file);
+        }
     }
 
     struct PresentPacing {
@@ -2381,7 +2545,7 @@ private:
     u32 m_wait_timeouts{};
     struct PresentStats {
         long long frame_us{}, fence_us{}, composite_us{}, pace_us{}, max_fence_us{};
-        long long max_frame_us{}, hitches{}, vblanks{};
+        long long max_frame_us{}, hitches{}, vblanks{}, frames{};
         u32 presents{}, ran_ahead{};
         std::chrono::steady_clock::time_point last_present{};
     } m_stats{};
@@ -3528,6 +3692,14 @@ private:
                         for (auto* vsync : vsync_state->events) {
                             vsync->Signal(kernel);
                         }
+                        // ft: EDEN_NX2_GUEST_LOG reads when the game's frames were started.
+                        vsync_state->last_signal_ns.store(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count(),
+                            std::memory_order_relaxed);
+                        vsync_state->last_late_ns.store(late.count(), std::memory_order_relaxed);
+                        vsync_state->signals.fetch_add(1, std::memory_order_relaxed);
                     });
                     std::scoped_lock lk{vsync_state->mutex};
                     if (Common::DkbFrameTrace::Enabled()) {
@@ -3591,6 +3763,10 @@ private:
         s64 trace_max_late{};
         u64 trace_callbacks{}, trace_late_callbacks{};
         std::atomic<u64> trace_present{};
+        // ft: the last timer signal (steady clock ns), how late CoreTiming ran it, and the count.
+        std::atomic<s64> last_signal_ns{};
+        std::atomic<s64> last_late_ns{};
+        std::atomic<u64> signals{};
     };
     std::shared_ptr<VsyncState> m_vsync = std::make_shared<VsyncState>();
     std::shared_ptr<Core::Timing::EventType> m_vsync_timer;
