@@ -1431,6 +1431,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     if (VideoCommon::RenderTrace::SampleFrame(render_trace_frame)) {
         TraceRenderState(is_indexed, "configured", texture_cache.GetFramebuffer());
     }
+    NoteRenderSize(texture_cache.GetFramebuffer());
     if (frame_dump.Capturing()) {
         FrameDumpPass(texture_cache.GetFramebuffer());
         frame_dump.NoteDraw(pipeline->ShaderHashes());
@@ -3582,6 +3583,51 @@ void RasterizerVulkan::FlushCommands() {
     }
 }
 
+namespace {
+bool RenderSizesEnabled() {
+    static const bool enabled = std::getenv("EDEN_NX2_RT_SIZES") != nullptr;
+    return enabled;
+}
+} // Anonymous namespace
+
+void RasterizerVulkan::NoteRenderSize(const Framebuffer* framebuffer) {
+    if (!RenderSizesEnabled() || render_trace_frame % 600 != 0) {
+        return;
+    }
+    const auto& regs = maxwell3d->regs;
+    const auto& viewport = regs.viewport_transform[0];
+    const auto extent = framebuffer ? framebuffer->RenderArea() : VkExtent2D{};
+    const std::array<u32, 9> key{
+        regs.rt[0].width, regs.rt[0].height, static_cast<u32>(regs.rt[0].format),
+        regs.zeta_enable ? regs.zeta_size.width : 0U, regs.zeta_enable ? regs.zeta_size.height : 0U,
+        static_cast<u32>(std::lround(std::abs(viewport.scale_x) * 2.0f)),
+        static_cast<u32>(std::lround(std::abs(viewport.scale_y) * 2.0f)), extent.width, extent.height};
+    ++render_size_hist[key];
+}
+
+void RasterizerVulkan::FlushRenderSizes() {
+    if (render_size_hist.empty()) {
+        return;
+    }
+    std::vector<std::pair<std::array<u32, 9>, u32>> rows(render_size_hist.begin(),
+                                                          render_size_hist.end());
+    std::ranges::sort(rows, [](const auto& a, const auto& b) { return a.second > b.second; });
+    u32 total{};
+    for (const auto& row : rows) {
+        total += row.second;
+    }
+    LOG_INFO(Render_Vulkan, "RT sizes frame={}: {} draws, {} kinds", render_trace_frame, total,
+             rows.size());
+    for (size_t i = 0; i < rows.size() && i < 40; ++i) {
+        const auto& k = rows[i].first;
+        LOG_INFO(Render_Vulkan,
+                 "RT sizes frame={} n={} rt0={}x{} fmt={:#x} zeta={}x{} viewport={}x{} host={}x{}",
+                 render_trace_frame, rows[i].second, k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7],
+                 k[8]);
+    }
+    render_size_hist.clear();
+}
+
 void RasterizerVulkan::TraceRenderState(bool is_indexed, const char* outcome,
                                         const Framebuffer* framebuffer) {
     if (!VideoCommon::RenderTrace::SampleFrame(render_trace_frame)) {
@@ -4184,6 +4230,7 @@ void RasterizerVulkan::TickFrame() {
         TickDrawReuse();
     }
     frame_dump.TickFrame();
+    FlushRenderSizes();
     ++render_trace_frame;
     render_trace_draws = 0;
     render_trace_clears = 0;

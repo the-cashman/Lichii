@@ -6,6 +6,7 @@
 #pragma once
 
 #include <array>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string_view>
@@ -429,6 +430,11 @@ private:
     u64 render_trace_frame = 0;
     u32 render_trace_draws = 0;
     u32 render_trace_clears = 0;
+    /// dkbres: EDEN_NX2_RT_SIZES=1: every draw of every 600th frame counted by its targets and
+    /// viewport (guest units) and the host render area; logged when the frame ends.
+    std::map<std::array<u32, 9>, u32> render_size_hist;
+    void NoteRenderSize(const Framebuffer* framebuffer);
+    void FlushRenderSizes();
     bool pending_native_work{};
     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
     /// List draws (nx2_list_draw.h): DrawIndirect for IndirectParams::list_words.
