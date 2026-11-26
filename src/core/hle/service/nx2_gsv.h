@@ -2125,6 +2125,25 @@ private:
                                           app_program_id == MarioKartWorldProgramId)) {
             frames_ahead = 1;
         }
+        // pace: in-session A/B of running a frame ahead (Lichii #1419: Bananza near 60 with it):
+        // EDEN_NX2_FRAMES_AHEAD_AB_MS=<ms> runs a frame ahead in odd periods of the steady clock
+        // ((steady_ns / 1e6 / ms) % 2 == 1) and waits for this frame in even ones (EDEN_NX2_PRESENT_LOG
+        // times are that clock).
+        static const s64 frames_ahead_ab_ms = [] {
+            const char* value = std::getenv("EDEN_NX2_FRAMES_AHEAD_AB_MS");
+            const s64 ms = value != nullptr ? std::strtoll(value, nullptr, 10) : 0;
+            if (ms > 0) {
+                LOG_INFO(Service, "EDEN_NX2_FRAMES_AHEAD_AB_MS={}: a frame ahead in odd periods of "
+                                  "the steady clock, this frame's wait in even ones", ms);
+            }
+            return ms;
+        }();
+        if (frames_ahead_ab_ms > 0) {
+            const s64 now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count();
+            frames_ahead = (now_ms / frames_ahead_ab_ms) % 2 == 1 ? 1 : 0;
+        }
         constexpr u64 DuskbloodsNetworkTestProgramId = 0x0400D1D02399A000ULL;
         const bool duskbloods_auto_ahead =
             frames_ahead_setting == -1 && app_program_id == DuskbloodsNetworkTestProgramId;
