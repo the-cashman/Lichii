@@ -506,11 +506,14 @@ bool Maxwell3D::IsFastDrawDeltaMethod(u32 method) {
 void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call) {
     if (!DrawManager::IsInstanceLoopMethod(method) && !IsFastDrawDeltaMethod(method)) {
         // A fence-flagged release signals a fence: never neutral for the fast draw path.
+        // EDEN_NX2_FAST_REPORT (Lichii #2612): it keeps the chain too, its write noted in
+        // ProcessQueryGet.
         const bool query_method =
             IsFastDrawQueryMethod(method) &&
             !(method == MAXWELL3D_REG_INDEX(report_semaphore.query) &&
               regs.report_semaphore.query.operation == Regs::ReportSemaphore::Operation::Release &&
-              regs.report_semaphore.query.short_query != 0);
+              regs.report_semaphore.query.short_query != 0 &&
+              !VideoCommon::Nx2FastDraw::FastReportOn());
         if (!query_method) {
             VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Method, method);
         }
@@ -1010,6 +1013,14 @@ void Maxwell3D::ProcessQueryGet() {
         static_cast<VideoCommon::QueryType>(regs.report_semaphore.query.report.Value());
     const u32 payload = regs.report_semaphore.payload;
     const u32 subreport = regs.report_semaphore.query.sub_report;
+    // EDEN_NX2_FAST_REPORT (Lichii #2612, with mstampfli's report write tracking): the bytes a
+    // release or report writes, as constant data the fast draw chain may keep.
+    if (VideoCommon::Nx2FastDraw::FastReportEnabled() && VideoCommon::Nx2FastDraw::Enabled() &&
+        (regs.report_semaphore.query.operation == Regs::ReportSemaphore::Operation::Release ||
+         regs.report_semaphore.query.operation == Regs::ReportSemaphore::Operation::ReportOnly)) {
+        const u64 bytes = regs.report_semaphore.query.short_query != 0 ? 4 : 16;
+        NoteFastDrawConstantData(sequence_address, sequence_address + bytes);
+    }
     switch (regs.report_semaphore.query.operation) {
     case Regs::ReportSemaphore::Operation::Release:
         if (regs.report_semaphore.query.short_query != 0) {

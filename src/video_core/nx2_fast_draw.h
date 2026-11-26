@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <span>
 #include <utility>
@@ -87,6 +88,44 @@ inline std::atomic<bool> g_dynamic_vertex_streams{};
 /// Tests only.
 inline void SetEnabledForTest(bool on) {
     g_enabled.store(on, std::memory_order_relaxed);
+}
+
+/// EDEN_NX2_FAST_REPORT (port of Lichii #2612, off by default): with it set, report semaphore
+/// releases and reports note the 4 or 16 bytes they write as constant data (a write over the
+/// texture or sampler headers ends the chain, one over kept constant data resolves where
+/// needed), and a fence-flagged short release no longer ends the fast draw chain by itself
+/// (other report methods already don't here). EDEN_NX2_FAST_REPORT_AB_MS=<ms>: the release
+/// stays neutral only in odd periods of the steady clock (in-session A/B); writes are always
+/// noted while either is set. Read once.
+[[nodiscard]] inline s64 FastReportAbMs() {
+    static const s64 period = [] {
+        const char* const value = std::getenv("EDEN_NX2_FAST_REPORT_AB_MS");
+        return value != nullptr ? static_cast<s64>(std::atoll(value)) : s64{0};
+    }();
+    return period;
+}
+
+[[nodiscard]] inline bool FastReportEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_FAST_REPORT");
+        return (value != nullptr && value[0] == '1') || FastReportAbMs() > 0;
+    }();
+    return enabled;
+}
+
+/// Whether a fence-flagged short release keeps the chain now.
+[[nodiscard]] inline bool FastReportOn() {
+    if (!FastReportEnabled()) {
+        return false;
+    }
+    const s64 period = FastReportAbMs();
+    if (period <= 0) {
+        return true;
+    }
+    const s64 ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch())
+                       .count();
+    return ((ms / period) & 1) != 0;
 }
 
 /// EDEN_NX2_FAST_DRAW_VERIFY=1, read once.
